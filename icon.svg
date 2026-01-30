@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+  <!-- Upper half of split object -->
+  <path d="M4 4h16v6H4z" fill="#808080" stroke="#404040" stroke-width="1"/>
+  <!-- Lower half of split object (offset slightly) -->
+  <path d="M5 14h16v6H5z" fill="#606060" stroke="#404040" stroke-width="1"/>
+  <!-- Cut line / split indicator -->
+  <path d="M2 11h20" stroke="#FF5722" stroke-width="2" stroke-dasharray="3,2"/>
+  <!-- Scissors / split symbol -->
+  <circle cx="12" cy="11" r="2" fill="#FF5722" stroke="#D84315" stroke-width="1"/>
+</svg>
