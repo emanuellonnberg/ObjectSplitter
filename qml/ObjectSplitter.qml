@@ -4,7 +4,7 @@
 import QtQuick 2.15
 import QtQuick.Controls 2.15
 
-import UM 1.6 as UM
+import UM 1.5 as UM
 import Cura 1.0 as Cura
 
 Item {
@@ -84,19 +84,20 @@ Item {
                 id: cutModeComboBox
                 width: 170
                 height: UM.Theme.getSize("setting_control").height
-                model: ["Horizontal", "Vertical", "Smallest Section"]
+                model: ["Horizontal", "Vertical", "Smallest Section", "Shortest Seam"]
                 currentIndex: {
                     if (UM.ActiveTool) {
                         var mode = UM.ActiveTool.properties.getValue("CutMode")
                         if (mode === "horizontal") return 0
                         if (mode === "vertical") return 1
                         if (mode === "smallest") return 2
+                        if (mode === "shortest") return 3
                     }
                     return 0
                 }
                 onActivated: {
                     if (UM.ActiveTool) {
-                        var modeMap = ["horizontal", "vertical", "smallest"]
+                        var modeMap = ["horizontal", "vertical", "smallest", "shortest"]
                         UM.ActiveTool.setProperty("CutMode", modeMap[currentIndex])
                     }
                 }
@@ -112,6 +113,7 @@ Item {
                     if (mode === "horizontal") return "Cut parallel to the build plate"
                     if (mode === "vertical") return "Cut perpendicular to the build plate"
                     if (mode === "smallest") return "Find smallest cross-section at click point"
+                    if (mode === "shortest") return "Compute a shortest surface seam loop"
                 }
                 return ""
             }

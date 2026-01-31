@@ -79,12 +79,6 @@ class ObjectSplitter(Tool):
 
     def __init__(self):
         super().__init__()
-        self._plugin_id = "ObjectSplitter"
-        if hasattr(self, "setPluginId"):
-            try:
-                self.setPluginId(self._plugin_id)
-            except Exception:
-                pass
         self._shortcut_key = Qt.Key.Key_K  # K for "Kut" (avoiding conflicts)
         self._controller = self.getController()
 
@@ -150,7 +144,12 @@ class ObjectSplitter(Tool):
         if global_container_stack:
             plugin_enabled = True  # Could add conditions here
 
-        Application.getInstance().getController().toolEnabledChanged.emit(self._plugin_id, plugin_enabled)
+        try:
+            plugin_id = self.getPluginId()
+            Application.getInstance().getController().toolEnabledChanged.emit(plugin_id, plugin_enabled)
+        except ValueError:
+            # Plugin ID not set yet during initialization, skip the emit
+            pass
 
     def _onSelectionChanged(self):
         """Handle selection changes."""
@@ -210,17 +209,6 @@ class ObjectSplitter(Tool):
     # ==========================================================================
     # Properties for QML
     # ==========================================================================
-    def getId(self) -> str:
-        return self._plugin_id
-
-    def getPluginId(self) -> str:
-        return self._plugin_id
-
-    def getQmlPath(self):
-        """Return the path to the QML file for the tool panel."""
-        qml_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "qml", "ObjectSplitter.qml")
-        Logger.log("d", f"QML path: {qml_path}")
-        return qml_path
     
     def getCutMode(self) -> str:
         return self._cut_mode
@@ -383,8 +371,12 @@ class ObjectSplitter(Tool):
 
     def setEnabled(self, enable: bool) -> None:
         """Called when the tool is enabled/disabled."""
+        Logger.log("d", "ObjectSplitter.setEnabled: %s", enable)
         super().setEnabled(enable)
-        if not enable:
+        if enable:
+            # Force panel visibility
+            Logger.log("d", "ObjectSplitter: Tool enabled, panel should be visible")
+        else:
             self._removePreview()
 
     # ==========================================================================
