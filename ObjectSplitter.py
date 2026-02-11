@@ -136,8 +136,7 @@ class ObjectSplitter(Tool):
         # Search settings for smallest cut
         self._search_resolution = 18  # Number of angles to search
 
-        # Debug capture
-        self._debug_capture_enabled = False
+        # Debug capture (derived from _capture_dir: None = off, path = on)
         self._capture_dir = None
 
         # State
@@ -329,6 +328,9 @@ class ObjectSplitter(Tool):
             Logger.log("d", "Connector clearance changed to: %s", str(value))
             self.propertyChanged.emit()
 
+    def getOpenScadPath(self) -> str:
+        return self._openscad_path or ""
+
     def setOpenScadPath(self, value: str) -> None:
         value = value or ""
         if value != (self._openscad_path or ""):
@@ -340,11 +342,10 @@ class ObjectSplitter(Tool):
             self.propertyChanged.emit()
 
     def getDebugCaptureEnabled(self) -> bool:
-        return self._debug_capture_enabled
+        return self._capture_dir is not None
 
     def setDebugCaptureEnabled(self, value: bool) -> None:
-        if value != self._debug_capture_enabled:
-            self._debug_capture_enabled = value
+        if value != self.getDebugCaptureEnabled():
             if value:
                 self._capture_dir = os.path.join(os.path.dirname(__file__), "captures")
                 Logger.log("i", "Debug capture enabled, saving to: %s", self._capture_dir)
