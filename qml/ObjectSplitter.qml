@@ -448,6 +448,58 @@ Item {
             color: UM.Theme.getColor("lining")
         }
 
+        // Debug Capture Toggle
+        Column {
+            width: parent.width
+            spacing: Math.round(UM.Theme.getSize("default_margin").height / 2)
+
+            Row {
+                spacing: Math.round(UM.Theme.getSize("default_margin").width / 2)
+
+                CheckBox {
+                    id: debugCaptureCheckBox
+                    checked: UM.ActiveTool ? UM.ActiveTool.properties.getValue("DebugCaptureEnabled") : false
+
+                    onCheckedChanged: {
+                        if (UM.ActiveTool) {
+                            UM.ActiveTool.setProperty("DebugCaptureEnabled", checked)
+                        }
+                    }
+                }
+
+                Label {
+                    height: debugCaptureCheckBox.height
+                    text: catalog.i18nc("@label", "Debug capture")
+                    font: UM.Theme.getFont("default")
+                    color: UM.Theme.getColor("text")
+                    verticalAlignment: Text.AlignVCenter
+                    renderType: Text.NativeRendering
+
+                    MouseArea {
+                        anchors.fill: parent
+                        onClicked: debugCaptureCheckBox.checked = !debugCaptureCheckBox.checked
+                    }
+                }
+            }
+
+            Label {
+                width: parent.width
+                text: "Saves mesh and parameters for each cut to the plugin captures/ folder"
+                font: UM.Theme.getFont("default_italic")
+                color: UM.Theme.getColor("text_inactive")
+                visible: debugCaptureCheckBox.checked
+                wrapMode: Text.WordWrap
+                renderType: Text.NativeRendering
+            }
+        }
+
+        // Separator
+        Rectangle {
+            width: parent.width
+            height: 1
+            color: UM.Theme.getColor("lining")
+        }
+
         // Instructions
         Label {
             width: parent.width

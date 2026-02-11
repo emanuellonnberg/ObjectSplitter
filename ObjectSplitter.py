@@ -136,7 +136,8 @@ class ObjectSplitter(Tool):
         # Search settings for smallest cut
         self._search_resolution = 18  # Number of angles to search
 
-        # Debug capture (set to a directory path to enable)
+        # Debug capture
+        self._debug_capture_enabled = False
         self._capture_dir = None
 
         # State
@@ -159,8 +160,10 @@ class ObjectSplitter(Tool):
             "OpenScadPath",
             "ConnectorDiameter",
             "ConnectorHeight",
-            "ConnectorClearance"
+            "ConnectorClearance",
             # (Note: ConnectorSides not exposed to QML to avoid undefined warnings)
+            # Debug capture
+            "DebugCaptureEnabled",
         )
 
         Logger.log("d", "Object Splitter Tool initialized (trimesh available: %s)", str(TRIMESH_AVAILABLE))
@@ -334,6 +337,20 @@ class ObjectSplitter(Tool):
             prefs.setValue("objectsplitter/openscad_path", value)
             Logger.log("i", "ObjectSplitter: OpenSCAD path set to: %s", value)
             self._configureBooleanEngines()  # Ensure trimesh uses the updated OpenSCAD path
+            self.propertyChanged.emit()
+
+    def getDebugCaptureEnabled(self) -> bool:
+        return self._debug_capture_enabled
+
+    def setDebugCaptureEnabled(self, value: bool) -> None:
+        if value != self._debug_capture_enabled:
+            self._debug_capture_enabled = value
+            if value:
+                self._capture_dir = os.path.join(os.path.dirname(__file__), "captures")
+                Logger.log("i", "Debug capture enabled, saving to: %s", self._capture_dir)
+            else:
+                self._capture_dir = None
+                Logger.log("i", "Debug capture disabled")
             self.propertyChanged.emit()
 
     # ==========================================================================
