@@ -14,7 +14,11 @@ import numpy
 import pytest
 import trimesh
 
-from core.plane_calculator import horizontal_cut_plane, vertical_cut_plane
+from core.plane_calculator import (
+    horizontal_cut_plane,
+    vertical_cut_plane,
+    find_smallest_cut_plane,
+)
 from core.mesh_splitter import slice_mesh_with_fallback
 
 
@@ -384,3 +388,96 @@ class TestCentroidPosition:
         cut_x = plane.origin[0]
         assert result.upper.centroid[0] > cut_x - 0.1
         assert result.lower.centroid[0] < cut_x + 0.1
+
+
+# ---------------------------------------------------------------------------
+# Smallest cut verification
+# ---------------------------------------------------------------------------
+
+class TestSmallestCutOptimality:
+    """Verify that find_smallest_cut_plane actually finds the smallest cut.
+
+    Rather than just checking that the area is 'small enough', these tests
+    compare the winner against explicit alternative orientations to confirm
+    it is truly the minimum (or very close to it).
+    """
+
+    @staticmethod
+    def _cross_section_area(mesh, origin, normal):
+        """Measure the cross-section area of mesh at the given plane."""
+        try:
+            section = mesh.section(plane_origin=origin, plane_normal=normal)
+            if section is not None:
+                path_2d, _ = section.to_2D()
+                return abs(path_2d.area)
+        except Exception:
+            pass
+        return float('inf')
+
+    def test_cylinder_smallest_beats_all_axis_cuts(self, cylinder_mesh):
+        """The found smallest cut should be <= every axis-aligned cut."""
+        center = cylinder_mesh.centroid + numpy.array([0.1, 0.1, 0.1])
+        result = find_smallest_cut_plane(
+            cylinder_mesh, center, search_resolution=8)
+
+        for normal in [[1, 0, 0], [0, 1, 0], [0, 0, 1]]:
+            axis_area = self._cross_section_area(
+                cylinder_mesh, center, numpy.array(normal, dtype=float))
+            assert result.area <= axis_area + 1.0, (
+                f"Smallest cut area {result.area:.1f} > axis {normal} area "
+                f"{axis_area:.1f}")
+
+    def test_tall_box_smallest_beats_vertical(self, tall_box_mesh):
+        """For a 10x40x10 box, smallest cut (~100) should beat vertical (~400)."""
+        center = tall_box_mesh.centroid + numpy.array([0.1, 0.1, 0.1])
+        result = find_smallest_cut_plane(
+            tall_box_mesh, center, search_resolution=6)
+
+        # Vertical cut through a 10x40x10 box gives ~400 mm^2
+        vertical_area = self._cross_section_area(
+            tall_box_mesh, center, numpy.array([1.0, 0.0, 0.0]))
+
+        assert result.area < vertical_area, (
+            f"Smallest {result.area:.1f} not smaller than vertical {vertical_area:.1f}")
+
+    def test_tall_box_smallest_area_close_to_expected(self, tall_box_mesh):
+        """10x10 cross-section of a 10x40x10 box should be ~100 mm^2."""
+        center = tall_box_mesh.centroid + numpy.array([0.1, 0.1, 0.1])
+        result = find_smallest_cut_plane(
+            tall_box_mesh, center, search_resolution=6)
+        # 10x10 = 100, allow some margin for offset from center
+        assert result.area == pytest.approx(100.0, rel=0.15)
+
+    def test_cylinder_smallest_area_close_to_circle(self, cylinder_mesh):
+        """Circular cross-section of r=8 cylinder should be ~pi*64 ≈ 201 mm^2."""
+        center = cylinder_mesh.centroid + numpy.array([0.1, 0.1, 0.1])
+        result = find_smallest_cut_plane(
+            cylinder_mesh, center, search_resolution=8)
+        expected = numpy.pi * 8.0 ** 2  # ~201
+        assert result.area == pytest.approx(expected, rel=0.15)
+
+    def test_smallest_is_minimum_of_all_samples(self, cube_mesh):
+        """With collect_all_samples, the winner should equal the min sample."""
+        center = cube_mesh.centroid + numpy.array([0.1, 0.1, 0.1])
+        result = find_smallest_cut_plane(
+            cube_mesh, center, search_resolution=4, collect_all_samples=True)
+        valid_areas = [
+            a for _, a in result.all_samples
+            if not numpy.isnan(a) and a > 0
+        ]
+        assert len(valid_areas) > 0
+        assert result.area == pytest.approx(min(valid_areas))
+
+    def test_smallest_split_produces_valid_halves(self, cylinder_mesh):
+        """Full pipeline: find smallest -> split -> verify both halves."""
+        center = cylinder_mesh.centroid
+        search = find_smallest_cut_plane(
+            cylinder_mesh, center, search_resolution=6)
+        result = slice_mesh_with_fallback(
+            cylinder_mesh, search.plane.origin, search.plane.normal)
+        assert result.success
+
+        if result.capped:
+            original_vol = cylinder_mesh.volume
+            combined_vol = abs(result.upper.volume) + abs(result.lower.volume)
+            assert combined_vol == pytest.approx(original_vol, rel=0.10)
