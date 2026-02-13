@@ -23,6 +23,117 @@ from .geometry import plane_normal_from_spherical
 logger = logging.getLogger("objectsplitter.plane_calculator")
 
 
+def _section_to_2d(section):
+    """
+    Convert a Path3D cross-section to 2D, compatible with both
+    trimesh 3.x (only has to_planar) and 4.x (to_2D preferred, to_planar deprecated).
+
+    Returns:
+        (path_2d, to_3D_transform) or raises if neither method exists.
+    """
+    # Try to_2D first (trimesh >= 4.x, not deprecated)
+    if hasattr(section, 'to_2D'):
+        try:
+            return section.to_2D()
+        except Exception:
+            pass
+    # Fall back to to_planar (trimesh 3.x, or 4.x where to_2D might fail)
+    if hasattr(section, 'to_planar'):
+        return section.to_planar()
+    raise AttributeError(
+        "Path3D has neither 'to_2D' nor 'to_planar' — unsupported trimesh version"
+    )
+
+
+def _local_section_area(path_2d, to_3D, click_position_3d):
+    """
+    Compute the area of the cross-section polygon nearest to the click point,
+    rather than the total area of all disconnected polygons.
+
+    This prevents the algorithm from choosing a plane that has a small total
+    area because it passes through a thin feature far from the click point.
+
+    Args:
+        path_2d: 2D cross-section path (from _section_to_2d).
+        to_3D: 4x4 transform matrix mapping 2D plane coords back to 3D.
+        click_position_3d: The 3D click point (which lies on the cutting plane).
+
+    Returns:
+        Area of the polygon nearest to the click point.
+    """
+    try:
+        polygons = path_2d.polygons_full
+        if polygons is None or len(polygons) == 0:
+            return abs(path_2d.area)
+    except Exception:
+        return abs(path_2d.area)
+
+    # Only one polygon — no ambiguity
+    if len(polygons) == 1:
+        return abs(polygons[0].area)
+
+    # Project click point from 3D onto the 2D plane
+    try:
+        to_2D = numpy.linalg.inv(to_3D)
+        click_h = numpy.append(numpy.asarray(click_position_3d, dtype=numpy.float64), 1.0)
+        click_2d = (to_2D @ click_h)[:2]
+    except Exception:
+        # If projection fails, fall back to total area
+        return abs(path_2d.area)
+
+    from shapely.geometry import Point
+    click_pt = Point(float(click_2d[0]), float(click_2d[1]))
+
+    # First check: does the click point land inside a polygon?
+    for poly in polygons:
+        if poly.contains(click_pt):
+            return abs(poly.area)
+
+    # Click point is outside all polygons (likely on an edge or between them).
+    # Pick the nearest polygon.
+    best_dist = float('inf')
+    best_area = abs(path_2d.area)  # fallback: total
+    for poly in polygons:
+        try:
+            dist = poly.distance(click_pt)
+            if dist < best_dist:
+                best_dist = dist
+                best_area = abs(poly.area)
+        except Exception:
+            continue
+
+    return best_area
+
+
+def snap_point_to_mesh_surface(
+    mesh: "trimesh.Trimesh",
+    point: numpy.ndarray
+) -> Tuple[numpy.ndarray, Optional[int]]:
+    """
+    Snap a 3D point to the nearest point on the mesh surface.
+    Use this to correct pick positions that may be slightly off.
+
+    Returns:
+        (point_on_surface, face_id) - face_id is None if proximity query fails.
+    """
+    point = numpy.asarray(point, dtype=numpy.float64).reshape(1, -1)
+    face_id = None
+    try:
+        from trimesh.proximity import ProximityQuery
+        pq = ProximityQuery(mesh)
+        closest, distance, face_ids = pq.on_surface(point)
+        if closest is not None and len(closest) > 0:
+            pt = numpy.array(closest[0], dtype=numpy.float64)
+            if face_ids is not None and len(face_ids) > 0:
+                face_id = int(face_ids[0])
+            return pt, face_id
+    except Exception as e:
+        logger.debug("Proximity snap failed: %s", e)
+
+    # Fallback: use mesh centroid (point is likely wrong)
+    return numpy.array(mesh.centroid, dtype=numpy.float64), None
+
+
 @dataclass
 class CutPlane:
     """Describes a cutting plane in 3D space."""
@@ -138,8 +249,8 @@ def find_smallest_cut_plane(
             try:
                 section = mesh.section(plane_origin=plane_origin, plane_normal=normal)
                 if section is not None:
-                    path_2d, _ = section.to_2D()
-                    area = abs(path_2d.area)
+                    path_2d, to_3D = _section_to_2d(section)
+                    area = _local_section_area(path_2d, to_3D, plane_origin)
 
                     if collect_all_samples:
                         all_samples.append((normal.copy(), area))
@@ -147,10 +258,35 @@ def find_smallest_cut_plane(
                     if 0 < area < best_area:
                         best_area = area
                         best_normal = normal.copy()
-            except Exception:
+            except Exception as e:
                 if collect_all_samples:
                     all_samples.append((normal.copy(), float('nan')))
+                logger.debug("Section failed for normal=%s: %s: %s", normal, type(e).__name__, e)
                 continue
+
+    # Fallback: if no valid sections found (e.g. mesh.section fails for real Cura meshes),
+    # try axis-aligned normals and pick the best. Avoids always returning horizontal.
+    if not numpy.isfinite(best_area) or best_area <= 0:
+        logger.warning(
+            "Smallest cut search found no valid sections (tested %d orientations). "
+            "Trying axis-aligned fallback.",
+            samples_tested,
+        )
+        for fallback_normal in [
+            numpy.array([0.0, 1.0, 0.0]),
+            numpy.array([1.0, 0.0, 0.0]),
+            numpy.array([0.0, 0.0, 1.0]),
+        ]:
+            try:
+                section = mesh.section(plane_origin=plane_origin, plane_normal=fallback_normal)
+                if section is not None:
+                    path_2d, to_3D = _section_to_2d(section)
+                    area = _local_section_area(path_2d, to_3D, plane_origin)
+                    if 0 < area < best_area:
+                        best_area = area
+                        best_normal = fallback_normal.copy()
+            except Exception as e:
+                logger.debug("Axis fallback failed for %s: %s", fallback_normal, e)
 
     logger.debug("Smallest cut search: best_area=%.2f mm^2, normal=%s, tested=%d orientations",
                  best_area, best_normal, samples_tested)
@@ -165,7 +301,8 @@ def find_smallest_cut_plane(
 
 def find_shortest_seam_partition(
     mesh: "trimesh.Trimesh",
-    click_position: numpy.ndarray
+    click_position: numpy.ndarray,
+    source_face_hint: Optional[int] = None
 ) -> Tuple[list, list, int, int]:
     """
     Compute a geodesic shortest-seam cut by finding a minimum cut in the
@@ -176,7 +313,8 @@ def find_shortest_seam_partition(
 
     Args:
         mesh: The trimesh object to partition.
-        click_position: 3D point identifying the source face.
+        click_position: 3D point identifying the source face (used if source_face_hint is None).
+        source_face_hint: If provided, use this face as the source (from snap_point_to_mesh_surface).
 
     Returns:
         (set_a_faces, set_b_faces, source_face, sink_face) where
@@ -184,17 +322,17 @@ def find_shortest_seam_partition(
     """
     import heapq
 
-    point = numpy.asarray(click_position, dtype=numpy.float64).reshape(1, -1)
-
-    # Find source face nearest to click
-    face_index = None
-    try:
-        from trimesh.proximity import ProximityQuery
-        pq = ProximityQuery(mesh)
-        _, _, face_ids = pq.on_surface(point)
-        face_index = int(face_ids[0]) if face_ids is not None else None
-    except Exception as e:
-        logger.debug("Proximity query failed: %s", e)
+    # Use provided face if available (from snapped point), else find via proximity
+    face_index = source_face_hint
+    if face_index is None:
+        point = numpy.asarray(click_position, dtype=numpy.float64).reshape(1, -1)
+        try:
+            from trimesh.proximity import ProximityQuery
+            pq = ProximityQuery(mesh)
+            _, _, face_ids = pq.on_surface(point)
+            face_index = int(face_ids[0]) if face_ids is not None else None
+        except Exception as e:
+            logger.debug("Proximity query failed: %s", e)
 
     if face_index is None:
         if mesh.vertices.shape[0] > 0:

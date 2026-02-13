@@ -220,3 +220,103 @@ def create_plane_mesh_data(
     ], dtype=numpy.int32)
 
     return vertices, indices
+
+
+def create_marker_mesh_data(
+    center: numpy.ndarray,
+    size: float = 2.0,
+    direction: Optional[numpy.ndarray] = None
+) -> Tuple[numpy.ndarray, numpy.ndarray]:
+    """
+    Generate vertices and face indices for an arrow marker pointing at the
+    click location along the surface normal direction.
+
+    The arrow tip touches `center`. The shaft extends away from the surface
+    in the `direction` the normal points (outward from the mesh).
+
+    Args:
+        center: 3D point where the arrow tip touches (the click location).
+        size: Scale factor. Arrow head radius = size * 0.5.
+        direction: Direction the arrow points FROM (i.e. surface normal).
+                   Arrow tip is at center, body extends opposite to this.
+                   Defaults to [0, 1, 0] (arrow points down from above).
+
+    Returns:
+        (vertices, indices) as numpy arrays.
+    """
+    s = float(size)
+    c = numpy.asarray(center, dtype=numpy.float64)
+
+    # Default direction: surface normal pointing outward (arrow comes from outside)
+    if direction is not None:
+        d = numpy.asarray(direction, dtype=numpy.float64)
+        norm = numpy.linalg.norm(d)
+        if norm > 1e-10:
+            d = d / norm
+        else:
+            d = numpy.array([0.0, 1.0, 0.0])
+    else:
+        d = numpy.array([0.0, 1.0, 0.0])
+
+    # Build arrow along +Y axis, then rotate to align with `d`
+    # Arrow proportions (built along Y axis, tip at origin):
+    head_radius = s * 0.5
+    head_length = s * 1.5
+    shaft_radius = s * 0.15
+    shaft_length = s * 3.0
+
+    n_sides = 8
+    angles = numpy.linspace(0, 2 * numpy.pi, n_sides, endpoint=False)
+
+    verts_local = []
+    faces = []
+
+    # --- Cone head (tip at origin, base at Y = head_length) ---
+    verts_local.append(numpy.array([0.0, 0.0, 0.0]))  # tip
+    for a in angles:
+        verts_local.append(numpy.array([
+            head_radius * numpy.cos(a), head_length, head_radius * numpy.sin(a)
+        ]))
+    cone_base_center_idx = len(verts_local)
+    verts_local.append(numpy.array([0.0, head_length, 0.0]))
+
+    for i in range(n_sides):
+        j = (i + 1) % n_sides
+        faces.append([0, 1 + i, 1 + j])
+    for i in range(n_sides):
+        j = (i + 1) % n_sides
+        faces.append([cone_base_center_idx, 1 + j, 1 + i])
+
+    # --- Shaft (thin prism from head_length to head_length + shaft_length) ---
+    shaft_base_idx = len(verts_local)
+    for a in angles:
+        verts_local.append(numpy.array([
+            shaft_radius * numpy.cos(a), head_length, shaft_radius * numpy.sin(a)
+        ]))
+    for a in angles:
+        verts_local.append(numpy.array([
+            shaft_radius * numpy.cos(a), head_length + shaft_length,
+            shaft_radius * numpy.sin(a)
+        ]))
+    shaft_top_center_idx = len(verts_local)
+    verts_local.append(numpy.array([0.0, head_length + shaft_length, 0.0]))
+
+    sb = shaft_base_idx
+    for i in range(n_sides):
+        j = (i + 1) % n_sides
+        faces.append([sb + i, sb + j, sb + n_sides + j])
+        faces.append([sb + i, sb + n_sides + j, sb + n_sides + i])
+    # Shaft top cap
+    for i in range(n_sides):
+        j = (i + 1) % n_sides
+        faces.append([shaft_top_center_idx, sb + n_sides + i, sb + n_sides + j])
+
+    # --- Rotate from +Y to the surface normal direction ---
+    # The arrow is built along +Y; we need to rotate so +Y aligns with `d`
+    R = rotation_matrix_from_vectors(numpy.array([0.0, 1.0, 0.0]), d)
+
+    vertices = numpy.array([
+        c + R @ v for v in verts_local
+    ], dtype=numpy.float32)
+    indices = numpy.array(faces, dtype=numpy.int32)
+    return vertices, indices

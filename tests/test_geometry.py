@@ -13,6 +13,7 @@ from core.geometry import (
     transform_point_to_local,
     plane_normal_from_spherical,
     create_plane_mesh_data,
+    create_marker_mesh_data,
 )
 
 
@@ -222,3 +223,45 @@ class TestCreatePlaneMeshData:
         span = vertices.max(axis=0) - vertices.min(axis=0)
         # The plane lies in XZ (normal=Y), so X and Z spans should be ~size
         assert span[0] == pytest.approx(size, rel=0.01) or span[2] == pytest.approx(size, rel=0.01)
+
+
+class TestCreateMarkerMeshData:
+    """Tests for arrow marker mesh."""
+
+    def test_arrow_at_origin(self):
+        """Arrow marker should produce valid vertices and faces."""
+        vertices, indices = create_marker_mesh_data(numpy.array([0, 0, 0]), 1.0)
+        assert vertices.shape[1] == 3
+        assert indices.shape[1] == 3
+        assert len(vertices) > 0
+        assert len(indices) > 0
+
+    def test_arrow_tip_at_center(self):
+        """Arrow tip (first vertex) should be at the given center point."""
+        center = numpy.array([10, 20, 30])
+        vertices, _ = create_marker_mesh_data(center, 2.0)
+        assert_allclose(vertices[0], center, atol=1e-5)
+
+    def test_arrow_default_direction(self):
+        """Default arrow direction should extend along Y+ from center."""
+        center = numpy.array([0, 0, 0])
+        vertices, _ = create_marker_mesh_data(center, 1.0)
+        # All non-tip vertices should have Y >= 0
+        assert numpy.all(vertices[1:, 1] >= -0.01)
+        assert vertices[:, 1].max() > 2.0
+
+    def test_arrow_custom_direction(self):
+        """Arrow with custom normal should point in that direction."""
+        center = numpy.array([0, 0, 0])
+        # Arrow along +X: body should extend in +X direction
+        vertices, _ = create_marker_mesh_data(center, 1.0, direction=numpy.array([1, 0, 0]))
+        assert vertices[:, 0].max() > 2.0  # shaft extends in +X
+        assert_allclose(vertices[0], center, atol=1e-5)  # tip at center
+
+    def test_arrow_negative_direction(self):
+        """Arrow pointing in -Z should extend in -Z direction."""
+        center = numpy.array([5, 5, 5])
+        vertices, _ = create_marker_mesh_data(center, 1.0, direction=numpy.array([0, 0, -1]))
+        assert_allclose(vertices[0], center, atol=1e-5)
+        # Shaft should extend in -Z from center
+        assert vertices[:, 2].min() < 5.0 - 2.0

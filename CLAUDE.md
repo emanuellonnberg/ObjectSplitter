@@ -73,6 +73,9 @@ Config is in `pytest.ini`. Test deps are in `requirements-test.txt`.
 ## Dependencies
 
 - `trimesh` (required) - mesh operations
+
+Bundled in `lib/` so the plugin works inside Cura (which doesn't ship trimesh).
+To refresh the bundle: `python scripts/bundle_deps.py`
 - `numpy`, `scipy` - math, Delaunay triangulation fallback
 - `manifold3d` (optional) - faster boolean ops
 - `shapely`, `networkx` - cross-section & seam algorithms

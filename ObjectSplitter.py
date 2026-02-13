@@ -79,6 +79,7 @@ from .core.geometry import (
     world_to_local_transform,
     transform_point_to_local,
     create_plane_mesh_data,
+    create_marker_mesh_data,
 )
 from .core.plane_calculator import (
     horizontal_cut_plane,
@@ -89,6 +90,7 @@ from .core.plane_calculator import (
 from .core.mesh_splitter import (
     slice_mesh_with_fallback,
     split_by_shortest_seam,
+    split_by_local_plane,
 )
 from .core.connectors import (
     add_connectors,
@@ -489,7 +491,35 @@ class ObjectSplitter(Tool):
         mesh_size = max_bounds - min_bounds
         plane_size = max(mesh_size[0], mesh_size[2]) * 1.2  # 20% larger than mesh
 
-        # Determine plane normal and origin based on mode
+        # For smallest/shortest seam: show arrow at click point along surface normal
+        if self._cut_mode in (self.CUT_MODE_SMALLEST, self.CUT_MODE_SHORTEST):
+            center = numpy.array([picked_position.x, picked_position.y, picked_position.z])
+            mesh_size_max = max(mesh_size[0], mesh_size[1], mesh_size[2])
+            marker_size = max(0.5, mesh_size_max * 0.012)  # 1.2% of mesh or 0.5mm
+
+            # Compute face normal at hover point for arrow direction
+            face_normal = None
+            try:
+                indices = transformed_mesh.getIndices()
+                verts_arr = numpy.asarray(vertices, dtype=numpy.float64)
+                if indices is not None:
+                    indices_arr = numpy.asarray(indices, dtype=numpy.int32)
+                else:
+                    indices_arr = numpy.arange(len(verts_arr), dtype=numpy.int32).reshape(-1, 3)
+                tm_preview = trimesh.Trimesh(vertices=verts_arr, faces=indices_arr)
+                tm_preview.merge_vertices()
+                from .core.plane_calculator import snap_point_to_mesh_surface
+                _, face_id = snap_point_to_mesh_surface(tm_preview, center)
+                if face_id is not None and face_id < len(tm_preview.face_normals):
+                    face_normal = numpy.array(tm_preview.face_normals[face_id], dtype=numpy.float64)
+            except Exception:
+                pass  # Fall back to default Y-up arrow
+
+            self._createOrUpdateMarker(center, marker_size, face_normal)
+            self._hover_node = picked_node
+            return
+
+        # Planar modes: show the actual cut plane
         if self._cut_mode == self.CUT_MODE_HORIZONTAL:
             min_y = min_bounds[1]
             max_y = max_bounds[1]
@@ -500,28 +530,38 @@ class ObjectSplitter(Tool):
         elif self._cut_mode == self.CUT_MODE_VERTICAL:
             plane_origin = picked_position
             plane_normal = Vector(1, 0, 0)  # Cut along X axis
-        elif self._cut_mode == self.CUT_MODE_SMALLEST:
-            # For smallest mode, just show horizontal plane at click position as hint
-            plane_origin = picked_position
-            plane_normal = Vector(0, 1, 0)
-        elif self._cut_mode == self.CUT_MODE_SHORTEST:
-            # For shortest seam mode, no simple planar preview
-            plane_origin = picked_position
-            plane_normal = Vector(0, 1, 0)
         else:
             plane_origin = picked_position
             plane_normal = Vector(0, 1, 0)
 
-        # Create or update preview
         self._createOrUpdatePreview(plane_origin, plane_normal, plane_size)
         self._hover_node = picked_node
+
+    def _createOrUpdateMarker(self, center: numpy.ndarray, size: float,
+                              direction: numpy.ndarray = None):
+        """Create or update an arrow marker at the click location, oriented along surface normal."""
+        if self._preview_node is None:
+            self._preview_node = self._createPreviewNode()
+
+        vertices, indices = create_marker_mesh_data(center, size, direction)
+        mesh_builder = MeshBuilder()
+        mesh_builder.setVertices(vertices)
+        mesh_builder.setIndices(indices)
+        n_verts = len(vertices)
+        colors = numpy.array([[1.0, 0.3, 0.0, 0.7]] * n_verts, dtype=numpy.float32)
+        mesh_builder.setColors(colors)
+        mesh_builder.calculateNormals()
+        self._preview_node.setMeshData(mesh_builder.build())
+
+        scene_root = self._controller.getScene().getRoot()
+        if self._preview_node.getParent() != scene_root:
+            self._preview_node.setParent(scene_root)
 
     def _createOrUpdatePreview(self, origin: Vector, normal: Vector, size: float):
         """Create or update the preview plane mesh."""
         if self._preview_node is None:
             self._preview_node = self._createPreviewNode()
 
-        # Use core geometry module for plane mesh generation
         origin_arr = numpy.array([origin.x, origin.y, origin.z])
         normal_arr = numpy.array([normal.x, normal.y, normal.z])
         vertices, indices = create_plane_mesh_data(origin_arr, normal_arr, size)
@@ -530,7 +570,6 @@ class ObjectSplitter(Tool):
         mesh_builder.setVertices(vertices)
         mesh_builder.setIndices(indices)
 
-        # Set preview color (orange, semi-transparent)
         colors = numpy.array([
             [1.0, 0.3, 0.0, 0.5],
             [1.0, 0.3, 0.0, 0.5],
@@ -542,7 +581,6 @@ class ObjectSplitter(Tool):
 
         self._preview_node.setMeshData(mesh_builder.build())
 
-        # Make sure it's in the scene
         scene_root = self._controller.getScene().getRoot()
         if self._preview_node.getParent() != scene_root:
             self._preview_node.setParent(scene_root)
@@ -582,11 +620,42 @@ class ObjectSplitter(Tool):
         transformed_mesh = mesh_data.getTransformed(node.getWorldTransformation())
         vertices = transformed_mesh.getVertices()
         indices = transformed_mesh.getIndices()
+
+        # Ensure numpy arrays with correct shape (Cura may return different formats)
+        vertices = numpy.asarray(vertices, dtype=numpy.float64)
+        if vertices.ndim == 1:
+            vertices = vertices.reshape(-1, 3)
+
         if indices is None:
-            indices = numpy.arange(len(vertices)).reshape(-1, 3).astype(numpy.int32)
+            # Triangle soup: every 3 consecutive vertices form a face
+            n_verts = len(vertices)
+            if n_verts % 3 != 0:
+                Logger.log("e", "Mesh has %d vertices, not divisible by 3", n_verts)
+                return None
+            indices = numpy.arange(n_verts, dtype=numpy.int32).reshape(-1, 3)
+        else:
+            indices = numpy.asarray(indices, dtype=numpy.int32)
+            if indices.ndim == 1:
+                indices = indices.reshape(-1, 3)
 
         local_vertices = mesh_data.getVertices()
+        if local_vertices is not None:
+            local_vertices = numpy.asarray(local_vertices, dtype=numpy.float64)
+            if local_vertices.ndim == 1:
+                local_vertices = local_vertices.reshape(-1, 3)
+        else:
+            local_vertices = vertices.copy()
+
         tm = trimesh.Trimesh(vertices=vertices, faces=indices)
+
+        # Cura often stores meshes as "triangle soup" with no shared vertices.
+        # merge_vertices() deduplicates vertices so trimesh can build proper
+        # edge-face adjacency, which is required for section(), split(), etc.
+        tm.merge_vertices()
+
+        Logger.log("d", "Extracted trimesh: %d vertices, %d faces (watertight=%s)",
+                   len(tm.vertices), len(tm.faces), str(tm.is_watertight))
+
         return tm, local_vertices, vertices
 
     def _performCut(self, node: CuraSceneNode, click_position: Vector):
@@ -636,6 +705,9 @@ class ObjectSplitter(Tool):
 
             split_result = None
 
+            from .core.plane_calculator import snap_point_to_mesh_surface
+            _, click_face_id = snap_point_to_mesh_surface(tm, click_pos_arr)
+
             if self._cut_mode == self.CUT_MODE_HORIZONTAL:
                 plane = horizontal_cut_plane(tm, self._cut_height_percent)
             elif self._cut_mode == self.CUT_MODE_VERTICAL:
@@ -647,14 +719,19 @@ class ObjectSplitter(Tool):
                     plane = vertical_cut_plane(click_pos_arr)
             elif self._cut_mode == self.CUT_MODE_SMALLEST:
                 self._updateProgress("Searching for smallest cross-section...", 20)
-                pos = click_pos_local_arr if click_pos_local_arr is not None else click_pos_arr
-                search_result = find_smallest_cut_plane(tm, pos, self._search_resolution)
+                snap_point, click_face_id = snap_point_to_mesh_surface(tm, click_pos_arr)
+                search_result = find_smallest_cut_plane(tm, snap_point, self._search_resolution)
                 plane = search_result.plane
-                Logger.log("d", "Smallest cut: area=%.2f mm^2, tested %d orientations",
-                           search_result.area, search_result.samples_tested)
+                Logger.log("i", "Smallest cut: area=%.2f mm^2, tested %d orientations, normal=%s",
+                           search_result.area, search_result.samples_tested,
+                           str(search_result.plane.normal))
             elif self._cut_mode == self.CUT_MODE_SHORTEST:
                 self._updateProgress("Computing shortest seam...", 20)
-                face_set_a, face_set_b, src, sink = find_shortest_seam_partition(tm, click_pos_arr)
+                snap_point, source_face = snap_point_to_mesh_surface(tm, click_pos_arr)
+                click_face_id = source_face
+                face_set_a, face_set_b, src, sink = find_shortest_seam_partition(
+                    tm, snap_point, source_face_hint=source_face
+                )
                 Logger.log("d", "Shortest seam: source=%d, sink=%d, partitions=%d/%d faces",
                            src, sink, len(face_set_a), len(face_set_b))
                 plane = None  # No planar cut for shortest seam
@@ -668,8 +745,16 @@ class ObjectSplitter(Tool):
             self._updateProgress("Splitting mesh...", 40)
             if self._cut_mode == self.CUT_MODE_SHORTEST:
                 split_result = split_by_shortest_seam(tm, face_set_a, face_set_b)
+            elif self._cut_mode == self.CUT_MODE_SMALLEST:
+                # Use graph-based local separation: only separates the region
+                # near the click, unlike an infinite plane that cuts everything.
+                split_result = split_by_local_plane(
+                    tm, plane.origin, plane.normal, click_face_id
+                )
             else:
-                split_result = slice_mesh_with_fallback(tm, plane.origin, plane.normal)
+                split_result = slice_mesh_with_fallback(
+                    tm, plane.origin, plane.normal, face_id=click_face_id
+                )
 
             Logger.log("i", "Split result: %s", split_result.summary())
 
