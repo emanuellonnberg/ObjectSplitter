@@ -368,7 +368,8 @@ def find_smallest_cut_plane(
 def find_shortest_seam_partition(
     mesh: "trimesh.Trimesh",
     click_position: numpy.ndarray,
-    source_face_hint: Optional[int] = None
+    source_face_hint: Optional[int] = None,
+    surface_normal: Optional[numpy.ndarray] = None,
 ) -> Tuple[list, list, int, int]:
     """
     Compute a geodesic shortest-seam cut by finding a minimum cut in the
@@ -377,10 +378,20 @@ def find_shortest_seam_partition(
     This separates the mesh into two face sets that minimize the total
     length of shared edges between them.
 
+    When a surface_normal is provided, the sink selection is biased toward
+    faces that are both far from the source AND on the "other side" of the
+    mesh (in the -surface_normal direction).
+
+    Note: min-cut can produce trivially small partitions (e.g. 1 face).
+    The caller should check partition sizes and fall back to a different
+    algorithm (e.g. split_by_local_plane) if needed.
+
     Args:
         mesh: The trimesh object to partition.
         click_position: 3D point identifying the source face (used if source_face_hint is None).
         source_face_hint: If provided, use this face as the source (from snap_point_to_mesh_surface).
+        surface_normal: Surface normal at the click point. If provided, biases
+            sink selection toward the "body" side of the mesh.
 
     Returns:
         (set_a_faces, set_b_faces, source_face, sink_face) where
@@ -420,11 +431,8 @@ def find_shortest_seam_partition(
         graph[u].append({"v": v, "cap": cap, "rev": len(graph[v])})
         graph[v].append({"v": u, "cap": 0, "rev": len(graph[u]) - 1})
 
-    # Compute edge weights for the flow network.
-    # Using raw edge lengths causes min-cut to isolate single small triangles
-    # (cutting 3 short edges is cheaper than any real neck). Adding a constant
-    # per-edge cost ensures the min-cut also minimizes the NUMBER of cut edges,
-    # strongly penalizing single-face isolation.
+    # Edge weights: edge_length + avg_edge_length constant.
+    # The constant penalizes cutting many edges (important for fair comparison).
     edge_lengths = numpy.array([
         numpy.linalg.norm(mesh.vertices[v1] - mesh.vertices[v2])
         for (_, _), (v1, v2) in zip(adj_pairs, adj_edges)
@@ -432,13 +440,11 @@ def find_shortest_seam_partition(
     avg_edge_length = float(numpy.mean(edge_lengths)) if len(edge_lengths) > 0 else 1.0
 
     for idx, ((f1, f2), (v1, v2)) in enumerate(zip(adj_pairs, adj_edges)):
-        # weight = edge_length + constant ensures cutting N edges costs at least
-        # N * avg_edge_length, making single-triangle isolation expensive
         weight = float(edge_lengths[idx]) + avg_edge_length
         _add_edge(int(f1), int(f2), weight)
         _add_edge(int(f2), int(f1), weight)
 
-    # Dijkstra to find farthest face (= sink)
+    # Dijkstra to compute graph distances from source
     dist = [float("inf")] * faces_count
     dist[face_index] = 0.0
     pq_heap = [(0.0, face_index)]
@@ -453,7 +459,36 @@ def find_shortest_seam_partition(
                     dist[edge["v"]] = nd
                     heapq.heappush(pq_heap, (nd, edge["v"]))
 
-    sink_face = int(numpy.argmax(dist)) if faces_count > 0 else face_index
+    # Sink selection: farthest face, biased toward "body" direction.
+    # The surface normal points outward at the click; -surface_normal points
+    # into the body. We want the sink deep in the body, on the far side of
+    # the throat from the click.
+    SINK_BIAS = 0.5
+    use_bias = (surface_normal is not None and
+                numpy.linalg.norm(surface_normal) > 0.5)
+    if use_bias:
+        sn = numpy.asarray(surface_normal, dtype=numpy.float64)
+        sn = sn / numpy.linalg.norm(sn)
+        into_body = -sn
+        face_centroids = mesh.vertices[mesh.faces].mean(axis=1)
+        click_pos = numpy.asarray(click_position, dtype=numpy.float64)
+
+        best_score = -1.0
+        sink_face = face_index
+        for f in range(faces_count):
+            if not numpy.isfinite(dist[f]) or f == face_index:
+                continue
+            direction = face_centroids[f] - click_pos
+            dir_len = numpy.linalg.norm(direction)
+            alignment = 0.0
+            if dir_len > 1e-12:
+                alignment = numpy.dot(direction / dir_len, into_body)
+            score = dist[f] * (1.0 + SINK_BIAS * max(0.0, alignment))
+            if score > best_score:
+                best_score = score
+                sink_face = f
+    else:
+        sink_face = int(numpy.argmax(dist)) if faces_count > 0 else face_index
 
     # Dinic's max-flow
     def _bfs_level():
@@ -514,3 +549,288 @@ def find_shortest_seam_partition(
                  face_index, sink_face, len(set_a), len(set_b))
 
     return set_a, set_b, face_index, sink_face
+
+
+def refine_partition_with_mincut(
+    mesh: "trimesh.Trimesh",
+    initial_set_a: list,
+    initial_set_b: list,
+    min_face_fraction: float = 0.005,
+) -> Tuple[list, list]:
+    """
+    Refine a plane-based partition by finding the shortest seam (min-cut)
+    between the two regions.
+
+    The initial partition (from local_plane_partition) gives us the right
+    REGION to cut, but the boundary is a straight plane. Min-cut can find
+    a shorter path along the mesh surface that follows the actual geometry.
+
+    The trick: place source and sink DEEP inside each partition (farthest
+    from the boundary). This prevents the min-cut from trivially isolating
+    a single triangle — it's forced to go through the actual neck between
+    the two regions.
+
+    Args:
+        mesh: The trimesh object.
+        initial_set_a: Face indices for the smaller partition (piece to cut off).
+        initial_set_b: Face indices for the larger partition (body).
+        min_face_fraction: Minimum fraction of faces for the result to be valid.
+
+    Returns:
+        (refined_set_a, refined_set_b) — the refined partition if min-cut
+        succeeds, or the original partition if it fails.
+    """
+    import heapq
+    from collections import deque
+
+    faces_count = len(mesh.faces)
+    min_faces = max(10, int(faces_count * min_face_fraction))
+
+    if len(initial_set_a) < 2 or len(initial_set_b) < 2:
+        logger.debug("refine_partition: partitions too small to refine (%d/%d)",
+                     len(initial_set_a), len(initial_set_b))
+        return initial_set_a, initial_set_b
+
+    # Step 1: Find boundary faces (faces in set_a adjacent to set_b and vice versa)
+    set_a_ids = set(initial_set_a)
+    set_b_ids = set(initial_set_b)
+    adj_pairs = mesh.face_adjacency
+
+    boundary_a = set()  # faces in set_a that touch set_b
+    boundary_b = set()  # faces in set_b that touch set_a
+    for f1, f2 in adj_pairs:
+        f1i, f2i = int(f1), int(f2)
+        if f1i in set_a_ids and f2i in set_b_ids:
+            boundary_a.add(f1i)
+            boundary_b.add(f2i)
+        elif f2i in set_a_ids and f1i in set_b_ids:
+            boundary_a.add(f2i)
+            boundary_b.add(f1i)
+
+    logger.debug("refine_partition: boundary faces: %d in set_a, %d in set_b",
+                 len(boundary_a), len(boundary_b))
+
+    # Step 2: BFS from boundary inward to find deepest face in each partition
+    # (face farthest from the boundary = safest source/sink for min-cut)
+    face_adj = [[] for _ in range(faces_count)]
+    for f1, f2 in adj_pairs:
+        face_adj[int(f1)].append(int(f2))
+        face_adj[int(f2)].append(int(f1))
+
+    def _find_deepest(partition_set, boundary_faces):
+        """BFS from boundary inward; return face with max depth."""
+        depth = {}
+        queue = deque()
+        for bf in boundary_faces:
+            if bf in partition_set:
+                depth[bf] = 0
+                queue.append(bf)
+        # If no boundary faces found, pick any face
+        if not queue:
+            first = next(iter(partition_set))
+            return first
+        deepest_face = queue[0]
+        max_depth = 0
+        while queue:
+            f = queue.popleft()
+            for nb in face_adj[f]:
+                if nb in partition_set and nb not in depth:
+                    depth[nb] = depth[f] + 1
+                    queue.append(nb)
+                    if depth[nb] > max_depth:
+                        max_depth = depth[nb]
+                        deepest_face = nb
+        return deepest_face
+
+    source_face = _find_deepest(set_a_ids, boundary_a)
+    sink_face = _find_deepest(set_b_ids, boundary_b)
+
+    logger.debug("refine_partition: source=%d (deep in set_a, %d faces), "
+                 "sink=%d (deep in set_b, %d faces)",
+                 source_face, len(initial_set_a),
+                 sink_face, len(initial_set_b))
+
+    if source_face == sink_face:
+        logger.warning("refine_partition: source == sink, returning original")
+        return initial_set_a, initial_set_b
+
+    # Step 3: Build flow network and run Dinic's max-flow
+    adj_edges = mesh.face_adjacency_edges
+    graph = [[] for _ in range(faces_count)]
+
+    def _add_edge(u, v, cap):
+        graph[u].append({"v": v, "cap": cap, "rev": len(graph[v])})
+        graph[v].append({"v": u, "cap": 0, "rev": len(graph[u]) - 1})
+
+    # Use PURE edge lengths as weights — no per-edge constant.
+    # The constant (used in find_shortest_seam_partition) prevents single-face
+    # isolation, but here source/sink are deep inside each partition, so
+    # trivial cuts are already impossible. Without the constant, the min-cut
+    # truly minimizes total boundary LENGTH: it always takes the shortest
+    # edge through a triangle rather than going the long way around via
+    # the two longer edges.
+    for (f1, f2), (v1, v2) in zip(adj_pairs, adj_edges):
+        weight = float(numpy.linalg.norm(mesh.vertices[v1] - mesh.vertices[v2]))
+        weight = max(weight, 1e-10)  # avoid zero-weight edges
+        _add_edge(int(f1), int(f2), weight)
+        _add_edge(int(f2), int(f1), weight)
+
+    # Dinic's max-flow
+    def _bfs_level():
+        level = [-1] * faces_count
+        queue = [source_face]
+        level[source_face] = 0
+        for u in queue:
+            for edge in graph[u]:
+                if level[edge["v"]] < 0 and edge["cap"] > 0:
+                    level[edge["v"]] = level[u] + 1
+                    queue.append(edge["v"])
+        return level
+
+    def _dfs_flow(u, sink, f, level, it):
+        if u == sink:
+            return f
+        for i in range(it[u], len(graph[u])):
+            it[u] = i
+            edge = graph[u][i]
+            if edge["cap"] <= 0 or level[edge["v"]] != level[u] + 1:
+                continue
+            ret = _dfs_flow(edge["v"], sink, min(f, edge["cap"]), level, it)
+            if ret > 0:
+                edge["cap"] -= ret
+                graph[edge["v"]][edge["rev"]]["cap"] += ret
+                return ret
+        return 0
+
+    while True:
+        level = _bfs_level()
+        if level[sink_face] < 0:
+            break
+        it = [0] * faces_count
+        while True:
+            pushed = _dfs_flow(source_face, sink_face, float("inf"), level, it)
+            if pushed <= 1e-9:
+                break
+
+    # Extract reachable set
+    reachable = [False] * faces_count
+    stack = [source_face]
+    reachable[source_face] = True
+    while stack:
+        u = stack.pop()
+        for edge in graph[u]:
+            if edge["cap"] > 0 and not reachable[edge["v"]]:
+                reachable[edge["v"]] = True
+                stack.append(edge["v"])
+
+    refined_a = [i for i, r in enumerate(reachable) if r]
+    refined_b = [i for i, r in enumerate(reachable) if not r]
+
+    # Ensure set_a is the smaller partition
+    if len(refined_a) > len(refined_b):
+        refined_a, refined_b = refined_b, refined_a
+
+    logger.debug("refine_partition: min-cut result: %d/%d faces (from %d/%d)",
+                 len(refined_a), len(refined_b),
+                 len(initial_set_a), len(initial_set_b))
+
+    # Validate: refined partition should have both sides >= min_faces
+    if len(refined_a) < min_faces or len(refined_b) < min_faces:
+        logger.warning("refine_partition: min-cut gave trivial result (%d/%d), "
+                       "keeping original plane partition (%d/%d)",
+                       len(refined_a), len(refined_b),
+                       len(initial_set_a), len(initial_set_b))
+        return smooth_partition_boundary(mesh, initial_set_a, initial_set_b)
+
+    return smooth_partition_boundary(mesh, refined_a, refined_b)
+
+
+def smooth_partition_boundary(
+    mesh: "trimesh.Trimesh",
+    set_a: list,
+    set_b: list,
+    iterations: int = 5,
+) -> Tuple[list, list]:
+    """
+    Smooth a partition boundary by greedy boundary-length minimization.
+
+    For each face on the boundary, compute the cut edge lengths if it stays
+    vs if it moves to the other side. Only move it if moving SHORTENS the
+    total boundary length. This ensures every move improves the seam.
+
+    A face in set_a has:
+    - "cut edges" to neighbors in set_b (these contribute to boundary length)
+    - "interior edges" to neighbors in set_a (these don't)
+
+    If we move the face to set_b:
+    - Old cut edges become interior (saved length)
+    - Old interior edges become cut edges (new length)
+
+    Move if: new_cut_length < old_cut_length  (boundary gets shorter)
+
+    Args:
+        mesh: The trimesh object.
+        set_a: Face indices for the first partition.
+        set_b: Face indices for the second partition.
+        iterations: Number of smoothing passes (default 5).
+
+    Returns:
+        (smoothed_set_a, smoothed_set_b) with shorter boundary.
+    """
+    members_a = set(set_a)
+    members_b = set(set_b)
+
+    # Build neighbor lookup with shared edge lengths
+    adj_pairs = mesh.face_adjacency
+    adj_edges = mesh.face_adjacency_edges
+    # face_neighbors[f] = list of (neighbor_face, shared_edge_length)
+    face_neighbors = [[] for _ in range(len(mesh.faces))]
+    for (f1, f2), (v1, v2) in zip(adj_pairs, adj_edges):
+        edge_len = float(numpy.linalg.norm(mesh.vertices[v1] - mesh.vertices[v2]))
+        face_neighbors[int(f1)].append((int(f2), edge_len))
+        face_neighbors[int(f2)].append((int(f1), edge_len))
+
+    for iteration in range(iterations):
+        # Find boundary faces
+        boundary_faces = []
+        for f in members_a:
+            for nb, _ in face_neighbors[f]:
+                if nb in members_b:
+                    boundary_faces.append(f)
+                    break
+        for f in members_b:
+            for nb, _ in face_neighbors[f]:
+                if nb in members_a:
+                    boundary_faces.append(f)
+                    break
+
+        moves = 0
+        for f in boundary_faces:
+            is_in_a = (f in members_a)
+            my_set = members_a if is_in_a else members_b
+            other_set = members_b if is_in_a else members_a
+
+            # Current cut length: sum of edges to neighbors on the other side
+            current_cut = sum(el for nb, el in face_neighbors[f] if nb in other_set)
+            # Cut length if we move f: edges to neighbors on our CURRENT side become cuts
+            new_cut = sum(el for nb, el in face_neighbors[f] if nb in my_set)
+
+            if new_cut < current_cut:
+                # Moving shortens the boundary
+                my_set.discard(f)
+                other_set.add(f)
+                moves += 1
+
+        if moves == 0:
+            logger.debug("smooth_partition: converged after %d iterations", iteration + 1)
+            break
+        logger.debug("smooth_partition: iteration %d, moved %d faces",
+                     iteration + 1, moves)
+
+    # Ensure set_a is still the smaller partition
+    result_a = sorted(members_a)
+    result_b = sorted(members_b)
+    if len(result_a) > len(result_b):
+        result_a, result_b = result_b, result_a
+
+    return result_a, result_b

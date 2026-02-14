@@ -86,11 +86,14 @@ from .core.plane_calculator import (
     vertical_cut_plane,
     find_smallest_cut_plane,
     find_shortest_seam_partition,
+    refine_partition_with_mincut,
 )
 from .core.mesh_splitter import (
     slice_mesh_with_fallback,
     split_by_shortest_seam,
     split_by_local_plane,
+    local_plane_partition,
+    split_by_face_sets,
 )
 from .core.connectors import (
     add_connectors,
@@ -740,14 +743,68 @@ class ObjectSplitter(Tool):
                            search_result.area, search_result.samples_tested,
                            str(search_result.plane.normal))
             elif self._cut_mode == self.CUT_MODE_SHORTEST:
-                self._updateProgress("Computing shortest seam...", 20)
+                self._updateProgress("Finding cut region...", 15)
                 snap_point, source_face = snap_point_to_mesh_surface(tm, click_pos_arr)
                 click_face_id = source_face
-                face_set_a, face_set_b, src, sink = find_shortest_seam_partition(
-                    tm, snap_point, source_face_hint=source_face
+
+                # Step 1: Use smallest-cut infrastructure to find the right
+                # cutting region (plane search + local partition).
+                seam_surface_normal = None
+                if source_face is not None and source_face < len(tm.face_normals):
+                    seam_surface_normal = numpy.array(
+                        tm.face_normals[source_face], dtype=numpy.float64
+                    )
+                    Logger.log("d", "Shortest seam surface normal: %s", seam_surface_normal)
+
+                search_result = find_smallest_cut_plane(
+                    tm, snap_point, self._search_resolution,
+                    surface_normal=seam_surface_normal,
                 )
-                Logger.log("d", "Shortest seam: source=%d, sink=%d, partitions=%d/%d faces",
-                           src, sink, len(face_set_a), len(face_set_b))
+                Logger.log("d", "Shortest seam plane search: area=%.2f, normal=%s",
+                           search_result.area, search_result.plane.normal)
+
+                # Step 2: Get plane-based partition (identifies the region)
+                candidate_normals = []
+                if search_result.top_candidates:
+                    candidate_normals = [n for _, n in search_result.top_candidates]
+                if not candidate_normals:
+                    candidate_normals = [search_result.plane.normal]
+
+                # Try candidates to find a valid plane partition
+                self._updateProgress("Computing shortest seam...", 30)
+                plane_set_a, plane_set_b = [], []
+                min_faces_seam = max(10, int(len(tm.faces) * 0.005))
+                for ci, cn in enumerate(candidate_normals):
+                    cn = numpy.asarray(cn, dtype=numpy.float64)
+                    pa, pb = local_plane_partition(
+                        tm, snap_point, cn, click_face_id
+                    )
+                    if len(pa) >= min_faces_seam and len(pb) >= min_faces_seam:
+                        plane_set_a, plane_set_b = pa, pb
+                        Logger.log("d", "Shortest seam: plane candidate %d accepted (%d/%d faces)",
+                                   ci, len(pa), len(pb))
+                        break
+
+                if not plane_set_a:
+                    # No valid plane partition found
+                    Logger.log("w", "Shortest seam: no valid plane partition, "
+                               "using raw min-cut fallback")
+                    face_set_a, face_set_b, src, sink = find_shortest_seam_partition(
+                        tm, snap_point, source_face_hint=source_face,
+                        surface_normal=seam_surface_normal,
+                    )
+                else:
+                    # Step 3: Refine the plane partition with min-cut to find
+                    # a shorter seam that follows the mesh surface.
+                    Logger.log("d", "Shortest seam: refining plane partition "
+                               "(%d/%d) with min-cut...",
+                               len(plane_set_a), len(plane_set_b))
+                    face_set_a, face_set_b = refine_partition_with_mincut(
+                        tm, plane_set_a, plane_set_b
+                    )
+                    Logger.log("d", "Shortest seam: refined partition %d/%d faces",
+                               len(face_set_a), len(face_set_b))
+
                 plane = None  # No planar cut for shortest seam
             else:
                 plane = horizontal_cut_plane(tm, self._cut_height_percent)
@@ -758,7 +815,10 @@ class ObjectSplitter(Tool):
             # Perform the split (delegates to core.mesh_splitter)
             self._updateProgress("Splitting mesh...", 40)
             if self._cut_mode == self.CUT_MODE_SHORTEST:
-                split_result = split_by_shortest_seam(tm, face_set_a, face_set_b)
+                split_result = split_by_face_sets(
+                    tm, face_set_a, face_set_b,
+                    strategy_name="shortest_seam"
+                )
             elif self._cut_mode == self.CUT_MODE_SMALLEST:
                 # Use graph-based local separation with candidate fallback.
                 # If the best plane only grazes the surface (single-triangle cut),
