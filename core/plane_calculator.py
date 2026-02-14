@@ -206,34 +206,83 @@ class SmallestPlaneSearchResult:
     samples_tested: int
     # All tested orientations for debugging/visualization
     all_samples: Optional[list] = None  # List of (normal, area) tuples
+    # Top N candidates sorted by area (for fallback if best produces bad partition)
+    top_candidates: Optional[list] = None  # List of (area, normal) tuples
 
 
 def find_smallest_cut_plane(
     mesh: "trimesh.Trimesh",
     click_position: numpy.ndarray,
     search_resolution: int = 18,
-    collect_all_samples: bool = False
+    collect_all_samples: bool = False,
+    surface_normal: Optional[numpy.ndarray] = None,
 ) -> SmallestPlaneSearchResult:
     """
-    Find the plane orientation that produces the smallest cross-sectional area.
+    Find the plane orientation that produces the smallest cross-sectional area,
+    biased toward the surface normal at the click point.
 
-    Samples orientations in spherical coordinates and measures the cross-section
-    area at each orientation through the click position.
+    When a surface_normal is provided, the scoring favors planes whose normal is
+    aligned with the surface normal. This means: if you click on the side of a
+    neck, the cut plane will align with the direction you clicked from, rather
+    than some random surface-grazing angle 90° away.
+
+    Scoring:  effective_score = area * (1 + BIAS * (1 - alignment))
+    where alignment = |dot(candidate_normal, surface_normal)| in [0, 1].
+    A perfectly aligned plane gets score = area (no penalty).
+    A perpendicular plane gets score = area * (1 + BIAS).
 
     Args:
         mesh: The trimesh object to analyze.
         click_position: 3D point to pass the plane through.
         search_resolution: Number of elevation angles to sample (azimuth = 2x this).
         collect_all_samples: If True, store all (normal, area) pairs for debugging.
+        surface_normal: Surface normal at the click point. If provided, strongly
+            biases the search toward planes aligned with this direction.
 
     Returns:
         SmallestPlaneSearchResult with the best plane, area, and optional debug data.
     """
     plane_origin = numpy.asarray(click_position, dtype=numpy.float64)
     best_normal = numpy.array([0.0, 1.0, 0.0])
+    best_score = float('inf')
     best_area = float('inf')
     samples_tested = 0
     all_samples = [] if collect_all_samples else None
+    valid_candidates = []  # collect all valid (score, area, normal) tuples
+
+    # Alignment bias: gently prefer planes aligned with the surface normal.
+    # With BIAS=0.5, a perpendicular plane needs ~1.5x smaller area to beat
+    # an aligned one. This is mild enough that a genuinely smaller cut still
+    # wins (important when clicking the SIDE of a neck, where the surface
+    # normal is perpendicular to the ideal cut direction), but strong enough
+    # to break ties between similar-area candidates in favor of the click
+    # direction.  The heavy lifting for filtering surface-grazing planes is
+    # done by min_section_area, not the bias.
+    ALIGNMENT_BIAS = 0.5
+    use_bias = (surface_normal is not None and
+                numpy.linalg.norm(surface_normal) > 0.5)
+    if use_bias:
+        surface_normal = numpy.asarray(surface_normal, dtype=numpy.float64)
+        surface_normal = surface_normal / numpy.linalg.norm(surface_normal)
+        logger.debug("Smallest cut search: using surface_normal=%s with bias=%.1f",
+                     surface_normal, ALIGNMENT_BIAS)
+
+    # Minimum area threshold: reject cross-sections smaller than this.
+    # Surface-grazing planes can skim the mesh from MANY orientations, each
+    # producing a tiny area (e.g. 0.12 mm²). A real through-cut has area
+    # comparable to several face areas.
+    avg_face_area = mesh.area / max(len(mesh.faces), 1)
+    min_section_area = avg_face_area * 5.0
+    logger.debug("Smallest cut search: avg_face_area=%.4f, min_section_area=%.4f",
+                 avg_face_area, min_section_area)
+
+    def _compute_score(area: float, normal: numpy.ndarray) -> float:
+        """Score a candidate: lower is better. Combines area with alignment."""
+        if not use_bias:
+            return area
+        alignment = abs(numpy.dot(normal, surface_normal))  # 0..1
+        penalty = 1.0 + ALIGNMENT_BIAS * (1.0 - alignment)
+        return area * penalty
 
     n_theta = search_resolution
     n_phi = search_resolution * 2
@@ -255,18 +304,22 @@ def find_smallest_cut_plane(
                     if collect_all_samples:
                         all_samples.append((normal.copy(), area))
 
-                    if 0 < area < best_area:
-                        best_area = area
-                        best_normal = normal.copy()
+                    if area >= min_section_area:
+                        score = _compute_score(area, normal)
+                        valid_candidates.append((score, area, normal.copy()))
+
+                        if score < best_score:
+                            best_score = score
+                            best_area = area
+                            best_normal = normal.copy()
             except Exception as e:
                 if collect_all_samples:
                     all_samples.append((normal.copy(), float('nan')))
                 logger.debug("Section failed for normal=%s: %s: %s", normal, type(e).__name__, e)
                 continue
 
-    # Fallback: if no valid sections found (e.g. mesh.section fails for real Cura meshes),
-    # try axis-aligned normals and pick the best. Avoids always returning horizontal.
-    if not numpy.isfinite(best_area) or best_area <= 0:
+    # Fallback: if no valid sections found, try axis-aligned normals.
+    if not numpy.isfinite(best_score) or best_area <= 0:
         logger.warning(
             "Smallest cut search found no valid sections (tested %d orientations). "
             "Trying axis-aligned fallback.",
@@ -282,20 +335,33 @@ def find_smallest_cut_plane(
                 if section is not None:
                     path_2d, to_3D = _section_to_2d(section)
                     area = _local_section_area(path_2d, to_3D, plane_origin)
+                    if 0 < area < float('inf'):
+                        score = _compute_score(area, fallback_normal)
+                        valid_candidates.append((score, area, fallback_normal.copy()))
                     if 0 < area < best_area:
                         best_area = area
                         best_normal = fallback_normal.copy()
             except Exception as e:
                 logger.debug("Axis fallback failed for %s: %s", fallback_normal, e)
 
-    logger.debug("Smallest cut search: best_area=%.2f mm^2, normal=%s, tested=%d orientations",
-                 best_area, best_normal, samples_tested)
+    # Sort candidates by score (area * alignment penalty).
+    # Best candidates are aligned with the click AND have small area.
+    valid_candidates.sort(key=lambda x: x[0])  # sort by score
+    # Extract (area, normal) for downstream use
+    top_candidates = [(area, normal) for _, area, normal
+                      in valid_candidates[:100]]
+
+    logger.debug("Smallest cut search: best_area=%.2f mm^2 (score=%.2f), normal=%s, "
+                 "tested=%d orientations, %d valid candidates",
+                 best_area, best_score, best_normal, samples_tested,
+                 len(valid_candidates))
 
     return SmallestPlaneSearchResult(
         plane=CutPlane(origin=plane_origin, normal=best_normal),
         area=best_area,
         samples_tested=samples_tested,
-        all_samples=all_samples
+        all_samples=all_samples,
+        top_candidates=top_candidates,
     )
 
 
@@ -354,10 +420,23 @@ def find_shortest_seam_partition(
         graph[u].append({"v": v, "cap": cap, "rev": len(graph[v])})
         graph[v].append({"v": u, "cap": 0, "rev": len(graph[u]) - 1})
 
-    for (f1, f2), (v1, v2) in zip(adj_pairs, adj_edges):
-        edge_length = float(numpy.linalg.norm(mesh.vertices[v1] - mesh.vertices[v2]))
-        _add_edge(int(f1), int(f2), edge_length)
-        _add_edge(int(f2), int(f1), edge_length)
+    # Compute edge weights for the flow network.
+    # Using raw edge lengths causes min-cut to isolate single small triangles
+    # (cutting 3 short edges is cheaper than any real neck). Adding a constant
+    # per-edge cost ensures the min-cut also minimizes the NUMBER of cut edges,
+    # strongly penalizing single-face isolation.
+    edge_lengths = numpy.array([
+        numpy.linalg.norm(mesh.vertices[v1] - mesh.vertices[v2])
+        for (_, _), (v1, v2) in zip(adj_pairs, adj_edges)
+    ])
+    avg_edge_length = float(numpy.mean(edge_lengths)) if len(edge_lengths) > 0 else 1.0
+
+    for idx, ((f1, f2), (v1, v2)) in enumerate(zip(adj_pairs, adj_edges)):
+        # weight = edge_length + constant ensures cutting N edges costs at least
+        # N * avg_edge_length, making single-triangle isolation expensive
+        weight = float(edge_lengths[idx]) + avg_edge_length
+        _add_edge(int(f1), int(f2), weight)
+        _add_edge(int(f2), int(f1), weight)
 
     # Dijkstra to find farthest face (= sink)
     dist = [float("inf")] * faces_count

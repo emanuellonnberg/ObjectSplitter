@@ -720,7 +720,21 @@ class ObjectSplitter(Tool):
             elif self._cut_mode == self.CUT_MODE_SMALLEST:
                 self._updateProgress("Searching for smallest cross-section...", 20)
                 snap_point, click_face_id = snap_point_to_mesh_surface(tm, click_pos_arr)
-                search_result = find_smallest_cut_plane(tm, snap_point, self._search_resolution)
+
+                # Get the surface normal at the click point — this tells us
+                # the direction the user is clicking from, and strongly biases
+                # the search toward that orientation.
+                click_surface_normal = None
+                if click_face_id is not None and click_face_id < len(tm.face_normals):
+                    click_surface_normal = numpy.array(
+                        tm.face_normals[click_face_id], dtype=numpy.float64
+                    )
+                    Logger.log("d", "Click surface normal: %s", click_surface_normal)
+
+                search_result = find_smallest_cut_plane(
+                    tm, snap_point, self._search_resolution,
+                    surface_normal=click_surface_normal,
+                )
                 plane = search_result.plane
                 Logger.log("i", "Smallest cut: area=%.2f mm^2, tested %d orientations, normal=%s",
                            search_result.area, search_result.samples_tested,
@@ -746,10 +760,17 @@ class ObjectSplitter(Tool):
             if self._cut_mode == self.CUT_MODE_SHORTEST:
                 split_result = split_by_shortest_seam(tm, face_set_a, face_set_b)
             elif self._cut_mode == self.CUT_MODE_SMALLEST:
-                # Use graph-based local separation: only separates the region
-                # near the click, unlike an infinite plane that cuts everything.
+                # Use graph-based local separation with candidate fallback.
+                # If the best plane only grazes the surface (single-triangle cut),
+                # try the next-best candidates until we get a meaningful partition.
+                candidate_normals = []
+                if search_result and search_result.top_candidates:
+                    candidate_normals = [n for _, n in search_result.top_candidates]
+                if not candidate_normals:
+                    candidate_normals = [plane.normal]
+
                 split_result = split_by_local_plane(
-                    tm, plane.origin, plane.normal, click_face_id
+                    tm, plane.origin, candidate_normals, click_face_id
                 )
             else:
                 split_result = slice_mesh_with_fallback(

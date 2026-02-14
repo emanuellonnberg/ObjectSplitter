@@ -222,13 +222,8 @@ def local_plane_partition(
     The algorithm:
     1. Classify each face as "above" or "below" the plane using its centroid.
     2. Build an adjacency graph connecting only faces on the SAME side.
-    3. Find the connected component containing the source face.
-    4. If that component is the smaller half, it's the piece to separate.
-    5. If it's the larger half, find the nearest component on the OTHER side
-       (the small piece the user actually wants to cut off).
-
-    This avoids the "leaking flood-fill" problem that occurs when vertices
-    near the click point have near-zero distances from the plane.
+    3. Find ALL connected components on both sides near the click point.
+    4. Pick the SMALLEST component nearest to the click as the piece to separate.
 
     Args:
         mesh: The trimesh object.
@@ -237,7 +232,7 @@ def local_plane_partition(
         source_face_id: The face the user clicked on.
 
     Returns:
-        (set_a, set_b) where set_a is the piece to separate (smaller, near click).
+        (set_a, set_b) where set_a is the piece to separate.
     """
     from collections import defaultdict, deque
 
@@ -259,100 +254,94 @@ def local_plane_partition(
             graph[f1i].append(f2i)
             graph[f2i].append(f1i)
 
-    # Step 3: BFS from source face to find its connected component
-    source_comp = set()
-    queue = deque([source_face_id])
-    source_comp.add(source_face_id)
-    while queue:
-        face = queue.popleft()
-        for neighbor in graph[face]:
-            if neighbor not in source_comp:
-                source_comp.add(neighbor)
-                queue.append(neighbor)
+    # Helper: BFS to find connected component from a seed face
+    def _bfs_component(seed, allowed=None):
+        comp = set()
+        queue = deque([seed])
+        comp.add(seed)
+        while queue:
+            face = queue.popleft()
+            for neighbor in graph.get(face, []):
+                if neighbor not in comp and (allowed is None or neighbor in allowed):
+                    comp.add(neighbor)
+                    queue.append(neighbor)
+        return comp
 
-    logger.debug("local_plane_partition: source_face=%d on %s side, "
-                 "source_component=%d/%d faces",
-                 source_face_id,
-                 "above" if face_above[source_face_id] else "below",
-                 len(source_comp), n_faces)
+    click_pos = face_centroids[source_face_id]
 
-    # Step 4: If source component is the minority (<=50%), separate it directly
-    if len(source_comp) <= n_faces * 0.5:
-        set_a = sorted(source_comp)
-        set_b = sorted(set(range(n_faces)) - source_comp)
-        logger.debug("local_plane_partition: source component IS the piece to "
-                     "separate (%d faces)", len(set_a))
-        return set_a, set_b
+    # Step 3: Find the source face's component (on its side of the plane)
+    source_comp = _bfs_component(source_face_id)
 
-    # Step 5: Source is on the big side. Find connected components on the
-    # OTHER side and pick the one nearest to the click point.
+    # Step 4: Find the nearest component on the OTHER side
     source_is_above = face_above[source_face_id]
     other_face_ids = set(
         i for i in range(n_faces) if face_above[i] != source_is_above
     )
 
-    if not other_face_ids:
+    nearest_other_comp = None
+    if other_face_ids:
+        remaining = set(other_face_ids)
+        other_components = []
+        while remaining:
+            start = next(iter(remaining))
+            comp = _bfs_component(start, allowed=remaining)
+            remaining -= comp
+            other_components.append(comp)
+
+        # Pick the one nearest to the click point
+        nearest_other_comp = min(
+            other_components,
+            key=lambda c: numpy.linalg.norm(
+                face_centroids[sorted(c)].mean(axis=0) - click_pos
+            )
+        )
+
+    logger.debug("local_plane_partition: source_face=%d, source_comp=%d faces, "
+                 "nearest_other_comp=%s faces, total=%d",
+                 source_face_id, len(source_comp),
+                 len(nearest_other_comp) if nearest_other_comp else "N/A",
+                 n_faces)
+
+    if nearest_other_comp is None:
         logger.warning("local_plane_partition: no faces on the other side of plane")
         return list(range(n_faces)), []
 
-    # Find connected components on the other side
-    remaining = set(other_face_ids)
-    components = []
-    while remaining:
-        start = next(iter(remaining))
-        comp = set()
-        queue = deque([start])
-        comp.add(start)
-        while queue:
-            face = queue.popleft()
-            for neighbor in graph.get(face, []):
-                if neighbor in remaining and neighbor not in comp:
-                    comp.add(neighbor)
-                    queue.append(neighbor)
-        remaining -= comp
-        components.append(comp)
+    # Step 5: Pick the SMALLER of the two candidates.
+    if len(source_comp) <= len(nearest_other_comp):
+        chosen = source_comp
+        logger.debug("local_plane_partition: separating source component "
+                     "(%d faces, smaller)", len(chosen))
+    else:
+        chosen = nearest_other_comp
+        logger.debug("local_plane_partition: separating other-side component "
+                     "(%d faces, smaller)", len(chosen))
 
-    logger.debug("local_plane_partition: %d components on the other side "
-                 "(sizes: %s)", len(components),
-                 [len(c) for c in components[:10]])
-
-    # Pick the component nearest to the click point
-    click_pos = face_centroids[source_face_id]
-    best_comp = min(
-        components,
-        key=lambda c: numpy.linalg.norm(
-            face_centroids[sorted(c)].mean(axis=0) - click_pos
-        )
-    )
-
-    set_a = sorted(best_comp)
-    set_b = sorted(set(range(n_faces)) - set(set_a))
-
-    logger.debug("local_plane_partition: separating other-side component "
-                 "with %d faces (nearest to click), rest=%d faces",
-                 len(set_a), len(set_b))
-
+    set_a = sorted(chosen)
+    set_b = sorted(set(range(n_faces)) - chosen)
     return set_a, set_b
 
 
 def split_by_local_plane(
     mesh: "trimesh.Trimesh",
     plane_origin: numpy.ndarray,
-    plane_normal: numpy.ndarray,
+    candidate_normals: List[numpy.ndarray],
     source_face_id: int,
+    min_face_fraction: float = 0.005,
 ) -> SplitResult:
     """
     Split mesh at the click point using a plane-guided local separation.
 
-    Combines the smallest-cut plane orientation with graph-based separation
-    (like shortest-seam) so only the local region near the click is separated.
-    Distant parts of the mesh remain intact.
+    Tries candidate plane normals in order (sorted by cross-section area).
+    Skips any that produce a partition where either piece has fewer than
+    min_face_fraction of total faces (prevents single-triangle cuts from
+    surface-grazing planes).
 
     Args:
         mesh: The trimesh object.
         plane_origin: A point on the cutting plane.
-        plane_normal: Normal vector of the cutting plane.
+        candidate_normals: List of normal vectors to try, ordered by preference.
         source_face_id: The face the user clicked on.
+        min_face_fraction: Minimum fraction of total faces for each piece (default 0.5%).
 
     Returns:
         SplitResult with the separated piece and the rest.
@@ -361,22 +350,70 @@ def split_by_local_plane(
     result.strategies_attempted.append("local_plane_partition")
 
     plane_origin = numpy.asarray(plane_origin, dtype=numpy.float64)
-    plane_normal = numpy.asarray(plane_normal, dtype=numpy.float64)
+    n_faces = len(mesh.faces)
+    min_faces = max(10, int(n_faces * min_face_fraction))
 
-    set_a, set_b = local_plane_partition(
-        mesh, plane_origin, plane_normal, source_face_id
-    )
+    logger.debug("split_by_local_plane: trying %d candidates, min_faces=%d (%.1f%% of %d)",
+                 len(candidate_normals), min_faces, min_face_fraction * 100, n_faces)
 
-    if len(set_a) == 0 or len(set_b) == 0:
-        result.error = ("Plane does not separate the mesh at this location "
-                        "(all %d faces reachable from click without crossing plane)"
-                        % len(mesh.faces))
-        logger.warning("local_plane_partition: %s", result.error)
+    best_rejected = None  # Track best rejected partition for fallback
+    best_rejected_min = 0
+
+    for i, normal in enumerate(candidate_normals):
+        normal = numpy.asarray(normal, dtype=numpy.float64)
+
+        set_a, set_b = local_plane_partition(
+            mesh, plane_origin, normal, source_face_id,
+        )
+
+        if len(set_a) == 0 or len(set_b) == 0:
+            logger.debug("Candidate %d: empty partition, skipping", i)
+            continue
+
+        smaller = min(len(set_a), len(set_b))
+
+        if smaller < min_faces:
+            # Track the best rejected candidate (largest min-side)
+            # so fallback uses the most balanced partition, not a surface graze
+            if smaller > best_rejected_min:
+                best_rejected = (set_a, set_b, i)
+                best_rejected_min = smaller
+            logger.debug("Candidate %d: partition too small (%d/%d faces, "
+                         "min=%d), skipping",
+                         i, len(set_a), len(set_b), min_faces)
+            continue
+
+        logger.info("Candidate %d accepted: %d/%d faces", i, len(set_a), len(set_b))
+        return split_by_face_sets(mesh, set_a, set_b,
+                                  strategy_name="local_plane_partition")
+
+    # All candidates rejected. Use the best rejected partition (most balanced)
+    # rather than falling back to infinite-plane slice which cuts everything.
+    if best_rejected is not None:
+        set_a, set_b, idx = best_rejected
+        logger.warning("All %d local-plane candidates below min_faces=%d; "
+                       "using best rejected (candidate %d: %d/%d faces)",
+                       len(candidate_normals), min_faces, idx,
+                       len(set_a), len(set_b))
+        return split_by_face_sets(mesh, set_a, set_b,
+                                  strategy_name="local_plane_partition(best_rejected)")
+
+    # Truly no partition found — fall back to infinite-plane slice
+    logger.warning("All %d local-plane candidates gave empty partitions; "
+                   "falling back to infinite-plane slice",
+                   len(candidate_normals))
+    if candidate_normals:
+        # Use the LAST candidate (largest area, most likely a real through-cut)
+        normal = numpy.asarray(candidate_normals[-1], dtype=numpy.float64)
+        result = slice_mesh_with_fallback(mesh, plane_origin, normal,
+                                          face_id=source_face_id)
+        result.strategies_attempted.insert(0, "local_plane_partition(all_empty)")
         return result
 
-    # Use the same submesh + hole-filling approach as shortest-seam
-    return split_by_face_sets(mesh, set_a, set_b,
-                              strategy_name="local_plane_partition")
+    result.error = ("No valid partition found across %d candidate planes "
+                    "(min_faces=%d)" % (len(candidate_normals), min_faces))
+    logger.warning("split_by_local_plane: %s", result.error)
+    return result
 
 
 def split_by_face_sets(
