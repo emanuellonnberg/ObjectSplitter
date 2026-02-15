@@ -1,0 +1,281 @@
+# Copyright (c) 2024 Emanuel Lönnberg.
+# This tool is released under the terms of the LGPLv3 or higher.
+
+"""
+Debug capture and replay system for ObjectSplitter.
+
+Serializes mesh inputs and parameters to disk so that cutting operations
+can be replayed and debugged outside of Cura. This enables:
+  - Capturing a failing cut with its exact inputs
+  - Replaying the operation in a unit test or standalone script
+  - Comparing results across algorithm changes
+"""
+
+import json
+import os
+import time
+import logging
+from pathlib import Path
+from typing import Optional
+from dataclasses import dataclass, asdict
+
+import numpy
+
+logger = logging.getLogger("objectsplitter.debug_capture")
+
+try:
+    import trimesh
+except ImportError:
+    trimesh = None
+
+
+@dataclass
+class CapturedOperation:
+    """All inputs needed to replay a cut operation."""
+    # Identification
+    timestamp: str
+    name: str  # e.g. "horizontal_cut_cube"
+
+    # Input mesh (stored as file path relative to capture dir)
+    mesh_file: str  # .stl or .ply file
+
+    # Cut parameters
+    cut_mode: str  # "horizontal", "vertical", "smallest", "shortest"
+    click_position: list  # [x, y, z]
+    height_percent: float  # for horizontal mode
+    search_resolution: int  # for smallest mode
+
+    # Connector parameters
+    connector_enabled: bool
+    connector_diameter: float
+    connector_height: float
+    connector_clearance: float
+
+    # Optional: plane override (for replaying with a known plane)
+    plane_origin: Optional[list] = None
+    plane_normal: Optional[list] = None
+
+
+def get_capture_dir(base_dir: Optional[str] = None) -> Path:
+    """Get or create the capture directory."""
+    if base_dir:
+        capture_dir = Path(base_dir)
+    else:
+        capture_dir = Path(__file__).parent.parent / "tests" / "fixtures"
+    capture_dir.mkdir(parents=True, exist_ok=True)
+    return capture_dir
+
+
+def capture_operation(
+    mesh: "trimesh.Trimesh",
+    cut_mode: str,
+    click_position: numpy.ndarray,
+    height_percent: float = 50.0,
+    search_resolution: int = 18,
+    connector_enabled: bool = True,
+    connector_diameter: float = 4.0,
+    connector_height: float = 3.0,
+    connector_clearance: float = 0.2,
+    plane_origin: Optional[numpy.ndarray] = None,
+    plane_normal: Optional[numpy.ndarray] = None,
+    name: Optional[str] = None,
+    capture_dir: Optional[str] = None
+) -> str:
+    """
+    Save a mesh and all operation parameters to disk for later replay.
+
+    Args:
+        mesh: The input trimesh object.
+        cut_mode: The cutting mode string.
+        click_position: 3D click position.
+        height_percent: Horizontal cut height percentage.
+        search_resolution: Search resolution for smallest mode.
+        connector_enabled: Whether connectors are enabled.
+        connector_diameter: Connector peg diameter.
+        connector_height: Connector peg height.
+        connector_clearance: Connector hole clearance.
+        plane_origin: Optional pre-computed plane origin.
+        plane_normal: Optional pre-computed plane normal.
+        name: Optional descriptive name for the capture.
+        capture_dir: Optional directory override.
+
+    Returns:
+        Path to the capture directory for this operation.
+    """
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    if name is None:
+        name = f"{cut_mode}_{timestamp}"
+
+    base = get_capture_dir(capture_dir)
+    op_dir = base / name
+    op_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save mesh
+    mesh_file = "input_mesh.stl"
+    mesh.export(str(op_dir / mesh_file))
+
+    # Save parameters
+    op = CapturedOperation(
+        timestamp=timestamp,
+        name=name,
+        mesh_file=mesh_file,
+        cut_mode=cut_mode,
+        click_position=click_position.tolist() if hasattr(click_position, 'tolist') else list(click_position),
+        height_percent=height_percent,
+        search_resolution=search_resolution,
+        connector_enabled=connector_enabled,
+        connector_diameter=connector_diameter,
+        connector_height=connector_height,
+        connector_clearance=connector_clearance,
+        plane_origin=plane_origin.tolist() if plane_origin is not None else None,
+        plane_normal=plane_normal.tolist() if plane_normal is not None else None,
+    )
+
+    with open(op_dir / "params.json", "w") as f:
+        json.dump(asdict(op), f, indent=2)
+
+    logger.info("Captured operation '%s' to %s", name, op_dir)
+    return str(op_dir)
+
+
+def load_captured_operation(capture_path: str) -> tuple:
+    """
+    Load a captured operation from disk.
+
+    Args:
+        capture_path: Path to the capture directory.
+
+    Returns:
+        (mesh, params) tuple where mesh is a trimesh.Trimesh and
+        params is a CapturedOperation dataclass.
+    """
+    op_dir = Path(capture_path)
+
+    with open(op_dir / "params.json", "r") as f:
+        data = json.load(f)
+
+    params = CapturedOperation(**data)
+
+    mesh = trimesh.load(str(op_dir / params.mesh_file))
+
+    logger.info("Loaded captured operation '%s' from %s", params.name, op_dir)
+    return mesh, params
+
+
+def replay_operation(capture_path: str) -> dict:
+    """
+    Replay a captured operation and return the results.
+
+    This is the main entry point for re-running a previously captured
+    cut operation with the exact same inputs.
+
+    Args:
+        capture_path: Path to the capture directory.
+
+    Returns:
+        Dictionary with keys:
+            - 'split_result': SplitResult from mesh_splitter
+            - 'connector_result': ConnectorResult (if connectors enabled)
+            - 'plane': CutPlane used
+            - 'params': The CapturedOperation parameters
+    """
+    from .plane_calculator import (
+        horizontal_cut_plane, vertical_cut_plane,
+        find_smallest_cut_plane, find_shortest_seam_partition, CutPlane
+    )
+    from .mesh_splitter import slice_mesh_with_fallback, split_by_shortest_seam
+    from .connectors import add_connectors, ConnectorConfig
+
+    mesh, params = load_captured_operation(capture_path)
+    click_pos = numpy.array(params.click_position)
+
+    # Determine cut plane
+    if params.plane_origin is not None and params.plane_normal is not None:
+        plane = CutPlane(
+            origin=numpy.array(params.plane_origin),
+            normal=numpy.array(params.plane_normal))
+    elif params.cut_mode == "horizontal":
+        plane = horizontal_cut_plane(mesh, params.height_percent)
+    elif params.cut_mode == "vertical":
+        plane = vertical_cut_plane(click_pos)
+    elif params.cut_mode == "smallest":
+        search_result = find_smallest_cut_plane(
+            mesh, click_pos, params.search_resolution, collect_all_samples=True)
+        plane = search_result.plane
+    elif params.cut_mode == "shortest":
+        plane = None  # Handled differently
+    else:
+        plane = horizontal_cut_plane(mesh, params.height_percent)
+
+    # Perform the split
+    if params.cut_mode == "shortest":
+        face_set_a, face_set_b, _, _ = find_shortest_seam_partition(mesh, click_pos)
+        split_result = split_by_shortest_seam(mesh, face_set_a, face_set_b)
+    else:
+        split_result = slice_mesh_with_fallback(mesh, plane.origin, plane.normal)
+
+    result = {
+        'split_result': split_result,
+        'connector_result': None,
+        'plane': plane,
+        'params': params,
+    }
+
+    # Add connectors if enabled
+    if params.connector_enabled and split_result.success and split_result.capped:
+        if params.cut_mode != "shortest" and plane is not None:
+            config = ConnectorConfig(
+                enabled=True,
+                diameter=params.connector_diameter,
+                height=params.connector_height,
+                clearance=params.connector_clearance)
+            connector_result = add_connectors(
+                split_result.upper, split_result.lower,
+                plane.origin, plane.normal, config)
+            result['connector_result'] = connector_result
+
+    return result
+
+
+def save_result_meshes(
+    result: dict,
+    output_dir: str
+) -> list:
+    """
+    Save the result meshes from a replay to disk for inspection.
+
+    Args:
+        result: Dictionary from replay_operation().
+        output_dir: Directory to save meshes into.
+
+    Returns:
+        List of saved file paths.
+    """
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    saved = []
+
+    split = result.get('split_result')
+    connector = result.get('connector_result')
+
+    # Use connector result meshes if available, otherwise split result
+    if connector is not None and connector.connectors_added:
+        upper = connector.upper
+        lower = connector.lower
+    elif split is not None and split.success:
+        upper = split.upper
+        lower = split.lower
+    else:
+        return saved
+
+    if upper is not None:
+        path = str(out / "result_upper.stl")
+        upper.export(path)
+        saved.append(path)
+
+    if lower is not None:
+        path = str(out / "result_lower.stl")
+        lower.export(path)
+        saved.append(path)
+
+    return saved
