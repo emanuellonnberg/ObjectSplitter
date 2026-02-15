@@ -109,7 +109,8 @@ class ObjectSplitter(Tool):
     CUT_MODE_VERTICAL = "vertical"          # Cut perpendicular to build plate
     CUT_MODE_SMALLEST = "smallest"          # Find smallest cross-section
     CUT_MODE_CUSTOM = "custom"              # User-defined plane orientation
-    CUT_MODE_SHORTEST = "shortest"          # Shortest seam (geodesic loop)
+    CUT_MODE_SHORTEST = "shortest"          # Shortest seam (plane search + refine)
+    CUT_MODE_RADIAL = "radial"              # Radial geodesic cut (dual-Dijkstra)
 
     def __init__(self):
         super().__init__()
@@ -263,7 +264,8 @@ class ObjectSplitter(Tool):
             {"value": self.CUT_MODE_HORIZONTAL, "text": "Horizontal (parallel to bed)"},
             {"value": self.CUT_MODE_VERTICAL, "text": "Vertical"},
             {"value": self.CUT_MODE_SMALLEST, "text": "Smallest cross-section"},
-            {"value": self.CUT_MODE_SHORTEST, "text": "Shortest seam (surface loop)"}
+            {"value": self.CUT_MODE_SHORTEST, "text": "Shortest seam (surface loop)"},
+            {"value": self.CUT_MODE_RADIAL, "text": "Radial (geodesic)"},
         ]
 
     def getCutHeightPercent(self) -> float:
@@ -495,7 +497,7 @@ class ObjectSplitter(Tool):
         plane_size = max(mesh_size[0], mesh_size[2]) * 1.2  # 20% larger than mesh
 
         # For smallest/shortest seam: show arrow at click point along surface normal
-        if self._cut_mode in (self.CUT_MODE_SMALLEST, self.CUT_MODE_SHORTEST):
+        if self._cut_mode in (self.CUT_MODE_SMALLEST, self.CUT_MODE_SHORTEST, self.CUT_MODE_RADIAL):
             center = numpy.array([picked_position.x, picked_position.y, picked_position.z])
             mesh_size_max = max(mesh_size[0], mesh_size[1], mesh_size[2])
             marker_size = max(0.5, mesh_size_max * 0.012)  # 1.2% of mesh or 0.5mm
@@ -743,19 +745,18 @@ class ObjectSplitter(Tool):
                            search_result.area, search_result.samples_tested,
                            str(search_result.plane.normal))
             elif self._cut_mode == self.CUT_MODE_SHORTEST:
-                self._updateProgress("Finding cut region...", 15)
+                # Shortest Seam: plane search + refine_partition_with_mincut
+                self._updateProgress("Finding shortest seam...", 15)
                 snap_point, source_face = snap_point_to_mesh_surface(tm, click_pos_arr)
                 click_face_id = source_face
 
-                # Step 1: Use smallest-cut infrastructure to find the right
-                # cutting region (plane search + local partition).
                 seam_surface_normal = None
                 if source_face is not None and source_face < len(tm.face_normals):
                     seam_surface_normal = numpy.array(
                         tm.face_normals[source_face], dtype=numpy.float64
                     )
-                    Logger.log("d", "Shortest seam surface normal: %s", seam_surface_normal)
 
+                self._updateProgress("Searching for split plane...", 30)
                 search_result = find_smallest_cut_plane(
                     tm, snap_point, self._search_resolution,
                     surface_normal=seam_surface_normal,
@@ -763,49 +764,68 @@ class ObjectSplitter(Tool):
                 Logger.log("d", "Shortest seam plane search: area=%.2f, normal=%s",
                            search_result.area, search_result.plane.normal)
 
-                # Step 2: Get plane-based partition (identifies the region)
+                # Get plane-based partition
                 candidate_normals = []
                 if search_result.top_candidates:
                     candidate_normals = [n for _, n in search_result.top_candidates]
                 if not candidate_normals:
                     candidate_normals = [search_result.plane.normal]
 
-                # Try candidates to find a valid plane partition
-                self._updateProgress("Computing shortest seam...", 30)
-                plane_set_a, plane_set_b = [], []
-                min_faces_seam = max(10, int(len(tm.faces) * 0.005))
+                flat_len = len(tm.faces)
+                face_set_a, face_set_b = [], []
+                min_faces_plane = max(10, int(flat_len * 0.005))
+
                 for ci, cn in enumerate(candidate_normals):
                     cn = numpy.asarray(cn, dtype=numpy.float64)
                     pa, pb = local_plane_partition(
                         tm, snap_point, cn, click_face_id
                     )
-                    if len(pa) >= min_faces_seam and len(pb) >= min_faces_seam:
-                        plane_set_a, plane_set_b = pa, pb
+                    if len(pa) >= min_faces_plane and len(pb) >= min_faces_plane:
+                        face_set_a, face_set_b = pa, pb
                         Logger.log("d", "Shortest seam: plane candidate %d accepted (%d/%d faces)",
                                    ci, len(pa), len(pb))
                         break
 
-                if not plane_set_a:
-                    # No valid plane partition found
-                    Logger.log("w", "Shortest seam: no valid plane partition, "
-                               "using raw min-cut fallback")
-                    face_set_a, face_set_b, src, sink = find_shortest_seam_partition(
-                        tm, snap_point, source_face_hint=source_face,
-                        surface_normal=seam_surface_normal,
-                    )
-                else:
-                    # Step 3: Refine the plane partition with min-cut to find
-                    # a shorter seam that follows the mesh surface.
+                if face_set_a:
+                    # Refine the plane partition
                     Logger.log("d", "Shortest seam: refining plane partition "
                                "(%d/%d) with min-cut...",
-                               len(plane_set_a), len(plane_set_b))
-                    face_set_a, face_set_b = refine_partition_with_mincut(
-                        tm, plane_set_a, plane_set_b
-                    )
-                    Logger.log("d", "Shortest seam: refined partition %d/%d faces",
                                len(face_set_a), len(face_set_b))
+                    face_set_a, face_set_b = refine_partition_with_mincut(
+                        tm, face_set_a, face_set_b
+                    )
+                else:
+                    Logger.log("e", "Shortest seam: plane strategy failed.")
+                    face_set_a, face_set_b = [], []
 
                 plane = None  # No planar cut for shortest seam
+
+            elif self._cut_mode == self.CUT_MODE_RADIAL:
+                # Radial: dual-Dijkstra geodesic partition
+                self._updateProgress("Computing radial cut...", 15)
+                snap_point, source_face = snap_point_to_mesh_surface(tm, click_pos_arr)
+                click_face_id = source_face
+
+                radial_surface_normal = None
+                if source_face is not None and source_face < len(tm.face_normals):
+                    radial_surface_normal = numpy.array(
+                        tm.face_normals[source_face], dtype=numpy.float64
+                    )
+
+                try:
+                    Logger.log("i", "Calling find_shortest_seam_partition (radial)...")
+                    face_set_a, face_set_b, src, sink = find_shortest_seam_partition(
+                        tm, snap_point, source_face_hint=source_face,
+                        surface_normal=radial_surface_normal,
+                    )
+                    Logger.log("i", "Radial search returned. A=%d, B=%d", len(face_set_a), len(face_set_b))
+                except Exception as e:
+                    Logger.log("w", "Radial search error: %s", e)
+                    import traceback
+                    Logger.log("w", traceback.format_exc())
+                    face_set_a, face_set_b = [], []
+
+                plane = None  # No planar cut for radial mode
             else:
                 plane = horizontal_cut_plane(tm, self._cut_height_percent)
 
@@ -814,10 +834,10 @@ class ObjectSplitter(Tool):
 
             # Perform the split (delegates to core.mesh_splitter)
             self._updateProgress("Splitting mesh...", 40)
-            if self._cut_mode == self.CUT_MODE_SHORTEST:
+            if self._cut_mode in (self.CUT_MODE_SHORTEST, self.CUT_MODE_RADIAL):
                 split_result = split_by_face_sets(
                     tm, face_set_a, face_set_b,
-                    strategy_name="shortest_seam"
+                    strategy_name="shortest_seam" if self._cut_mode == self.CUT_MODE_SHORTEST else "radial"
                 )
             elif self._cut_mode == self.CUT_MODE_SMALLEST:
                 # Use graph-based local separation with candidate fallback.

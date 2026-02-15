@@ -84,19 +84,21 @@ Item {
                 id: cutModeComboBox
                 width: 170
                 height: UM.Theme.getSize("setting_control").height
-                model: ["Horizontal", "Vertical", "Smallest Section"]
+                model: ["Horizontal", "Vertical", "Smallest Section", "Shortest Seam", "Radial (geodesic)"]
                 currentIndex: {
                     if (UM.ActiveTool) {
                         var mode = UM.ActiveTool.properties.getValue("CutMode")
                         if (mode === "horizontal") return 0
                         if (mode === "vertical") return 1
                         if (mode === "smallest") return 2
+                        if (mode === "shortest") return 3
+                        if (mode === "radial") return 4
                     }
                     return 0
                 }
                 onActivated: {
                     if (UM.ActiveTool) {
-                        var modeMap = ["horizontal", "vertical", "smallest"]
+                        var modeMap = ["horizontal", "vertical", "smallest", "shortest", "radial"]
                         UM.ActiveTool.setProperty("CutMode", modeMap[currentIndex])
                     }
                 }
@@ -112,6 +114,8 @@ Item {
                     if (mode === "horizontal") return "Cut parallel to the build plate"
                     if (mode === "vertical") return "Cut perpendicular to the build plate"
                     if (mode === "smallest") return "Find smallest cross-section at click point"
+                    if (mode === "shortest") return "Plane search + min-cut refinement"
+                    if (mode === "radial") return "Geodesic distance partition from click"
                 }
                 return ""
             }
