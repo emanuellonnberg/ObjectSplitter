@@ -80,6 +80,7 @@ from .core.geometry import (
     transform_point_to_local,
     create_plane_mesh_data,
     create_marker_mesh_data,
+    create_pin_mesh_data,
 )
 from .core.plane_calculator import (
     horizontal_cut_plane,
@@ -111,6 +112,7 @@ class ObjectSplitter(Tool):
     CUT_MODE_CUSTOM = "custom"              # User-defined plane orientation
     CUT_MODE_SHORTEST = "shortest"          # Shortest seam (plane search + refine)
     CUT_MODE_RADIAL = "radial"              # Radial geodesic cut (dual-Dijkstra)
+    CUT_MODE_PATH = "path"                  # Multi-point geodesic path cut
 
     def __init__(self):
         super().__init__()
@@ -145,6 +147,12 @@ class ObjectSplitter(Tool):
         # Debug capture (derived from _capture_dir: None = off, path = on)
         self._capture_dir = None
 
+        # Path mode state
+        self._path_waypoints = []  # List of 3D positions (numpy arrays)
+        self._path_node = None  # The node being path-cut
+        self._path_preview_nodes = []  # Marker nodes for each waypoint
+        self._path_close_loop = False  # Whether to close the path loop
+
         # State
         self._selection_pass = None
         self._last_picked_node = None
@@ -169,6 +177,10 @@ class ObjectSplitter(Tool):
             # (Note: ConnectorSides not exposed to QML to avoid undefined warnings)
             # Debug capture
             "DebugCaptureEnabled",
+            # Path mode
+            "PathPointCount",
+            "PathCloseLoop",
+            "TriggerPathCut",
         )
 
         Logger.log("d", "Object Splitter Tool initialized (trimesh available: %s)", str(TRIMESH_AVAILABLE))
@@ -255,6 +267,7 @@ class ObjectSplitter(Tool):
     def setCutMode(self, mode: str) -> None:
         if mode != self._cut_mode:
             self._cut_mode = mode
+            self._clearPathWaypoints()  # Clear path state on mode change
             Logger.log("d", "Cut mode changed to: %s", mode)
             self.propertyChanged.emit()
 
@@ -266,6 +279,7 @@ class ObjectSplitter(Tool):
             {"value": self.CUT_MODE_SMALLEST, "text": "Smallest cross-section"},
             {"value": self.CUT_MODE_SHORTEST, "text": "Shortest seam (surface loop)"},
             {"value": self.CUT_MODE_RADIAL, "text": "Radial (geodesic)"},
+            {"value": self.CUT_MODE_PATH, "text": "Path (multi-point)"},
         ]
 
     def getCutHeightPercent(self) -> float:
@@ -362,8 +376,114 @@ class ObjectSplitter(Tool):
             self.propertyChanged.emit()
 
     # ==========================================================================
-    # Event Handling
+    # Path Mode Properties
     # ==========================================================================
+
+    def getPathPointCount(self) -> int:
+        return len(self._path_waypoints)
+
+    def getPathCloseLoop(self) -> bool:
+        return self._path_close_loop
+
+    def setPathCloseLoop(self, value: bool):
+        self._path_close_loop = bool(value)
+        self.propertyChanged.emit()
+
+    def getTriggerPathCut(self) -> bool:
+        return False  # Write-only property, always reads as False
+
+    def setTriggerPathCut(self, value: bool):
+        """Called from QML to trigger the path cut."""
+        if value:
+            self._executePathCut()
+
+    def _clearPathWaypoints(self):
+        """Clear all path waypoints and remove preview markers."""
+        self._path_waypoints.clear()
+        self._path_node = None
+        for node in self._path_preview_nodes:
+            try:
+                scene = self._controller.getScene()
+                if node.getParent():
+                    node.setParent(None)
+            except Exception:
+                pass
+        self._path_preview_nodes.clear()
+        self._removePreview()
+        self.propertyChanged.emit()
+
+    def _addPathWaypoint(self, position, picked_node):
+        """Add a waypoint for path mode and show a pin marker."""
+        pos_arr = numpy.array([position.x, position.y, position.z])
+
+        # Ensure all waypoints are on the same node
+        if self._path_node is not None and self._path_node != picked_node:
+            Logger.log("w", "Path mode: clicked a different object, clearing path")
+            self._clearPathWaypoints()
+
+        self._path_node = picked_node
+        self._path_waypoints.append(pos_arr)
+        Logger.log("i", "Path mode: added waypoint %d at %s",
+                   len(self._path_waypoints), pos_arr)
+
+        # Draw pin marker at this point
+        mesh_data = picked_node.getMeshData()
+        if mesh_data:
+            transformed = mesh_data.getTransformed(picked_node.getWorldTransformation())
+            verts = transformed.getVertices()
+            mesh_size = verts.max(axis=0) - verts.min(axis=0)
+            mesh_size_max = max(mesh_size[0], mesh_size[1], mesh_size[2])
+            pin_size = max(0.8, mesh_size_max * 0.02)  # Slightly larger than arrow for visibility
+
+            # Compute face normal at click point for pin orientation
+            face_normal = None
+            try:
+                indices_raw = transformed.getIndices()
+                verts_arr = numpy.asarray(verts, dtype=numpy.float64)
+                if indices_raw is not None:
+                    indices_arr = numpy.asarray(indices_raw, dtype=numpy.int32)
+                else:
+                    indices_arr = numpy.arange(len(verts_arr), dtype=numpy.int32).reshape(-1, 3)
+                tm_snap = trimesh.Trimesh(vertices=verts_arr, faces=indices_arr)
+                tm_snap.merge_vertices()
+                from .core.plane_calculator import snap_point_to_mesh_surface
+                _, face_id = snap_point_to_mesh_surface(tm_snap, pos_arr)
+                if face_id is not None and face_id < len(tm_snap.face_normals):
+                    face_normal = numpy.array(tm_snap.face_normals[face_id], dtype=numpy.float64)
+            except Exception:
+                pass  # Fall back to default Y-up pin
+
+            marker_node = self._createPreviewNode()
+            vertices, indices = create_pin_mesh_data(pos_arr, pin_size, face_normal)
+            mesh_builder = MeshBuilder()
+            mesh_builder.setVertices(vertices)
+            mesh_builder.setIndices(indices)
+            n_verts = len(vertices)
+            # Cyan pins for placed waypoints (distinct from orange hover arrow)
+            colors = numpy.array([[0.0, 0.85, 0.9, 0.9]] * n_verts, dtype=numpy.float32)
+            mesh_builder.setColors(colors)
+            mesh_builder.calculateNormals()
+            marker_node.setMeshData(mesh_builder.build())
+            self._path_preview_nodes.append(marker_node)
+
+        self.propertyChanged.emit()
+
+    def _executePathCut(self):
+        """Execute the cut along the accumulated path waypoints."""
+        if len(self._path_waypoints) < 2:
+            Logger.log("w", "Path mode: need at least 2 points to cut")
+            return
+        if self._path_node is None:
+            Logger.log("w", "Path mode: no node selected")
+            return
+
+        node = self._path_node
+        waypoints = list(self._path_waypoints)  # Copy before clearing
+        # Optionally close the loop
+        if self._path_close_loop and len(waypoints) >= 3:
+            waypoints.append(waypoints[0].copy())
+        self._clearPathWaypoints()
+        self._performPathCut(node, waypoints)
 
     def event(self, event):
         super().event(event)
@@ -374,6 +494,8 @@ class ObjectSplitter(Tool):
         if event.type == Event.MouseMoveEvent and self._show_preview:
             self._updatePreview(event.x, event.y)
             return
+
+        # (Right-click no longer triggers path cut — use the Cut button instead)
 
         if event.type == Event.MousePressEvent and MouseEvent.LeftButton in event.buttons and self._controller.getToolsEnabled():
             if ctrl_is_active:
@@ -414,6 +536,11 @@ class ObjectSplitter(Tool):
             picking_pass = PickingPass(active_camera.getViewportWidth(), active_camera.getViewportHeight())
             picking_pass.render()
             picked_position = picking_pass.getPickedPosition(event.x, event.y)
+
+            # PATH MODE: accumulate waypoints instead of cutting immediately
+            if self._cut_mode == self.CUT_MODE_PATH:
+                self._addPathWaypoint(picked_position, picked_node)
+                return
 
             Logger.log("i", "Splitting object '%s' at position %s", picked_node.getName(), str(picked_position))
 
@@ -497,7 +624,7 @@ class ObjectSplitter(Tool):
         plane_size = max(mesh_size[0], mesh_size[2]) * 1.2  # 20% larger than mesh
 
         # For smallest/shortest seam: show arrow at click point along surface normal
-        if self._cut_mode in (self.CUT_MODE_SMALLEST, self.CUT_MODE_SHORTEST, self.CUT_MODE_RADIAL):
+        if self._cut_mode in (self.CUT_MODE_SMALLEST, self.CUT_MODE_SHORTEST, self.CUT_MODE_RADIAL, self.CUT_MODE_PATH):
             center = numpy.array([picked_position.x, picked_position.y, picked_position.z])
             mesh_size_max = max(mesh_size[0], mesh_size[1], mesh_size[2])
             marker_size = max(0.5, mesh_size_max * 0.012)  # 1.2% of mesh or 0.5mm
@@ -927,6 +1054,99 @@ class ObjectSplitter(Tool):
 
         except Exception as e:
             Logger.log("e", "Error during cut operation: %s", str(e))
+        finally:
+            self._closeProgress()
+    def _performPathCut(self, node, waypoints):
+        """Execute a path-based cut using multiple waypoints."""
+        try:
+            self._showProgress("Object Splitter", "Computing path cut...", 0, 100)
+
+            mesh_data = node.getMeshData()
+            if not mesh_data:
+                Logger.log("e", "Path cut: no mesh data")
+                return
+
+            # Transform to world space
+            world_transform = node.getWorldTransformation()
+            transformed = mesh_data.getTransformed(world_transform)
+            world_vertices = transformed.getVertices()
+            world_faces = (transformed.getIndices() if transformed.getIndices() is not None
+                           else numpy.arange(len(world_vertices)).reshape(-1, 3))
+
+            # Create trimesh — merge vertices for proper edge connectivity
+            tm = trimesh.Trimesh(vertices=world_vertices, faces=world_faces,
+                                 process=False, validate=False)
+            tm.merge_vertices()
+
+            Logger.log("i", "Path cut: %d waypoints on mesh with %d verts, %d faces",
+                       len(waypoints), len(tm.vertices), len(tm.faces))
+
+            self._updateProgress("Computing geodesic path...", 20)
+
+            from .core.path_cutter import chain_paths, partition_faces_by_path
+
+            # Find geodesic path through all waypoints
+            vertex_path = chain_paths(tm, waypoints)
+            Logger.log("i", "Path cut: geodesic path has %d vertices", len(vertex_path))
+
+            self._updateProgress("Partitioning faces...", 50)
+
+            # Partition faces along the path
+            face_set_a, face_set_b = partition_faces_by_path(tm, vertex_path)
+            Logger.log("i", "Path cut: partition %d / %d faces",
+                       len(face_set_a), len(face_set_b))
+
+            if not face_set_a or not face_set_b:
+                Logger.log("e", "Path cut: failed to create valid partition")
+                self._closeProgress()
+                return
+
+            # Split using face sets (same as shortest/radial modes)
+            self._updateProgress("Splitting mesh...", 70)
+            split_result = split_by_face_sets(
+                tm, face_set_a, face_set_b,
+                strategy_name="path_cut"
+            )
+
+            Logger.log("i", "Path cut split result: %s", split_result.summary())
+
+            if not split_result.success:
+                Logger.log("e", "Path cut failed: %s", split_result.error)
+                self._closeProgress()
+                return
+
+            mesh_upper = split_result.upper
+            mesh_lower = split_result.lower
+
+            # Connectors not supported for path mode (no cut plane)
+            if self._connector_enabled:
+                Logger.log("w", "Skipping connectors - not supported for path cut mode")
+
+            # Create scene nodes and replace original
+            node_upper = self._createMeshNode(
+                mesh_upper.vertices, mesh_upper.faces,
+                node.getName() + " (A)")
+            node_lower = self._createMeshNode(
+                mesh_lower.vertices, mesh_lower.faces,
+                node.getName() + " (B)")
+
+            op = GroupedOperation()
+            scene_root = self._controller.getScene().getRoot()
+            op.addOperation(AddSceneNodeOperation(node_upper, scene_root))
+            op.addOperation(AddSceneNodeOperation(node_lower, scene_root))
+            op.addOperation(RemoveSceneNodeOperation(node))
+            op.push()
+
+            CuraApplication.getInstance().getController().getScene().sceneChanged.emit(node_upper)
+
+            self._updateProgress("Done!", 100)
+            Logger.log("i", "Path cut complete: created '%s' and '%s'",
+                       node_upper.getName(), node_lower.getName())
+
+        except Exception as e:
+            Logger.log("e", "Error during path cut: %s", str(e))
+            import traceback
+            Logger.log("e", traceback.format_exc())
         finally:
             self._closeProgress()
 

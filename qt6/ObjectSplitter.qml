@@ -84,7 +84,7 @@ Item {
                 id: cutModeComboBox
                 width: 170
                 height: UM.Theme.getSize("setting_control").height
-                model: ["Horizontal", "Vertical", "Smallest Section", "Shortest Seam", "Radial (geodesic)"]
+                model: ["Horizontal", "Vertical", "Smallest Section", "Shortest Seam", "Radial (geodesic)", "Path (multi-point)"]
                 currentIndex: {
                     if (UM.ActiveTool) {
                         var mode = UM.ActiveTool.properties.getValue("CutMode")
@@ -93,12 +93,13 @@ Item {
                         if (mode === "smallest") return 2
                         if (mode === "shortest") return 3
                         if (mode === "radial") return 4
+                        if (mode === "path") return 5
                     }
                     return 0
                 }
                 onActivated: {
                     if (UM.ActiveTool) {
-                        var modeMap = ["horizontal", "vertical", "smallest", "shortest", "radial"]
+                        var modeMap = ["horizontal", "vertical", "smallest", "shortest", "radial", "path"]
                         UM.ActiveTool.setProperty("CutMode", modeMap[currentIndex])
                     }
                 }
@@ -116,6 +117,7 @@ Item {
                     if (mode === "smallest") return "Find smallest cross-section at click point"
                     if (mode === "shortest") return "Plane search + min-cut refinement"
                     if (mode === "radial") return "Geodesic distance partition from click"
+                    if (mode === "path") return "Click to place points, then press Cut"
                 }
                 return ""
             }
@@ -123,6 +125,58 @@ Item {
             color: UM.Theme.getColor("text_inactive")
             wrapMode: Text.WordWrap
             renderType: Text.NativeRendering
+        }
+
+        // Path mode controls
+        Column {
+            width: parent.width
+            spacing: Math.round(UM.Theme.getSize("default_margin").height / 2)
+            visible: UM.ActiveTool && UM.ActiveTool.properties.getValue("CutMode") === "path"
+
+            Label {
+                text: "Points placed: " + (UM.ActiveTool ? UM.ActiveTool.properties.getValue("PathPointCount") : 0)
+                font: UM.Theme.getFont("default")
+                color: UM.Theme.getColor("text")
+                renderType: Text.NativeRendering
+            }
+
+            CheckBox {
+                id: closeLoopCheckbox
+                text: "Close loop"
+                checked: UM.ActiveTool ? UM.ActiveTool.properties.getValue("PathCloseLoop") : false
+                onClicked: {
+                    if (UM.ActiveTool) {
+                        UM.ActiveTool.setProperty("PathCloseLoop", checked)
+                    }
+                }
+            }
+
+            Row {
+                spacing: Math.round(UM.Theme.getSize("default_margin").width / 2)
+
+                Button {
+                    text: "Clear Points"
+                    width: 85
+                    height: UM.Theme.getSize("setting_control").height
+                    onClicked: {
+                        if (UM.ActiveTool) {
+                            UM.ActiveTool.setProperty("CutMode", "path")  // triggers clear
+                        }
+                    }
+                }
+
+                Button {
+                    text: "Cut Along Path"
+                    width: 100
+                    height: UM.Theme.getSize("setting_control").height
+                    enabled: UM.ActiveTool && UM.ActiveTool.properties.getValue("PathPointCount") >= 2
+                    onClicked: {
+                        if (UM.ActiveTool) {
+                            UM.ActiveTool.setProperty("TriggerPathCut", true)
+                        }
+                    }
+                }
+            }
         }
 
         // Separator

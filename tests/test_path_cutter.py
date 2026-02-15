@@ -1,0 +1,272 @@
+"""
+Unit tests for core.path_cutter module.
+
+Tests geodesic path finding, waypoint chaining, and face partitioning.
+"""
+import sys
+import os
+import pytest
+import numpy as np
+
+# Add project root to path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+import trimesh
+from core.path_cutter import find_geodesic_path, chain_paths, partition_faces_by_path
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def make_grid_mesh(nx: int = 5, ny: int = 5) -> trimesh.Trimesh:
+    """
+    Create a flat grid mesh on the XY plane with nx*ny vertices.
+    Vertices are laid out in a regular grid [0..nx-1] x [0..ny-1].
+    """
+    vertices = []
+    for j in range(ny):
+        for i in range(nx):
+            vertices.append([float(i), float(j), 0.0])
+    vertices = np.array(vertices, dtype=np.float64)
+
+    faces = []
+    for j in range(ny - 1):
+        for i in range(nx - 1):
+            v0 = j * nx + i
+            v1 = v0 + 1
+            v2 = v0 + nx
+            v3 = v2 + 1
+            faces.append([v0, v1, v2])
+            faces.append([v1, v3, v2])
+    faces = np.array(faces, dtype=np.int32)
+
+    return trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+
+
+def make_cylinder_mesh(radius: float = 1.0, height: float = 2.0,
+                       sections: int = 16) -> trimesh.Trimesh:
+    """Create a cylinder mesh for testing on curved surfaces."""
+    mesh = trimesh.creation.cylinder(radius=radius, height=height,
+                                      sections=sections)
+    mesh.merge_vertices()
+    return mesh
+
+
+# ===========================================================================
+# Tests for find_geodesic_path
+# ===========================================================================
+
+class TestFindGeodesicPath:
+    """Tests for vertex-based Dijkstra shortest path."""
+
+    def test_adjacent_vertices(self):
+        """Path between adjacent vertices should be just those two vertices."""
+        mesh = make_grid_mesh(5, 5)
+        path = find_geodesic_path(mesh, 0, 1)
+        assert path[0] == 0
+        assert path[-1] == 1
+        assert len(path) == 2
+
+    def test_same_vertex(self):
+        """Path from vertex to itself should be just that vertex."""
+        mesh = make_grid_mesh(5, 5)
+        path = find_geodesic_path(mesh, 7, 7)
+        assert path == [7]
+
+    def test_path_exists(self):
+        """Path between distant vertices on connected mesh should exist."""
+        mesh = make_grid_mesh(5, 5)
+        # Corner to opposite corner
+        path = find_geodesic_path(mesh, 0, 24)
+        assert len(path) >= 2
+        assert path[0] == 0
+        assert path[-1] == 24
+
+    def test_path_vertices_are_connected(self):
+        """Each consecutive pair in the path should share an edge."""
+        mesh = make_grid_mesh(5, 5)
+        path = find_geodesic_path(mesh, 0, 24)
+
+        edges_set = set()
+        for edge in mesh.edges_unique:
+            edges_set.add((edge[0], edge[1]))
+            edges_set.add((edge[1], edge[0]))
+
+        for i in range(len(path) - 1):
+            assert (path[i], path[i + 1]) in edges_set, \
+                f"Vertices {path[i]} and {path[i+1]} are not connected by an edge"
+
+    def test_path_is_shortest(self):
+        """On a grid, diagonal path should exist and be reasonably short."""
+        mesh = make_grid_mesh(5, 5)
+        path = find_geodesic_path(mesh, 0, 24)
+
+        # Compute path length
+        path_length = 0.0
+        verts = mesh.vertices
+        for i in range(len(path) - 1):
+            path_length += np.linalg.norm(verts[path[i + 1]] - verts[path[i]])
+
+        # L-shaped path length = 4 + 4 = 8
+        # Euclidean distance = 4*sqrt(2) ≈ 5.66
+        # The grid has diagonal edges (triangle hypotenuse = sqrt(2))
+        # So the path should be <= 8.0 (it might be exactly 8 if no diagonals 
+        # align, or shorter if diagonals do)
+        assert path_length <= 8.0 + 1e-6, \
+            f"Path length {path_length} exceeds L-path upper bound"
+        # Path must be at least the Euclidean distance
+        euclidean = np.linalg.norm(verts[24] - verts[0])
+        assert path_length >= euclidean - 1e-6, \
+            f"Path length {path_length} is less than Euclidean distance {euclidean}"
+
+    def test_disconnected_raises(self):
+        """Path between disconnected components should raise ValueError."""
+        # Create two separate triangles
+        vertices = np.array([
+            [0, 0, 0], [1, 0, 0], [0, 1, 0],  # Triangle A
+            [5, 5, 0], [6, 5, 0], [5, 6, 0],  # Triangle B
+        ], dtype=np.float64)
+        faces = np.array([[0, 1, 2], [3, 4, 5]], dtype=np.int32)
+        mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+
+        with pytest.raises(ValueError, match="[Nn]o path"):
+            find_geodesic_path(mesh, 0, 3)
+
+    def test_on_cylinder(self):
+        """Path on curved surface (cylinder) should work."""
+        mesh = make_cylinder_mesh()
+        # Pick two vertices on opposite sides
+        v0 = 0
+        v1 = len(mesh.vertices) // 2
+        path = find_geodesic_path(mesh, v0, v1)
+        assert len(path) >= 2
+        assert path[0] == v0
+        assert path[-1] == v1
+
+
+# ===========================================================================
+# Tests for chain_paths
+# ===========================================================================
+
+class TestChainPaths:
+    """Tests for waypoint chaining."""
+
+    def test_two_waypoints(self):
+        """Chaining two waypoints should produce a valid path."""
+        mesh = make_grid_mesh(5, 5)
+        wp1 = np.array([0.1, 0.1, 0.0])  # Near vertex 0
+        wp2 = np.array([3.9, 3.9, 0.0])  # Near vertex 24
+        path = chain_paths(mesh, [wp1, wp2])
+        assert len(path) >= 2
+
+    def test_three_waypoints(self):
+        """Chaining three waypoints should visit vertices near each."""
+        mesh = make_grid_mesh(5, 5)
+        wp1 = np.array([0.0, 0.0, 0.0])  # vertex 0
+        wp2 = np.array([4.0, 0.0, 0.0])  # vertex 4
+        wp3 = np.array([4.0, 4.0, 0.0])  # vertex 24
+        path = chain_paths(mesh, [wp1, wp2, wp3])
+        assert len(path) >= 3
+        # Path should start near wp1 and end near wp3
+        assert path[0] == 0  # Nearest to [0,0,0]
+        assert path[-1] == 24  # Nearest to [4,4,0]
+
+    def test_single_waypoint_raises(self):
+        """Chain with <2 waypoints should raise ValueError."""
+        mesh = make_grid_mesh(5, 5)
+        with pytest.raises(ValueError):
+            chain_paths(mesh, [np.array([0.0, 0.0, 0.0])])
+
+    def test_no_duplicate_vertices(self):
+        """Chained path should not have consecutive duplicate vertices."""
+        mesh = make_grid_mesh(5, 5)
+        wp1 = np.array([0.0, 0.0, 0.0])
+        wp2 = np.array([2.0, 2.0, 0.0])
+        wp3 = np.array([4.0, 4.0, 0.0])
+        path = chain_paths(mesh, [wp1, wp2, wp3])
+        for i in range(len(path) - 1):
+            assert path[i] != path[i + 1], \
+                f"Consecutive duplicate at index {i}: vertex {path[i]}"
+
+
+# ===========================================================================
+# Tests for partition_faces_by_path
+# ===========================================================================
+
+class TestPartitionFacesByPath:
+    """Tests for face partitioning along a path."""
+
+    def test_basic_partition(self):
+        """Partitioning should produce two non-empty sets covering all faces."""
+        mesh = make_grid_mesh(5, 5)
+        # Create a path across the middle row
+        path = find_geodesic_path(mesh, 2, 22)  # Column 2, rows 0-4
+        face_a, face_b = partition_faces_by_path(mesh, path)
+
+        assert len(face_a) > 0, "Partition A is empty"
+        assert len(face_b) > 0, "Partition B is empty"
+
+        # Together should cover all faces (some boundary faces may be in either)
+        all_faces = set(face_a) | set(face_b)
+        assert len(all_faces) == len(mesh.faces), \
+            f"Partitions cover {len(all_faces)} faces but mesh has {len(mesh.faces)}"
+
+    def test_no_overlap(self):
+        """Partitions should not overlap."""
+        mesh = make_grid_mesh(5, 5)
+        path = find_geodesic_path(mesh, 2, 22)
+        face_a, face_b = partition_faces_by_path(mesh, path)
+        overlap = set(face_a) & set(face_b)
+        assert len(overlap) == 0, f"Partitions overlap on {len(overlap)} faces"
+
+    def test_partition_on_cylinder(self):
+        """Partition on cylinder should produce two non-empty halves."""
+        mesh = make_cylinder_mesh(sections=16)
+        # Find two vertices roughly on opposite ends
+        verts = mesh.vertices
+        # Top vertex (max z) and bottom vertex (min z)
+        top_v = int(np.argmax(verts[:, 2]))
+        bot_v = int(np.argmin(verts[:, 2]))
+        path = find_geodesic_path(mesh, top_v, bot_v)
+        face_a, face_b = partition_faces_by_path(mesh, path)
+
+        total = len(mesh.faces)
+        assert len(face_a) > 0, "Partition A is empty"
+        assert len(face_b) > 0, "Partition B is empty"
+        assert len(face_a) + len(face_b) == total, \
+            f"Partitions don't cover all faces: {len(face_a)} + {len(face_b)} != {total}"
+
+    def test_short_path_partition(self):
+        """Even a short path (2 vertices) should partition."""
+        mesh = make_grid_mesh(5, 5)
+        path = [0, 1]
+        face_a, face_b = partition_faces_by_path(mesh, path)
+        assert len(face_a) + len(face_b) == len(mesh.faces)
+
+    def test_path_cut_on_stl(self):
+        """Test path cut on captured STL fixture if available."""
+        fixture_dir = os.path.join(os.path.dirname(__file__), "fixtures")
+        stl_path = os.path.join(fixture_dir, "captured_model_small.stl")
+        if not os.path.exists(stl_path):
+            pytest.skip("STL fixture not available")
+
+        mesh = trimesh.load(stl_path, force="mesh")
+        mesh.merge_vertices()
+
+        # Pick two distant vertices
+        verts = mesh.vertices
+        distances = np.linalg.norm(verts - verts[0], axis=1)
+        far_vertex = int(np.argmax(distances))
+
+        path = find_geodesic_path(mesh, 0, far_vertex)
+        assert len(path) >= 2
+
+        face_a, face_b = partition_faces_by_path(mesh, path)
+        assert len(face_a) > 0
+        assert len(face_b) > 0
+        assert len(face_a) + len(face_b) == len(mesh.faces)
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

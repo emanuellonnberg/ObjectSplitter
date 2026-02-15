@@ -320,3 +320,81 @@ def create_marker_mesh_data(
     ], dtype=numpy.float32)
     indices = numpy.array(faces, dtype=numpy.int32)
     return vertices, indices
+
+
+def create_pin_mesh_data(
+    center: numpy.ndarray,
+    size: float = 1.0,
+    direction: Optional[numpy.ndarray] = None,
+) -> Tuple[numpy.ndarray, numpy.ndarray]:
+    """
+    Generate vertices and face indices for a pin/dot marker (diamond shape)
+    placed at a surface point. The pin has a small diamond head sitting on the
+    surface and a thin spike poking into the surface for anchoring.
+
+    Args:
+        center: 3D point on the surface.
+        size: Scale factor. Diamond radius = size * 0.4.
+        direction: Surface normal direction. Pin head extends outward.
+                   Defaults to [0, 1, 0].
+
+    Returns:
+        (vertices, indices) as numpy arrays.
+    """
+    s = float(size)
+    c = numpy.asarray(center, dtype=numpy.float64)
+
+    if direction is not None:
+        d = numpy.asarray(direction, dtype=numpy.float64)
+        norm = numpy.linalg.norm(d)
+        if norm > 1e-10:
+            d = d / norm
+        else:
+            d = numpy.array([0.0, 1.0, 0.0])
+    else:
+        d = numpy.array([0.0, 1.0, 0.0])
+
+    # Diamond proportions (built along +Y axis, base at origin)
+    diamond_radius = s * 0.4
+    diamond_height_up = s * 0.6    # height of upper half above base
+    diamond_height_down = s * 0.25  # height of lower half (into surface)
+    spike_length = s * 0.3          # thin spike going into surface
+
+    n_sides = 6  # hexagonal cross-section
+    angles = numpy.linspace(0, 2 * numpy.pi, n_sides, endpoint=False)
+
+    verts_local = []
+    faces = []
+
+    # Base ring (equator of diamond, at Y=0 = surface)
+    for a in angles:
+        verts_local.append(numpy.array([
+            diamond_radius * numpy.cos(a), 0.0, diamond_radius * numpy.sin(a)
+        ]))
+
+    # Top point (above surface)
+    top_idx = len(verts_local)
+    verts_local.append(numpy.array([0.0, diamond_height_up, 0.0]))
+
+    # Bottom point (into surface)
+    bot_idx = len(verts_local)
+    verts_local.append(numpy.array([0.0, -(diamond_height_down + spike_length), 0.0]))
+
+    # Upper cone faces (base ring to top)
+    for i in range(n_sides):
+        j = (i + 1) % n_sides
+        faces.append([i, j, top_idx])
+
+    # Lower cone faces (base ring to bottom, reversed winding)
+    for i in range(n_sides):
+        j = (i + 1) % n_sides
+        faces.append([i, bot_idx, j])
+
+    # Rotate from +Y to surface normal direction
+    R = rotation_matrix_from_vectors(numpy.array([0.0, 1.0, 0.0]), d)
+
+    vertices = numpy.array([
+        c + R @ v for v in verts_local
+    ], dtype=numpy.float32)
+    indices = numpy.array(faces, dtype=numpy.int32)
+    return vertices, indices
