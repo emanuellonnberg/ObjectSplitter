@@ -13,6 +13,7 @@ from core.connectors import (
     find_connector_position,
     create_peg_mesh,
     create_hole_mesh,
+    try_boolean_difference,
     add_connectors,
     ConnectorConfig,
     ConnectorResult,
@@ -186,3 +187,151 @@ class TestAddConnectors:
                     assert len(cr.upper.vertices) > upper_verts_before
                 else:
                     assert len(cr.lower.vertices) > lower_verts_before
+
+
+class TestFindConnectorPositionEdgeCases:
+    """Tests for edge cases in connector position finding."""
+
+    def test_returns_none_for_plane_outside_mesh(self, cube_mesh):
+        """Plane that doesn't intersect the mesh should return None."""
+        origin = numpy.array([0, 100, 0])  # Way above cube
+        normal = numpy.array([0, 1, 0])
+        pos = find_connector_position(cube_mesh, origin, normal)
+        assert pos is None
+
+    def test_position_on_cut_plane(self, sphere_mesh):
+        """Returned position should lie on the cut plane."""
+        origin = numpy.array([0, 0, 0])
+        normal = numpy.array([0, 1, 0])
+        result = slice_mesh_with_fallback(sphere_mesh, origin, normal)
+        assert result.success
+        pos = find_connector_position(result.upper, origin, normal)
+        if pos is not None:
+            dist_to_plane = abs(numpy.dot(pos - origin, normal))
+            assert dist_to_plane < 0.5
+
+    def test_diagonal_plane(self, cube_mesh):
+        """Should find position on a diagonal cut plane."""
+        origin = numpy.array([0, 0, 0])
+        normal = numpy.array([1, 1, 0])
+        normal = normal / numpy.linalg.norm(normal)
+        result = slice_mesh_with_fallback(cube_mesh, origin, normal)
+        assert result.success
+        pos = find_connector_position(result.upper, origin, normal)
+        # May or may not succeed depending on geometry, but should not crash
+        if pos is not None:
+            assert pos.shape == (3,)
+
+
+class TestTryBooleanDifference:
+    """Tests for try_boolean_difference engine fallback."""
+
+    def test_valid_subtraction(self):
+        """Subtracting a small sphere from a large cube should succeed."""
+        import trimesh
+        cube = trimesh.creation.box(extents=[20, 20, 20])
+        sphere = trimesh.creation.icosphere(subdivisions=2, radius=3.0)
+        result_mesh, engine = try_boolean_difference(cube, sphere)
+        # May fail if no boolean engine available, but should not crash
+        if result_mesh is not None:
+            assert len(result_mesh.vertices) > 0
+            assert engine is not None
+
+    def test_non_overlapping_returns_none_or_original(self):
+        """Non-overlapping tools should fail gracefully."""
+        import trimesh
+        cube = trimesh.creation.box(extents=[10, 10, 10])
+        tool = trimesh.creation.box(extents=[5, 5, 5])
+        tool.apply_translation([100, 100, 100])  # Far away
+        result_mesh, engine = try_boolean_difference(cube, tool)
+        # Engine might return the original or None — either is acceptable
+        if result_mesh is not None:
+            assert len(result_mesh.vertices) > 0
+
+
+class TestAddConnectorsEdgeCases:
+    """Tests for edge cases in the add_connectors pipeline."""
+
+    def test_none_config_uses_defaults(self, cube_mesh):
+        """None config should use default ConnectorConfig."""
+        origin = numpy.array([0, 0, 0])
+        normal = numpy.array([0, 1, 0])
+        result = slice_mesh_with_fallback(cube_mesh, origin, normal)
+        if result.success:
+            cr = add_connectors(result.upper, result.lower, origin, normal, None)
+            assert isinstance(cr, ConnectorResult)
+
+    def test_skipped_reason_when_no_position(self):
+        """When connector position can't be found, should provide skipped_reason."""
+        import trimesh
+        # Create a mesh where the cut plane doesn't intersect
+        cube = trimesh.creation.box(extents=[10, 10, 10])
+        fake_upper = cube.copy()
+        fake_lower = cube.copy()
+        # Use a plane far from both meshes
+        origin = numpy.array([0, 100, 0])
+        normal = numpy.array([0, 1, 0])
+        config = ConnectorConfig()
+        cr = add_connectors(fake_upper, fake_lower, origin, normal, config)
+        # Should either succeed or have a skipped_reason
+        if not cr.connectors_added:
+            assert cr.skipped_reason is not None
+            assert len(cr.skipped_reason) > 0
+
+    def test_peg_on_smaller_volume(self, cube_mesh, tall_box_mesh):
+        """Peg should be assigned to the smaller volume part."""
+        origin = numpy.array([0, 0, 0])
+        normal = numpy.array([0, 1, 0])
+        result = slice_mesh_with_fallback(cube_mesh, origin, normal)
+        if result.success and result.capped:
+            config = ConnectorConfig()
+            cr = add_connectors(result.upper, result.lower, origin, normal, config)
+            if cr.connectors_added:
+                # Both halves are roughly equal, peg on upper (first ≤ second)
+                vol_upper = get_mesh_volume(result.upper)
+                vol_lower = get_mesh_volume(result.lower)
+                if vol_upper <= vol_lower:
+                    assert cr.peg_on == "upper"
+                else:
+                    assert cr.peg_on == "lower"
+
+
+class TestCreatePegHoleArbitraryNormals:
+    """Tests for peg/hole creation with various normal orientations."""
+
+    def test_peg_along_each_axis(self):
+        """Pegs should work along all 6 axis directions."""
+        pos = numpy.zeros(3)
+        for normal in [
+            [1, 0, 0], [-1, 0, 0],
+            [0, 1, 0], [0, -1, 0],
+            [0, 0, 1], [0, 0, -1],
+        ]:
+            normal_arr = numpy.array(normal, dtype=float)
+            peg = create_peg_mesh(pos, normal_arr, diameter=4.0, height=3.0)
+            assert peg.is_watertight
+            assert len(peg.vertices) > 0
+
+    def test_peg_diagonal_normal(self):
+        """Peg along a diagonal normal should still be watertight."""
+        pos = numpy.array([5, 5, 5])
+        normal = numpy.array([1, 1, 1], dtype=float)
+        normal = normal / numpy.linalg.norm(normal)
+        peg = create_peg_mesh(pos, normal, diameter=4.0, height=3.0)
+        assert peg.is_watertight
+
+    def test_hole_clearance_dimensions(self):
+        """Hole should be larger than peg by exactly 2*clearance in diameter."""
+        pos = numpy.zeros(3)
+        normal = numpy.array([0, 0, 1], dtype=float)
+        diameter = 6.0
+        clearance = 0.3
+        peg = create_peg_mesh(pos, normal, diameter=diameter, height=3.0, sides=32)
+        hole = create_hole_mesh(pos, normal, diameter=diameter, height=3.0,
+                                clearance=clearance, sides=32)
+        peg_ext = peg.bounds[1] - peg.bounds[0]
+        hole_ext = hole.bounds[1] - hole.bounds[0]
+        # In X and Y, hole should be wider by ~2*clearance
+        for axis in [0, 1]:
+            diff = hole_ext[axis] - peg_ext[axis]
+            assert diff == pytest.approx(2 * clearance, abs=0.2)

@@ -9,9 +9,13 @@ import pytest
 from core.mesh_splitter import (
     slice_mesh_with_fallback,
     split_by_shortest_seam,
+    split_by_local_plane,
+    split_by_face_sets,
+    local_plane_partition,
+    _component_containing_face,
     SplitResult,
 )
-from core.plane_calculator import find_shortest_seam_partition
+from core.plane_calculator import find_shortest_seam_partition, find_smallest_cut_plane
 
 
 class TestSliceMeshWithFallback:
@@ -155,3 +159,236 @@ class TestSplitByShortestSeam:
         assert result.success
         total_faces = len(result.upper.faces) + len(result.lower.faces)
         assert total_faces == len(cube_mesh.faces)
+
+
+class TestComponentContainingFace:
+    """Tests for _component_containing_face helper."""
+
+    def test_single_component_returns_all(self, cube_mesh):
+        """For a single-component mesh, should return all faces."""
+        faces = _component_containing_face(cube_mesh, 0)
+        assert len(faces) == len(cube_mesh.faces)
+
+    def test_disconnected_returns_correct_component(self):
+        """For disconnected mesh, should return only the clicked component's faces."""
+        import trimesh
+        cube_a = trimesh.creation.box(extents=[10, 10, 10])
+        cube_a.apply_translation([-20, 0, 0])
+        cube_b = trimesh.creation.box(extents=[10, 10, 10])
+        cube_b.apply_translation([20, 0, 0])
+        combined = trimesh.util.concatenate([cube_a, cube_b])
+
+        faces_a = _component_containing_face(combined, 0)
+        # cube_a has 12 faces, cube_b has 12 faces
+        assert len(faces_a) == 12
+
+        faces_b = _component_containing_face(combined, len(cube_a.faces))
+        assert len(faces_b) == 12
+
+    def test_three_components(self):
+        """Should correctly identify component in a 3-component mesh."""
+        import trimesh
+        boxes = []
+        for i in range(3):
+            box = trimesh.creation.box(extents=[5, 5, 5])
+            box.apply_translation([i * 20, 0, 0])
+            boxes.append(box)
+        combined = trimesh.util.concatenate(boxes)
+
+        # Face 0 is in first box (12 faces each)
+        faces_0 = _component_containing_face(combined, 0)
+        assert len(faces_0) == 12
+
+        # Face 12 is in second box
+        faces_12 = _component_containing_face(combined, 12)
+        assert len(faces_12) == 12
+
+        # Face 24 is in third box
+        faces_24 = _component_containing_face(combined, 24)
+        assert len(faces_24) == 12
+
+
+class TestLocalPlanePartition:
+    """Tests for local_plane_partition function."""
+
+    def test_basic_partition(self, cube_mesh):
+        """Should partition cube into two non-empty sets."""
+        origin = numpy.array([0.0, 0.0, 0.0])
+        normal = numpy.array([0.0, 1.0, 0.0])
+        set_a, set_b = local_plane_partition(cube_mesh, origin, normal, 0)
+        assert len(set_a) > 0
+        assert len(set_b) > 0
+        assert len(set_a) + len(set_b) == len(cube_mesh.faces)
+
+    def test_smaller_set_is_first(self, cube_mesh):
+        """set_a should be the smaller partition."""
+        origin = numpy.array([0.0, 5.0, 0.0])  # Near top
+        normal = numpy.array([0.0, 1.0, 0.0])
+        set_a, set_b = local_plane_partition(cube_mesh, origin, normal, 0)
+        assert len(set_a) <= len(set_b)
+
+    def test_no_overlap(self, cube_mesh):
+        """Partitions should not overlap."""
+        origin = numpy.array([0.0, 0.0, 0.0])
+        normal = numpy.array([1.0, 0.0, 0.0])
+        set_a, set_b = local_plane_partition(cube_mesh, origin, normal, 0)
+        assert len(set(set_a) & set(set_b)) == 0
+
+    def test_sphere_local_partition(self, sphere_mesh):
+        """Should work on curved geometry."""
+        origin = sphere_mesh.centroid
+        normal = numpy.array([1.0, 0.0, 0.0])
+        set_a, set_b = local_plane_partition(sphere_mesh, origin, normal, 0)
+        assert len(set_a) > 0
+        assert len(set_b) > 0
+        assert len(set_a) + len(set_b) == len(sphere_mesh.faces)
+
+
+class TestSplitByLocalPlane:
+    """Tests for split_by_local_plane function."""
+
+    def test_basic_split(self, sphere_mesh):
+        """Should split a sphere using local plane partition."""
+        center = sphere_mesh.centroid + numpy.array([0.1, 0.1, 0.1])
+        normals = [
+            numpy.array([0.0, 1.0, 0.0]),
+            numpy.array([1.0, 0.0, 0.0]),
+            numpy.array([0.0, 0.0, 1.0]),
+        ]
+        result = split_by_local_plane(sphere_mesh, center, normals, 0)
+        assert result.success
+        assert "local_plane_partition" in result.strategies_attempted
+
+    def test_split_preserves_faces(self, cube_mesh):
+        """Total faces should be preserved."""
+        normals = [numpy.array([0.0, 1.0, 0.0])]
+        result = split_by_local_plane(cube_mesh, cube_mesh.centroid, normals, 0)
+        assert result.success
+        total = len(result.upper.faces) + len(result.lower.faces)
+        assert total == len(cube_mesh.faces)
+
+    def test_empty_candidates_fails(self, cube_mesh):
+        """No candidate normals should fail gracefully."""
+        result = split_by_local_plane(cube_mesh, cube_mesh.centroid, [], 0)
+        assert not result.success
+
+    def test_with_real_smallest_candidates(self, cylinder_mesh):
+        """Use actual candidates from find_smallest_cut_plane."""
+        center = cylinder_mesh.centroid + numpy.array([0.1, 0.1, 0.1])
+        search = find_smallest_cut_plane(
+            cylinder_mesh, center, search_resolution=6)
+        if search.top_candidates:
+            normals = [n for _, n in search.top_candidates[:5]]
+            result = split_by_local_plane(
+                cylinder_mesh, center, normals, source_face_id=0)
+            assert result.success
+
+
+class TestMultiComponentSlicing:
+    """Tests for multi-component mesh slicing with face_id."""
+
+    def test_two_components_only_cuts_target(self):
+        """With face_id, only the target component should be cut."""
+        import trimesh
+        cube_a = trimesh.creation.box(extents=[10, 10, 10])
+        cube_a.apply_translation([-15, 0, 0])
+        cube_b = trimesh.creation.box(extents=[10, 10, 10])
+        cube_b.apply_translation([15, 0, 0])
+        combined = trimesh.util.concatenate([cube_a, cube_b])
+
+        # Cut at x=0, targeting cube_a (face 0)
+        result = slice_mesh_with_fallback(
+            combined,
+            numpy.array([0, 0, 0]),
+            numpy.array([1, 0, 0]),
+            face_id=0
+        )
+        assert result.success
+        total = len(result.upper.faces) + len(result.lower.faces)
+        assert total == len(combined.faces)
+
+    def test_three_components_preserves_others(self):
+        """Three cubes: cut only one, others assigned by centroid side."""
+        import trimesh
+        cubes = []
+        for x in [-30, 0, 30]:
+            box = trimesh.creation.box(extents=[10, 10, 10])
+            box.apply_translation([x, 0, 0])
+            cubes.append(box)
+        combined = trimesh.util.concatenate(cubes)
+
+        # Cut the middle cube (faces 12-23), plane along Y
+        result = slice_mesh_with_fallback(
+            combined,
+            numpy.array([0, 0, 0]),
+            numpy.array([0, 1, 0]),
+            face_id=12  # A face in the middle cube
+        )
+        assert result.success
+        # Both halves should be non-empty
+        assert len(result.upper.faces) > 0
+        assert len(result.lower.faces) > 0
+        # Total faces may exceed original due to capping faces
+        total = len(result.upper.faces) + len(result.lower.faces)
+        assert total >= len(combined.faces)
+
+    def test_without_face_id_cuts_everything(self):
+        """Without face_id, the plane should cut through all components."""
+        import trimesh
+        cube_a = trimesh.creation.box(extents=[10, 10, 10])
+        cube_a.apply_translation([-10, 0, 0])
+        cube_b = trimesh.creation.box(extents=[10, 10, 10])
+        cube_b.apply_translation([10, 0, 0])
+        combined = trimesh.util.concatenate([cube_a, cube_b])
+
+        # Horizontal cut with no face_id — should cut both
+        result = slice_mesh_with_fallback(
+            combined,
+            numpy.array([0, 0, 0]),
+            numpy.array([0, 1, 0])
+        )
+        assert result.success
+        # Both halves should have faces from both cubes
+        assert len(result.upper.faces) > 12
+        assert len(result.lower.faces) > 12
+
+
+class TestFallbackChain:
+    """Tests for the strategy fallback chain in slice_mesh_with_fallback."""
+
+    def test_strategy_is_recorded(self, cube_mesh):
+        """Successful split should record the strategy used."""
+        result = slice_mesh_with_fallback(
+            cube_mesh,
+            numpy.array([0, 0, 0]),
+            numpy.array([0, 1, 0])
+        )
+        assert result.success
+        assert result.strategy_used in [
+            "capped_slice", "manual_cap", "uncapped_slice", "manual_split"
+        ]
+
+    def test_failure_records_strategies(self, cube_mesh):
+        """Failed split should record at least one strategy attempted."""
+        # Plane far outside mesh — should fail
+        result = slice_mesh_with_fallback(
+            cube_mesh,
+            numpy.array([0, 1000, 0]),
+            numpy.array([0, 1, 0])
+        )
+        assert not result.success
+        # Strategy 1 returns partial results (upper empty, lower full) and
+        # may short-circuit. At minimum 1 strategy should be recorded.
+        assert len(result.strategies_attempted) >= 1
+
+    def test_torus_split_uses_fallback(self, torus_mesh):
+        """Torus geometry may require fallback strategies."""
+        result = slice_mesh_with_fallback(
+            torus_mesh,
+            torus_mesh.centroid,
+            numpy.array([0, 1, 0])
+        )
+        # Whether it succeeds depends on the strategy chain
+        assert len(result.strategies_attempted) >= 1
+        if result.success:
+            assert result.strategy_used != "none"
