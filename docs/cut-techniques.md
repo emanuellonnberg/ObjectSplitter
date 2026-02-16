@@ -440,9 +440,14 @@ edge graph (edge weights = Euclidean distances). This produces the shortest path
 along mesh edges between the two vertices.
 
 ```python
+full_path = []
 for i in range(len(waypoints) - 1):
     segment = find_geodesic_path(mesh, waypoints[i], waypoints[i+1])
-    full_path.extend(segment)  # remove duplicate at junctions
+    if full_path and segment:
+        # Remove duplicate junction vertex
+        full_path.extend(segment[1:])
+    else:
+        full_path.extend(segment)
 ```
 
 #### Step 3: Face partition
