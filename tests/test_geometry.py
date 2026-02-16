@@ -14,6 +14,7 @@ from core.geometry import (
     plane_normal_from_spherical,
     create_plane_mesh_data,
     create_marker_mesh_data,
+    create_pin_mesh_data,
 )
 
 
@@ -265,3 +266,87 @@ class TestCreateMarkerMeshData:
         assert_allclose(vertices[0], center, atol=1e-5)
         # Shaft should extend in -Z from center
         assert vertices[:, 2].min() < 5.0 - 2.0
+
+    def test_arrow_zero_direction_falls_back(self):
+        """Zero-length direction should fall back to default Y-up."""
+        center = numpy.array([0, 0, 0])
+        vertices, _ = create_marker_mesh_data(center, 1.0, direction=numpy.array([0, 0, 0]))
+        # Should behave like default: shaft extends in +Y
+        assert vertices[:, 1].max() > 2.0
+        assert_allclose(vertices[0], center, atol=1e-5)
+
+    def test_arrow_face_indices_valid(self):
+        """All face indices should reference existing vertices."""
+        center = numpy.array([0, 0, 0])
+        vertices, indices = create_marker_mesh_data(center, 2.0,
+                                                     direction=numpy.array([1, 1, 0]))
+        assert indices.min() >= 0
+        assert indices.max() < len(vertices)
+
+
+class TestCreatePinMeshData:
+    """Tests for pin/dot marker mesh generation."""
+
+    def test_pin_basic_shape(self):
+        """Pin should produce valid vertices and triangular faces."""
+        center = numpy.array([0, 0, 0])
+        vertices, indices = create_pin_mesh_data(center, 1.0)
+        assert vertices.shape[1] == 3
+        assert indices.shape[1] == 3
+        assert len(vertices) > 0
+        assert len(indices) > 0
+
+    def test_pin_face_indices_valid(self):
+        """All face indices should reference existing vertices."""
+        center = numpy.array([5, 10, 15])
+        vertices, indices = create_pin_mesh_data(center, 2.0)
+        assert indices.min() >= 0
+        assert indices.max() < len(vertices)
+
+    def test_pin_default_direction_extends_along_y(self):
+        """Default direction (Y-up) should have geometry above and below center."""
+        center = numpy.array([0, 0, 0])
+        vertices, _ = create_pin_mesh_data(center, 1.0)
+        # Diamond extends both above and below center
+        assert vertices[:, 1].max() > 0.0
+        assert vertices[:, 1].min() < 0.0
+
+    def test_pin_custom_direction(self):
+        """Pin with custom direction should orient along that direction."""
+        center = numpy.array([0, 0, 0])
+        direction = numpy.array([0, 0, 1])
+        vertices, _ = create_pin_mesh_data(center, 1.0, direction=direction)
+        # Pin extends in +Z (above) and -Z (spike below)
+        assert vertices[:, 2].max() > 0.0
+        assert vertices[:, 2].min() < 0.0
+
+    def test_pin_at_position(self):
+        """Pin should be centered near the specified position."""
+        center = numpy.array([10, 20, 30])
+        vertices, _ = create_pin_mesh_data(center, 1.0)
+        centroid = vertices.mean(axis=0)
+        # Centroid should be near center (may be offset slightly due to asymmetry)
+        assert numpy.linalg.norm(centroid - center) < 2.0
+
+    def test_pin_scale_factor(self):
+        """Larger scale should produce larger geometry."""
+        center = numpy.array([0, 0, 0])
+        verts_small, _ = create_pin_mesh_data(center, 0.5)
+        verts_large, _ = create_pin_mesh_data(center, 2.0)
+        extent_small = verts_small.max(axis=0) - verts_small.min(axis=0)
+        extent_large = verts_large.max(axis=0) - verts_large.min(axis=0)
+        assert numpy.all(extent_large > extent_small)
+
+    def test_pin_zero_direction_falls_back(self):
+        """Zero direction should fall back to Y-up."""
+        center = numpy.array([0, 0, 0])
+        vertices, _ = create_pin_mesh_data(center, 1.0, direction=numpy.array([0, 0, 0]))
+        # Should still produce valid geometry along Y axis
+        assert vertices[:, 1].max() > 0.0
+
+    def test_pin_vertex_count_matches_hexagonal(self):
+        """Pin uses 6-sided cross-section: 6 ring + 1 top + 1 bottom = 8 vertices."""
+        center = numpy.array([0, 0, 0])
+        vertices, indices = create_pin_mesh_data(center, 1.0)
+        assert len(vertices) == 8  # 6 ring + top + bottom
+        assert len(indices) == 12  # 6 upper cone + 6 lower cone

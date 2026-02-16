@@ -268,5 +268,93 @@ class TestPartitionFacesByPath:
         assert len(face_a) + len(face_b) == len(mesh.faces)
 
 
+class TestChainPathsCrossComponent:
+    """Tests for chain_paths handling disconnected mesh components."""
+
+    def test_resnap_to_target_component(self):
+        """Waypoints on other components should be re-snapped to the first waypoint's component."""
+        # Create two disconnected triangles
+        vertices = np.array([
+            # Triangle A: around origin
+            [0, 0, 0], [2, 0, 0], [1, 2, 0],
+            [0, 0, 0.1], [2, 0, 0.1], [1, 2, 0.1],
+            # Triangle B: far away
+            [100, 100, 0], [102, 100, 0], [101, 102, 0],
+            [100, 100, 0.1], [102, 100, 0.1], [101, 102, 0.1],
+        ], dtype=np.float64)
+        faces = np.array([
+            [0, 1, 2], [3, 4, 5], [0, 1, 3], [1, 3, 4],
+            [1, 2, 4], [2, 4, 5], [0, 2, 3], [2, 3, 5],
+            [6, 7, 8], [9, 10, 11], [6, 7, 9], [7, 9, 10],
+            [7, 8, 10], [8, 10, 11], [6, 8, 9], [8, 9, 11],
+        ], dtype=np.int32)
+        mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+
+        # First waypoint on component A, second on component B
+        wp1 = np.array([0.0, 0.0, 0.0])     # On component A
+        wp2 = np.array([100.0, 100.0, 0.0])  # On component B → should re-snap to A
+
+        path = chain_paths(mesh, [wp1, wp2])
+        # Path should exist entirely on component A's vertices (indices 0-5)
+        for v in path:
+            assert v < 6, f"Vertex {v} is not on target component A"
+
+    def test_all_waypoints_on_same_component(self):
+        """When all waypoints are on the same component, no re-snapping needed."""
+        mesh = make_grid_mesh(5, 5)
+        wp1 = np.array([0.0, 0.0, 0.0])
+        wp2 = np.array([4.0, 4.0, 0.0])
+        path = chain_paths(mesh, [wp1, wp2])
+        assert len(path) >= 2
+        assert path[0] == 0
+        assert path[-1] == 24
+
+
+class TestPartitionFacesByPathOnCurved:
+    """Tests for partition_faces_by_path on non-trivial geometries."""
+
+    def test_sphere_partition(self):
+        """Partitioning a sphere by a geodesic path should work."""
+        mesh = trimesh.creation.icosphere(subdivisions=2, radius=5.0)
+        mesh.merge_vertices()
+        verts = mesh.vertices
+
+        # Pick two distant vertices
+        distances = np.linalg.norm(verts - verts[0], axis=1)
+        far_v = int(np.argmax(distances))
+
+        path = find_geodesic_path(mesh, 0, far_v)
+        face_a, face_b = partition_faces_by_path(mesh, path)
+        assert len(face_a) > 0
+        assert len(face_b) > 0
+        assert len(face_a) + len(face_b) == len(mesh.faces)
+        assert len(set(face_a) & set(face_b)) == 0
+
+    def test_partition_set_a_is_smaller(self):
+        """set_a should always be the smaller partition."""
+        mesh = make_grid_mesh(8, 8)
+        path = find_geodesic_path(mesh, 4, 60)  # Roughly middle column
+        face_a, face_b = partition_faces_by_path(mesh, path)
+        assert len(face_a) <= len(face_b)
+
+    def test_partition_then_split(self):
+        """Path partition should produce splittable face sets."""
+        from core.mesh_splitter import split_by_face_sets
+
+        mesh = trimesh.creation.cylinder(radius=5, height=10, sections=16)
+        mesh.merge_vertices()
+        verts = mesh.vertices
+
+        top_v = int(np.argmax(verts[:, 2]))
+        bot_v = int(np.argmin(verts[:, 2]))
+        path = find_geodesic_path(mesh, top_v, bot_v)
+        face_a, face_b = partition_faces_by_path(mesh, path)
+
+        result = split_by_face_sets(mesh, face_a, face_b)
+        assert result.success
+        assert len(result.upper.faces) > 0
+        assert len(result.lower.faces) > 0
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
