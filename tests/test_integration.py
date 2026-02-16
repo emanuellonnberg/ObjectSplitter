@@ -19,11 +19,13 @@ from core.plane_calculator import (
     horizontal_cut_plane,
     vertical_cut_plane,
     find_smallest_cut_plane,
+    find_valley_cut_plane,
     find_shortest_seam_partition,
 )
 from core.mesh_splitter import (
     slice_mesh_with_fallback,
     split_by_shortest_seam,
+    split_by_local_plane,
 )
 from core.connectors import add_connectors, ConnectorConfig
 from core.debug_capture import (
@@ -111,6 +113,34 @@ class TestFullShortestSeamWorkflow:
         click = numpy.array([15.0, 0.0, 0.0])
         set_a, set_b, _, _ = find_shortest_seam_partition(sphere_mesh, click)
         result = split_by_shortest_seam(sphere_mesh, set_a, set_b)
+        assert result.success
+
+
+class TestFullValleyWorkflow:
+    """End-to-end valley/groove detection tests."""
+
+    def test_cylinder_valley_cut(self, cylinder_mesh):
+        """Valley mode should find and cut through a cylinder's narrowest section."""
+        # Click slightly off-center — valley sweep should still find the groove
+        center = cylinder_mesh.centroid + numpy.array([0.0, 3.0, 0.0])
+        search = find_valley_cut_plane(cylinder_mesh, center, search_resolution=6)
+        result = slice_mesh_with_fallback(
+            cylinder_mesh, search.plane.origin, search.plane.normal)
+        assert result.success
+
+    def test_sphere_valley_cut(self, sphere_mesh):
+        """Valley mode on a sphere should produce a valid split."""
+        center = sphere_mesh.centroid + numpy.array([2.0, 0.0, 0.0])
+        search = find_valley_cut_plane(sphere_mesh, center, search_resolution=6)
+        # Use local plane partition (same path as ObjectSplitter._performCut)
+        from core.plane_calculator import snap_point_to_mesh_surface
+        snap_point, face_id = snap_point_to_mesh_surface(sphere_mesh, center)
+        if face_id is None:
+            face_id = 0  # fallback for proximity query failures
+        candidate_normals = ([n for _, n in search.top_candidates]
+                             if search.top_candidates else [search.plane.normal])
+        result = split_by_local_plane(
+            sphere_mesh, search.plane.origin, candidate_normals, face_id)
         assert result.success
 
 

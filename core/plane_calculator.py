@@ -365,6 +365,235 @@ def find_smallest_cut_plane(
     )
 
 
+def find_valley_cut_plane(
+    mesh: "trimesh.Trimesh",
+    click_position: numpy.ndarray,
+    search_resolution: int = 18,
+    collect_all_samples: bool = False,
+    surface_normal: Optional[numpy.ndarray] = None,
+    sweep_fraction: float = 0.15,
+    n_sweep_steps: int = 11,
+    n_top_candidates: int = 20,
+) -> SmallestPlaneSearchResult:
+    """
+    Find a cut plane that follows a geographic valley or groove near the click.
+
+    Unlike find_smallest_cut_plane (which pins the plane at the click position),
+    this sweeps the plane along each candidate axis to find the local minimum
+    in cross-section area near the click point.  This allows detecting grooves
+    and valleys (like a figurine's neck) even when the click is slightly off
+    from the narrowest point.
+
+    The result is always a plane, so the cut line around the mesh is as
+    straight (planar) as possible.
+
+    Algorithm:
+        Phase 1 (coarse): For each axis orientation, compute the cross-section
+            at the click point.  Keep the top candidates by area.
+        Phase 2 (sweep): For each top candidate, sweep the plane origin along
+            the axis in a local window to find the position with minimum
+            cross-section area.  This locates the groove center.
+
+    Args:
+        mesh: The trimesh object to analyze.
+        click_position: 3D point near the valley/groove.
+        search_resolution: Number of elevation angles (azimuth = 2x this).
+        collect_all_samples: Store all (normal, area) pairs for debugging.
+        surface_normal: Bias toward planes aligned with this direction.
+        sweep_fraction: How far to sweep as fraction of mesh diagonal (default 15%).
+        n_sweep_steps: Number of positions to test during the sweep phase.
+        n_top_candidates: How many coarse candidates to refine in phase 2.
+
+    Returns:
+        SmallestPlaneSearchResult with the best groove-following plane.
+    """
+    plane_origin = numpy.asarray(click_position, dtype=numpy.float64)
+
+    # Alignment bias (same as find_smallest_cut_plane)
+    ALIGNMENT_BIAS = 0.5
+    use_bias = (surface_normal is not None and
+                numpy.linalg.norm(surface_normal) > 0.5)
+    if use_bias:
+        surface_normal = numpy.asarray(surface_normal, dtype=numpy.float64)
+        surface_normal = surface_normal / numpy.linalg.norm(surface_normal)
+        logger.debug("Valley cut search: using surface_normal=%s with bias=%.1f",
+                     surface_normal, ALIGNMENT_BIAS)
+
+    def _compute_score(area: float, normal: numpy.ndarray) -> float:
+        if not use_bias:
+            return area
+        alignment = abs(numpy.dot(normal, surface_normal))
+        penalty = 1.0 + ALIGNMENT_BIAS * (1.0 - alignment)
+        return area * penalty
+
+    # Minimum area threshold (same as smallest mode)
+    avg_face_area = mesh.area / max(len(mesh.faces), 1)
+    min_section_area = avg_face_area * 5.0
+
+    # Sweep distance: fraction of mesh diagonal
+    extent = mesh.bounds[1] - mesh.bounds[0]
+    mesh_diagonal = float(numpy.linalg.norm(extent))
+    sweep_distance = mesh_diagonal * sweep_fraction
+
+    logger.debug("Valley cut search: sweep_distance=%.2f (%.0f%% of diagonal %.2f), "
+                 "%d sweep steps, resolution=%d",
+                 sweep_distance, sweep_fraction * 100, mesh_diagonal,
+                 n_sweep_steps, search_resolution)
+
+    # ---- Phase 1: Coarse search (same as smallest mode) ----
+    all_samples = [] if collect_all_samples else None
+    coarse_candidates = []  # (score, area, normal) — above min_section_area
+    coarse_all = []         # all valid sections (fallback for low-poly meshes)
+    samples_tested = 0
+
+    n_theta = search_resolution
+    n_phi = search_resolution * 2
+
+    for i in range(n_theta):
+        theta = numpy.pi * i / n_theta
+        for j in range(n_phi):
+            phi = 2 * numpy.pi * j / n_phi
+            normal = plane_normal_from_spherical(theta, phi)
+            samples_tested += 1
+
+            try:
+                section = mesh.section(plane_origin=plane_origin,
+                                       plane_normal=normal)
+                if section is not None:
+                    path_2d, to_3D = _section_to_2d(section)
+                    area = _local_section_area(path_2d, to_3D, plane_origin)
+
+                    if collect_all_samples:
+                        all_samples.append((normal.copy(), area))
+
+                    if area > 0:
+                        score = _compute_score(area, normal)
+                        coarse_all.append((score, area, normal.copy()))
+                        if area >= min_section_area:
+                            coarse_candidates.append((score, area,
+                                                      normal.copy()))
+            except Exception as e:
+                if collect_all_samples:
+                    all_samples.append((normal.copy(), float('nan')))
+                logger.debug("Valley phase 1: section failed for normal=%s: %s",
+                             normal, e)
+                continue
+
+    # Sort by score and take top N for refinement.
+    # For low-poly meshes (e.g. a box with 12 faces) min_section_area can
+    # exceed the actual cross-section area, filtering out everything.
+    # If that happens, fall back to all candidates without the threshold.
+    coarse_candidates.sort(key=lambda x: x[0])
+    top_coarse = coarse_candidates[:n_top_candidates]
+
+    if not top_coarse and coarse_all:
+        coarse_all.sort(key=lambda x: x[0])
+        top_coarse = coarse_all[:n_top_candidates]
+        logger.debug("Valley phase 1: min_section_area filter removed all "
+                     "candidates, using %d unfiltered", len(top_coarse))
+
+    logger.debug("Valley phase 1: %d valid candidates from %d samples, "
+                 "refining top %d",
+                 len(coarse_candidates), samples_tested, len(top_coarse))
+
+    # ---- Phase 2: Sweep each top candidate to find the groove ----
+    best_normal = numpy.array([0.0, 1.0, 0.0])
+    best_origin = plane_origin.copy()
+    best_score = float('inf')
+    best_area = float('inf')
+    valid_candidates = []
+
+    for _, coarse_area, normal in top_coarse:
+        # Sweep positions along this normal, centered at the click point
+        offsets = numpy.linspace(-sweep_distance, sweep_distance, n_sweep_steps)
+
+        sweep_best_area = float('inf')
+        sweep_best_offset = 0.0
+
+        for offset in offsets:
+            sweep_origin = plane_origin + offset * normal
+            try:
+                section = mesh.section(plane_origin=sweep_origin,
+                                       plane_normal=normal)
+                if section is not None:
+                    path_2d, to_3D = _section_to_2d(section)
+                    area = _local_section_area(path_2d, to_3D, sweep_origin)
+
+                    if area > 0 and area < sweep_best_area:
+                        sweep_best_area = area
+                        sweep_best_offset = offset
+            except Exception:
+                continue
+
+        if not numpy.isfinite(sweep_best_area):
+            continue
+
+        # Score the swept result: area * alignment bias * proximity bias
+        # Prefer planes closer to the click point (mild penalty for offset)
+        proximity_penalty = 1.0 + 0.3 * (abs(sweep_best_offset) / max(sweep_distance, 1e-6))
+        score = _compute_score(sweep_best_area, normal) * proximity_penalty
+
+        swept_origin = plane_origin + sweep_best_offset * normal
+        valid_candidates.append((score, sweep_best_area, normal.copy(),
+                                 swept_origin.copy()))
+
+        if score < best_score:
+            best_score = score
+            best_area = sweep_best_area
+            best_normal = normal.copy()
+            best_origin = swept_origin.copy()
+
+    # Fallback: axis-aligned normals (same as find_smallest_cut_plane)
+    if not numpy.isfinite(best_score):
+        logger.warning("Valley sweep found no valid sections; trying axis "
+                       "fallback")
+        for fallback_normal in [
+            numpy.array([0.0, 1.0, 0.0]),
+            numpy.array([1.0, 0.0, 0.0]),
+            numpy.array([0.0, 0.0, 1.0]),
+        ]:
+            for offset in numpy.linspace(-sweep_distance, sweep_distance,
+                                         n_sweep_steps):
+                sweep_origin = plane_origin + offset * fallback_normal
+                try:
+                    section = mesh.section(plane_origin=sweep_origin,
+                                           plane_normal=fallback_normal)
+                    if section is not None:
+                        path_2d, to_3D = _section_to_2d(section)
+                        area = _local_section_area(path_2d, to_3D,
+                                                   sweep_origin)
+                        if 0 < area < best_area:
+                            best_area = area
+                            best_normal = fallback_normal.copy()
+                            best_origin = sweep_origin.copy()
+                            best_score = _compute_score(area, fallback_normal)
+                            valid_candidates.append(
+                                (best_score, area, fallback_normal.copy(),
+                                 sweep_origin.copy()))
+                except Exception:
+                    continue
+
+    # Sort candidates and extract top for downstream fallback
+    valid_candidates.sort(key=lambda x: x[0])
+    top_candidates = [(area, normal) for _, area, normal, _ in
+                      valid_candidates[:100]]
+
+    logger.debug("Valley cut search: best_area=%.2f mm^2 (score=%.2f), "
+                 "normal=%s, origin_offset=%.2f, tested=%d orientations, "
+                 "%d refined candidates",
+                 best_area, best_score, best_normal,
+                 float(numpy.linalg.norm(best_origin - plane_origin)),
+                 samples_tested, len(valid_candidates))
+
+    return SmallestPlaneSearchResult(
+        plane=CutPlane(origin=best_origin, normal=best_normal),
+        area=best_area,
+        samples_tested=samples_tested,
+        all_samples=all_samples,
+        top_candidates=top_candidates,
+    )
+
+
 def find_shortest_seam_partition(
     mesh: "trimesh.Trimesh",
     click_position: numpy.ndarray,

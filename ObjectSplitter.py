@@ -86,6 +86,7 @@ from .core.plane_calculator import (
     horizontal_cut_plane,
     vertical_cut_plane,
     find_smallest_cut_plane,
+    find_valley_cut_plane,
     find_shortest_seam_partition,
     refine_partition_with_mincut,
 )
@@ -113,6 +114,7 @@ class ObjectSplitter(Tool):
     CUT_MODE_SHORTEST = "shortest"          # Shortest seam (plane search + refine)
     CUT_MODE_RADIAL = "radial"              # Radial geodesic cut (dual-Dijkstra)
     CUT_MODE_PATH = "path"                  # Multi-point geodesic path cut
+    CUT_MODE_VALLEY = "valley"              # Geographic valley/groove detection
 
     def __init__(self):
         super().__init__()
@@ -280,6 +282,7 @@ class ObjectSplitter(Tool):
             {"value": self.CUT_MODE_SHORTEST, "text": "Shortest seam (surface loop)"},
             {"value": self.CUT_MODE_RADIAL, "text": "Radial (geodesic)"},
             {"value": self.CUT_MODE_PATH, "text": "Path (multi-point)"},
+            {"value": self.CUT_MODE_VALLEY, "text": "Valley (geographic groove)"},
         ]
 
     def getCutHeightPercent(self) -> float:
@@ -624,7 +627,7 @@ class ObjectSplitter(Tool):
         plane_size = max(mesh_size[0], mesh_size[2]) * 1.2  # 20% larger than mesh
 
         # For smallest/shortest seam: show arrow at click point along surface normal
-        if self._cut_mode in (self.CUT_MODE_SMALLEST, self.CUT_MODE_SHORTEST, self.CUT_MODE_RADIAL, self.CUT_MODE_PATH):
+        if self._cut_mode in (self.CUT_MODE_SMALLEST, self.CUT_MODE_SHORTEST, self.CUT_MODE_RADIAL, self.CUT_MODE_PATH, self.CUT_MODE_VALLEY):
             center = numpy.array([picked_position.x, picked_position.y, picked_position.z])
             mesh_size_max = max(mesh_size[0], mesh_size[1], mesh_size[2])
             marker_size = max(0.5, mesh_size_max * 0.012)  # 1.2% of mesh or 0.5mm
@@ -871,6 +874,28 @@ class ObjectSplitter(Tool):
                 Logger.log("i", "Smallest cut: area=%.2f mm^2, tested %d orientations, normal=%s",
                            search_result.area, search_result.samples_tested,
                            str(search_result.plane.normal))
+            elif self._cut_mode == self.CUT_MODE_VALLEY:
+                self._updateProgress("Detecting valley/groove...", 20)
+                snap_point, click_face_id = snap_point_to_mesh_surface(tm, click_pos_arr)
+
+                valley_surface_normal = None
+                if click_face_id is not None and click_face_id < len(tm.face_normals):
+                    valley_surface_normal = numpy.array(
+                        tm.face_normals[click_face_id], dtype=numpy.float64
+                    )
+                    Logger.log("d", "Valley click surface normal: %s", valley_surface_normal)
+
+                search_result = find_valley_cut_plane(
+                    tm, snap_point, self._search_resolution,
+                    surface_normal=valley_surface_normal,
+                )
+                plane = search_result.plane
+                Logger.log("i", "Valley cut: area=%.2f mm^2, tested %d orientations, "
+                           "normal=%s, origin=%s",
+                           search_result.area, search_result.samples_tested,
+                           str(search_result.plane.normal),
+                           str(search_result.plane.origin))
+
             elif self._cut_mode == self.CUT_MODE_SHORTEST:
                 # Shortest Seam: plane search + refine_partition_with_mincut
                 self._updateProgress("Finding shortest seam...", 15)
@@ -966,7 +991,7 @@ class ObjectSplitter(Tool):
                     tm, face_set_a, face_set_b,
                     strategy_name="shortest_seam" if self._cut_mode == self.CUT_MODE_SHORTEST else "radial"
                 )
-            elif self._cut_mode == self.CUT_MODE_SMALLEST:
+            elif self._cut_mode in (self.CUT_MODE_SMALLEST, self.CUT_MODE_VALLEY):
                 # Use graph-based local separation with candidate fallback.
                 # If the best plane only grazes the surface (single-triangle cut),
                 # try the next-best candidates until we get a meaningful partition.
