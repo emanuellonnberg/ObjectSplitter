@@ -30,7 +30,7 @@ docs/                  Architecture and algorithm documentation
 ## Running tests
 
 ```bash
-pytest                          # 82 tests, ~2.5s
+pytest                          # 222 tests, ~21s (with local captures present)
 pytest tests/test_geometry.py   # single module
 pytest -v                       # verbose
 pytest -k smallest              # filter by keyword

@@ -147,10 +147,11 @@ def slice_mesh_with_fallback(
         lower = trimesh.intersections.slice_mesh_plane(
             mesh_to_cut, plane_normal=-plane_normal, plane_origin=plane_origin, cap=True)
         if upper is not None and lower is not None:
+            capped = bool(upper.is_watertight and lower.is_watertight)
             result.upper, result.lower = _merge_other_components(
                 upper, lower, other_components, plane_origin, plane_normal
             )
-            result.capped = True
+            result.capped = capped
             result.strategy_used = "capped_slice"
             logger.debug("Strategy 1 (capped slice) succeeded")
             return result
@@ -170,10 +171,11 @@ def slice_mesh_with_fallback(
             upper_capped = _manual_cap_mesh(upper, plane_origin, plane_normal)
             lower_capped = _manual_cap_mesh(lower, plane_origin, -plane_normal)
             if upper_capped is not None and lower_capped is not None:
+                capped = bool(upper_capped.is_watertight and lower_capped.is_watertight)
                 result.upper, result.lower = _merge_other_components(
                     upper_capped, lower_capped, other_components, plane_origin, plane_normal
                 )
-                result.capped = True
+                result.capped = capped
                 result.strategy_used = "manual_cap"
                 logger.debug("Strategy 2 (manual cap) succeeded")
                 return result
@@ -421,6 +423,7 @@ def split_by_face_sets(
     face_set_a: list,
     face_set_b: list,
     strategy_name: str = "face_partition",
+    attempt_hole_fill: bool = True,
 ) -> SplitResult:
     """
     Split a mesh into two parts using pre-computed face partitions.
@@ -431,6 +434,8 @@ def split_by_face_sets(
         face_set_a: Face indices for the first (smaller) part.
         face_set_b: Face indices for the second (larger) part.
         strategy_name: Name for logging/debug.
+        attempt_hole_fill: If True, try to fill open boundaries to make
+            both parts watertight.
 
     Returns:
         SplitResult with the two submeshes.
@@ -445,7 +450,7 @@ def split_by_face_sets(
         # Attempt hole-filling for watertightness
         capped = False
         try:
-            if not upper.is_watertight or not lower.is_watertight:
+            if attempt_hole_fill and (not upper.is_watertight or not lower.is_watertight):
                 upper_filled = upper.copy()
                 lower_filled = lower.copy()
                 upper_filled.fill_holes()
@@ -486,7 +491,8 @@ def split_by_shortest_seam(
         SplitResult with the two submeshes.
     """
     return split_by_face_sets(mesh, face_set_a, face_set_b,
-                              strategy_name="shortest_seam")
+                              strategy_name="shortest_seam",
+                              attempt_hole_fill=False)
 
 
 def _manual_cap_mesh(
@@ -508,11 +514,11 @@ def _manual_cap_mesh(
         # Compatible with both trimesh 3.x (to_planar) and 4.x (to_2D)
         if hasattr(section, 'to_2D'):
             try:
-                path_2d, transform = section.to_2D()
+                path_2d, to_3d = section.to_2D()
             except Exception:
-                path_2d, transform = section.to_planar()
+                path_2d, to_3d = section.to_planar()
         elif hasattr(section, 'to_planar'):
-            path_2d, transform = section.to_planar()
+            path_2d, to_3d = section.to_planar()
         else:
             return None
         if path_2d is None:
@@ -561,8 +567,7 @@ def _manual_cap_mesh(
             numpy.zeros(len(vertices_2d)),
             numpy.ones(len(vertices_2d))
         ])
-        transform_inv = numpy.linalg.inv(transform)
-        vertices_3d = (transform_inv @ vertices_3d_hom.T).T[:, :3]
+        vertices_3d = (to_3d @ vertices_3d_hom.T).T[:, :3]
 
         cap_mesh = trimesh.Trimesh(vertices=vertices_3d, faces=faces_2d)
 
@@ -576,6 +581,8 @@ def _manual_cap_mesh(
                     cap_mesh.faces = cap_mesh.faces[:, ::-1]
 
         combined = trimesh.util.concatenate([mesh, cap_mesh])
+        # Stitch shared boundary vertices so the cap seals the cut surface.
+        combined.merge_vertices()
         logger.debug("Manual cap: added %d cap verts, %d cap faces", len(vertices_3d), len(faces_2d))
         return combined
 

@@ -989,7 +989,8 @@ class ObjectSplitter(Tool):
             if self._cut_mode in (self.CUT_MODE_SHORTEST, self.CUT_MODE_RADIAL):
                 split_result = split_by_face_sets(
                     tm, face_set_a, face_set_b,
-                    strategy_name="shortest_seam" if self._cut_mode == self.CUT_MODE_SHORTEST else "radial"
+                    strategy_name="shortest_seam" if self._cut_mode == self.CUT_MODE_SHORTEST else "radial",
+                    attempt_hole_fill=False,
                 )
             elif self._cut_mode in (self.CUT_MODE_SMALLEST, self.CUT_MODE_VALLEY):
                 # Use graph-based local separation with candidate fallback.
@@ -1130,7 +1131,8 @@ class ObjectSplitter(Tool):
             self._updateProgress("Splitting mesh...", 70)
             split_result = split_by_face_sets(
                 tm, face_set_a, face_set_b,
-                strategy_name="path_cut"
+                strategy_name="path_cut",
+                attempt_hole_fill=False,
             )
 
             Logger.log("i", "Path cut split result: %s", split_result.summary())

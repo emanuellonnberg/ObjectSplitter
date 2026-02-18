@@ -6,6 +6,7 @@
 import numpy
 import pytest
 
+import core.mesh_splitter as mesh_splitter_module
 from core.mesh_splitter import (
     slice_mesh_with_fallback,
     split_by_shortest_seam,
@@ -392,3 +393,64 @@ class TestFallbackChain:
         assert len(result.strategies_attempted) >= 1
         if result.success:
             assert result.strategy_used != "none"
+
+    def test_manual_cap_path_is_watertight_on_cube(self, cube_mesh, monkeypatch):
+        """Force strategy-2 and verify manual capping really seals both halves."""
+        original_slice = mesh_splitter_module.trimesh.intersections.slice_mesh_plane
+
+        def _force_manual_cap(mesh, plane_normal, plane_origin, cap=False):
+            if cap:
+                raise ImportError("forced test fallback to manual cap")
+            return original_slice(
+                mesh,
+                plane_normal=plane_normal,
+                plane_origin=plane_origin,
+                cap=False,
+            )
+
+        monkeypatch.setattr(
+            mesh_splitter_module.trimesh.intersections,
+            "slice_mesh_plane",
+            _force_manual_cap,
+        )
+
+        result = slice_mesh_with_fallback(
+            cube_mesh,
+            numpy.array([0, 0, 0]),
+            numpy.array([0, 1, 0]),
+        )
+        assert result.success
+        assert result.strategy_used == "manual_cap"
+        assert result.capped
+        assert result.upper.is_watertight
+        assert result.lower.is_watertight
+
+    def test_manual_cap_failure_falls_back_to_uncapped(self, cube_mesh, monkeypatch):
+        """If manual cap generation fails, uncapped slices should still be returned."""
+        original_slice = mesh_splitter_module.trimesh.intersections.slice_mesh_plane
+
+        def _force_manual_cap(mesh, plane_normal, plane_origin, cap=False):
+            if cap:
+                raise ImportError("forced test fallback to manual cap")
+            return original_slice(
+                mesh,
+                plane_normal=plane_normal,
+                plane_origin=plane_origin,
+                cap=False,
+            )
+
+        monkeypatch.setattr(
+            mesh_splitter_module.trimesh.intersections,
+            "slice_mesh_plane",
+            _force_manual_cap,
+        )
+        monkeypatch.setattr(mesh_splitter_module, "_manual_cap_mesh", lambda *_args, **_kwargs: None)
+
+        result = slice_mesh_with_fallback(
+            cube_mesh,
+            numpy.array([0, 0, 0]),
+            numpy.array([0, 1, 0]),
+        )
+        assert result.success
+        assert result.strategy_used == "uncapped_slice"
+        assert not result.capped
