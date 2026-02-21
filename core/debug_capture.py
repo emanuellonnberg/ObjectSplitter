@@ -40,7 +40,7 @@ class CapturedOperation:
     mesh_file: str  # .stl or .ply file
 
     # Cut parameters
-    cut_mode: str  # "horizontal", "vertical", "smallest", "shortest"
+    cut_mode: str  # "horizontal", "vertical", "smallest", "shortest", "valley_seam"
     click_position: list  # [x, y, z]
     height_percent: float  # for horizontal mode
     search_resolution: int  # for smallest mode
@@ -181,9 +181,14 @@ def replay_operation(capture_path: str) -> dict:
     """
     from .plane_calculator import (
         horizontal_cut_plane, vertical_cut_plane,
-        find_smallest_cut_plane, find_shortest_seam_partition, CutPlane
+        find_smallest_cut_plane, find_shortest_seam_partition,
+        find_valley_seam_partition, CutPlane
     )
-    from .mesh_splitter import slice_mesh_with_fallback, split_by_shortest_seam
+    from .mesh_splitter import (
+        slice_mesh_with_fallback,
+        split_by_shortest_seam,
+        split_by_face_sets,
+    )
     from .connectors import add_connectors, ConnectorConfig
 
     mesh, params = load_captured_operation(capture_path)
@@ -204,6 +209,8 @@ def replay_operation(capture_path: str) -> dict:
         plane = search_result.plane
     elif params.cut_mode == "shortest":
         plane = None  # Handled differently
+    elif params.cut_mode == "valley_seam":
+        plane = None  # Handled differently
     else:
         plane = horizontal_cut_plane(mesh, params.height_percent)
 
@@ -211,6 +218,15 @@ def replay_operation(capture_path: str) -> dict:
     if params.cut_mode == "shortest":
         face_set_a, face_set_b, _, _ = find_shortest_seam_partition(mesh, click_pos)
         split_result = split_by_shortest_seam(mesh, face_set_a, face_set_b)
+    elif params.cut_mode == "valley_seam":
+        face_set_a, face_set_b, _, _ = find_valley_seam_partition(mesh, click_pos)
+        split_result = split_by_face_sets(
+            mesh,
+            face_set_a,
+            face_set_b,
+            strategy_name="valley_seam",
+            attempt_hole_fill=False,
+        )
     else:
         split_result = slice_mesh_with_fallback(mesh, plane.origin, plane.normal)
 
@@ -223,7 +239,7 @@ def replay_operation(capture_path: str) -> dict:
 
     # Add connectors if enabled
     if params.connector_enabled and split_result.success and split_result.capped:
-        if params.cut_mode != "shortest" and plane is not None:
+        if params.cut_mode not in ("shortest", "valley_seam") and plane is not None:
             config = ConnectorConfig(
                 enabled=True,
                 diameter=params.connector_diameter,

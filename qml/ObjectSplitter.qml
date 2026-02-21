@@ -84,7 +84,7 @@ Item {
                 id: cutModeComboBox
                 width: 170
                 height: UM.Theme.getSize("setting_control").height
-                model: ["Horizontal", "Vertical", "Smallest Section", "Shortest Seam", "Radial (geodesic)", "Path (multi-point)", "Valley (groove)"]
+                model: ["Horizontal", "Vertical", "Smallest Section", "Shortest Seam", "Radial (geodesic)", "Path (multi-point)", "Valley (groove)", "Valley Seam (concavity)"]
                 currentIndex: {
                     if (UM.ActiveTool) {
                         var mode = UM.ActiveTool.properties.getValue("CutMode")
@@ -95,12 +95,13 @@ Item {
                         if (mode === "radial") return 4
                         if (mode === "path") return 5
                         if (mode === "valley") return 6
+                        if (mode === "valley_seam") return 7
                     }
                     return 0
                 }
                 onActivated: {
                     if (UM.ActiveTool) {
-                        var modeMap = ["horizontal", "vertical", "smallest", "shortest", "radial", "path", "valley"]
+                        var modeMap = ["horizontal", "vertical", "smallest", "shortest", "radial", "path", "valley", "valley_seam"]
                         UM.ActiveTool.setProperty("CutMode", modeMap[currentIndex])
                     }
                 }
@@ -120,6 +121,7 @@ Item {
                     if (mode === "radial") return "Geodesic distance partition from click"
                     if (mode === "path") return "Click to place points, then press Cut"
                     if (mode === "valley") return "Find and follow a valley/groove near click"
+                    if (mode === "valley_seam") return "Concavity-biased seam around clicked feature"
                 }
                 return ""
             }

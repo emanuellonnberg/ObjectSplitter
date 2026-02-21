@@ -12,6 +12,7 @@ from core.plane_calculator import (
     vertical_cut_plane,
     find_smallest_cut_plane,
     find_valley_cut_plane,
+    find_valley_seam_partition,
     find_shortest_seam_partition,
     snap_point_to_mesh_surface,
     smooth_partition_boundary,
@@ -256,6 +257,37 @@ class TestFindShortestSeamPartition:
         all_faces = set(set_a) | set(set_b)
         assert face_hint in all_faces
         assert len(set_a) + len(set_b) == len(cube_mesh.faces)
+
+
+class TestFindValleySeamPartition:
+    """Tests for concavity-biased seam partitioning."""
+
+    def test_partitions_cover_all_faces(self, sphere_mesh):
+        click = numpy.array([15.0, 0.0, 0.0])
+        set_a, set_b, src, sink = find_valley_seam_partition(
+            sphere_mesh, click, surface_normal=numpy.array([1.0, 0.0, 0.0])
+        )
+        assert len(set_a) + len(set_b) == len(sphere_mesh.faces)
+        assert len(set(set_a) & set(set_b)) == 0
+
+    def test_partitions_nonempty_and_smaller_set_a(self, sphere_mesh):
+        click = numpy.array([15.0, 0.0, 0.0])
+        set_a, set_b, _, _ = find_valley_seam_partition(
+            sphere_mesh, click, surface_normal=numpy.array([1.0, 0.0, 0.0])
+        )
+        assert len(set_a) > 0
+        assert len(set_b) > 0
+        assert len(set_a) <= len(set_b)
+
+    def test_opposite_normals_tend_to_change_sink(self, sphere_mesh):
+        click = numpy.array([15.0, 0.0, 0.0])
+        _, _, _, sink_up = find_valley_seam_partition(
+            sphere_mesh, click, surface_normal=numpy.array([0.0, 1.0, 0.0])
+        )
+        _, _, _, sink_down = find_valley_seam_partition(
+            sphere_mesh, click, surface_normal=numpy.array([0.0, -1.0, 0.0])
+        )
+        assert sink_up != sink_down
 
 
 class TestSnapPointToMeshSurface:

@@ -20,12 +20,14 @@ from core.plane_calculator import (
     vertical_cut_plane,
     find_smallest_cut_plane,
     find_valley_cut_plane,
+    find_valley_seam_partition,
     find_shortest_seam_partition,
 )
 from core.mesh_splitter import (
     slice_mesh_with_fallback,
     split_by_shortest_seam,
     split_by_local_plane,
+    split_by_face_sets,
 )
 from core.connectors import add_connectors, ConnectorConfig
 from core.debug_capture import (
@@ -142,6 +144,26 @@ class TestFullValleyWorkflow:
         result = split_by_local_plane(
             sphere_mesh, search.plane.origin, candidate_normals, face_id)
         assert result.success
+
+
+class TestFullValleySeamWorkflow:
+    """End-to-end seam-based valley tests."""
+
+    def test_sphere_valley_seam(self, sphere_mesh):
+        click = numpy.array([15.0, 0.0, 0.0])
+        set_a, set_b, _, _ = find_valley_seam_partition(
+            sphere_mesh, click, surface_normal=numpy.array([1.0, 0.0, 0.0])
+        )
+        result = split_by_face_sets(
+            sphere_mesh,
+            set_a,
+            set_b,
+            strategy_name="valley_seam",
+            attempt_hole_fill=False,
+        )
+        assert result.success
+        assert len(result.upper.faces) > 0
+        assert len(result.lower.faces) > 0
 
 
 class TestCaptureAndReplay:

@@ -594,6 +594,354 @@ def find_valley_cut_plane(
     )
 
 
+def find_valley_seam_partition(
+    mesh: "trimesh.Trimesh",
+    click_position: numpy.ndarray,
+    source_face_hint: Optional[int] = None,
+    surface_normal: Optional[numpy.ndarray] = None,
+) -> Tuple[list, list, int, int]:
+    """
+    Compute a seam-based valley partition that prefers concave surface paths.
+
+    Unlike planar valley mode, this algorithm works directly on the face graph:
+    - edge costs are reduced on concave adjacencies,
+    - edge costs increase away from the click region,
+    - dual-Dijkstra + threshold sweep finds a short seam-like partition.
+
+    The computation runs in a worker thread with a hard timeout, matching the
+    behavior of radial/shortest seam search.
+    """
+    import threading
+
+    HARD_TIMEOUT_SEC = 10.0
+    result_holder = [None]
+    error_holder = [None]
+    cancel_event = threading.Event()
+
+    def _worker():
+        try:
+            result_holder[0] = _find_valley_seam_partition_impl(
+                mesh,
+                click_position,
+                source_face_hint,
+                surface_normal,
+                cancel_event,
+            )
+        except Exception as e:
+            error_holder[0] = e
+
+    logger.info(
+        "find_valley_seam_partition: Starting worker thread (timeout=%.1fs)",
+        HARD_TIMEOUT_SEC,
+    )
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    t.join(timeout=HARD_TIMEOUT_SEC)
+
+    if t.is_alive():
+        cancel_event.set()
+        msg = (
+            f"Valley seam search timed out after {HARD_TIMEOUT_SEC}s "
+            "(thread still running, cancel sent)."
+        )
+        logger.warning(msg)
+        raise TimeoutError(msg)
+
+    if error_holder[0] is not None:
+        raise error_holder[0]
+
+    if result_holder[0] is None:
+        raise RuntimeError("Valley seam search returned no result")
+
+    logger.info("find_valley_seam_partition: Worker thread completed successfully")
+    return result_holder[0]
+
+
+def _find_valley_seam_partition_impl(
+    mesh: "trimesh.Trimesh",
+    click_position: numpy.ndarray,
+    source_face_hint: Optional[int] = None,
+    surface_normal: Optional[numpy.ndarray] = None,
+    cancel_event=None,
+) -> Tuple[list, list, int, int]:
+    import heapq
+
+    def _check_cancel():
+        if cancel_event is not None and cancel_event.is_set():
+            raise TimeoutError("Valley seam search cancelled")
+
+    point = numpy.asarray(click_position, dtype=numpy.float64).reshape(1, -1)
+    face_index = source_face_hint
+
+    if face_index is None:
+        try:
+            from trimesh.proximity import ProximityQuery
+
+            pq = ProximityQuery(mesh)
+            _, _, face_ids = pq.on_surface(point)
+            if face_ids is not None and len(face_ids) > 0:
+                face_index = int(face_ids[0])
+        except Exception as e:
+            logger.debug("valley_seam: proximity query failed: %s", e)
+
+    if face_index is None:
+        if mesh.vertices.shape[0] > 0:
+            distances = numpy.linalg.norm(mesh.vertices - point, axis=1)
+            nearest_idx = int(numpy.argmin(distances))
+            faces_with_vertex = numpy.where(mesh.faces == nearest_idx)[0]
+            face_index = int(faces_with_vertex[0]) if faces_with_vertex.size > 0 else 0
+        else:
+            face_index = 0
+
+    faces_count = len(mesh.faces)
+    if faces_count < 4:
+        raise RuntimeError("valley_seam: mesh too small for partitioning")
+
+    adj_pairs = mesh.face_adjacency
+    adj_edges = mesh.face_adjacency_edges
+    num_adj = len(adj_pairs)
+    if num_adj == 0:
+        raise RuntimeError("valley_seam: mesh has no face adjacency")
+
+    f1_arr = adj_pairs[:, 0].astype(numpy.int32)
+    f2_arr = adj_pairs[:, 1].astype(numpy.int32)
+
+    face_centroids = mesh.vertices[mesh.faces].mean(axis=1)
+    c1 = face_centroids[f1_arr]
+    c2 = face_centroids[f2_arr]
+    centroid_dists = numpy.linalg.norm(c1 - c2, axis=1)
+    base_edge_lengths = numpy.maximum(centroid_dists, 1e-8)
+
+    # Concavity-aware edge weighting.
+    concave_strength = numpy.zeros(num_adj, dtype=numpy.float64)
+    convex_strength = numpy.zeros(num_adj, dtype=numpy.float64)
+    concave_edge_ratio = 0.0
+    try:
+        angles = numpy.asarray(mesh.face_adjacency_angles, dtype=numpy.float64)
+        convex_mask = numpy.asarray(mesh.face_adjacency_convex, dtype=bool)
+        if len(angles) == num_adj and len(convex_mask) == num_adj:
+            normalized_angle = numpy.clip(angles / (numpy.pi / 2.0), 0.0, 1.0)
+            concave_strength[~convex_mask] = normalized_angle[~convex_mask]
+            convex_strength[convex_mask] = normalized_angle[convex_mask]
+            concave_edge_ratio = float(numpy.count_nonzero(~convex_mask)) / float(num_adj)
+    except Exception as e:
+        logger.debug("valley_seam: concavity extraction failed: %s", e)
+
+    click = point.reshape(3)
+    edge_midpoints = 0.5 * (c1 + c2)
+    mesh_diag = float(numpy.linalg.norm(mesh.bounds[1] - mesh.bounds[0]))
+    mesh_diag = max(mesh_diag, 1e-6)
+    locality_norm = numpy.linalg.norm(edge_midpoints - click, axis=1) / mesh_diag
+
+    # Favor concave edges and keep seams local to the click neighborhood.
+    # Lower weights are preferred by Dijkstra.
+    geo_weights_per_adj = base_edge_lengths.copy()
+    geo_weights_per_adj *= (1.0 + 0.55 * convex_strength)
+    geo_weights_per_adj /= (1.0 + 2.6 * concave_strength)
+    geo_weights_per_adj *= (1.0 + 0.75 * locality_norm)
+    geo_weights_per_adj = numpy.maximum(geo_weights_per_adj, base_edge_lengths * 0.05)
+
+    # Build CSR adjacency from weighted undirected face graph.
+    edge_count_per_node = numpy.zeros(faces_count, dtype=numpy.int32)
+    for i in range(num_adj):
+        edge_count_per_node[f1_arr[i]] += 1
+        edge_count_per_node[f2_arr[i]] += 1
+
+    offsets = numpy.zeros(faces_count + 1, dtype=numpy.int32)
+    offsets[1:] = numpy.cumsum(edge_count_per_node)
+    total_geo_edges = int(offsets[faces_count])
+
+    geo_targets = numpy.zeros(total_geo_edges, dtype=numpy.int32)
+    geo_weights = numpy.zeros(total_geo_edges, dtype=numpy.float64)
+    fill_pos = offsets[:-1].copy()
+
+    for i in range(num_adj):
+        u, v = int(f1_arr[i]), int(f2_arr[i])
+        w = float(geo_weights_per_adj[i])
+
+        pos_u = fill_pos[u]
+        geo_targets[pos_u] = v
+        geo_weights[pos_u] = w
+        fill_pos[u] += 1
+
+        pos_v = fill_pos[v]
+        geo_targets[pos_v] = u
+        geo_weights[pos_v] = w
+        fill_pos[v] += 1
+
+    def _run_dijkstra(start_face: int) -> numpy.ndarray:
+        dist = numpy.full(faces_count, numpy.inf, dtype=numpy.float64)
+        dist[start_face] = 0.0
+        pq_heap = [(0.0, int(start_face))]
+        pops = 0
+        while pq_heap:
+            d, u = heapq.heappop(pq_heap)
+            pops += 1
+            if pops % 2000 == 0:
+                _check_cancel()
+            if d > dist[u]:
+                continue
+            for e_idx in range(offsets[u], offsets[u + 1]):
+                v = int(geo_targets[e_idx])
+                nd = d + geo_weights[e_idx]
+                if nd < dist[v]:
+                    dist[v] = nd
+                    heapq.heappush(pq_heap, (nd, v))
+        return dist
+
+    dist_src = _run_dijkstra(face_index)
+    finite_mask = numpy.isfinite(dist_src)
+    if not numpy.any(finite_mask):
+        raise RuntimeError("valley_seam: source Dijkstra produced no finite distances")
+
+    max_dist = float(numpy.max(dist_src[finite_mask]))
+    if max_dist <= 1e-12:
+        max_dist = 1.0
+
+    sink_face = None
+    if surface_normal is not None and len(mesh.triangles_center) > 0:
+        normal = numpy.asarray(surface_normal, dtype=numpy.float64)
+        normal_norm = numpy.linalg.norm(normal)
+        if normal_norm > 1e-8:
+            normal = normal / normal_norm
+            norm_dist = numpy.where(finite_mask, dist_src / max_dist, 0.0)
+
+            vecs = mesh.triangles_center - click
+            norms = numpy.linalg.norm(vecs, axis=1)
+            valid = norms > 1e-6
+            if numpy.any(valid):
+                vecs[valid] = vecs[valid] / norms[valid, numpy.newaxis]
+                align_score = numpy.full_like(norm_dist, -1.0)
+                align_score[valid] = numpy.dot(vecs[valid], -normal)
+
+                candidate_mask = finite_mask & (norm_dist >= 0.15)
+                combined = numpy.full_like(norm_dist, -numpy.inf)
+                if numpy.any(candidate_mask):
+                    combined[candidate_mask] = (
+                        (0.60 * norm_dist[candidate_mask]) +
+                        (0.40 * align_score[candidate_mask])
+                    )
+                else:
+                    combined[finite_mask] = norm_dist[finite_mask]
+                sink_face = int(numpy.argmax(combined))
+
+    if sink_face is None:
+        finite_dist = numpy.where(finite_mask, dist_src, -1.0)
+        sink_face = int(numpy.argmax(finite_dist))
+
+    if sink_face == face_index:
+        finite_dist = numpy.where(finite_mask, dist_src, -1.0)
+        finite_dist[face_index] = -1.0
+        sink_face = int(numpy.argmax(finite_dist))
+
+    dist_sink = _run_dijkstra(sink_face)
+
+    d_src = numpy.where(numpy.isfinite(dist_src), dist_src, max_dist)
+    d_snk = numpy.where(numpy.isfinite(dist_sink), dist_sink, max_dist)
+    total_d = d_src + d_snk
+    safe_total = numpy.where(total_d > 1e-12, total_d, 1.0)
+    score = d_src / safe_total
+
+    # Threshold sweep with cost preferring short, concave, local boundaries.
+    # On large, smooth meshes (very low explicit concave-edge ratio), tiny local
+    # cuts can win purely on perimeter; guard with an adaptive second pass below.
+    thresholds = numpy.linspace(0.05, 0.45, 25)
+
+    s1 = score[f1_arr]
+    s2 = score[f2_arr]
+    score_lo = numpy.minimum(s1, s2)
+    score_hi = numpy.maximum(s1, s2)
+
+    boundary_edge_lengths = numpy.linalg.norm(
+        mesh.vertices[adj_edges[:, 0]] - mesh.vertices[adj_edges[:, 1]],
+        axis=1,
+    )
+
+    def _select_threshold(min_ratio: float, max_ratio: Optional[float] = None):
+        min_faces_threshold = max(10, int(faces_count * min_ratio))
+        best_thresh_local = None
+        best_cost_local = float("inf")
+        best_small_local = 0
+
+        for t in thresholds:
+            cross_mask = (score_lo < t) & (score_hi >= t)
+            len_a = int(numpy.sum(score < t))
+            len_b = faces_count - len_a
+            if len_a < min_faces_threshold or len_b < min_faces_threshold:
+                continue
+            if not numpy.any(cross_mask):
+                continue
+
+            small_faces = min(len_a, len_b)
+            ratio = float(small_faces) / float(faces_count)
+            if max_ratio is not None and ratio > max_ratio:
+                continue
+
+            perimeter = float(numpy.sum(boundary_edge_lengths[cross_mask]))
+            mean_concavity = float(numpy.mean(concave_strength[cross_mask]))
+            mean_locality = float(numpy.mean(locality_norm[cross_mask]))
+
+            concavity_factor = max(0.2, 1.0 - 0.65 * mean_concavity)
+            locality_factor = 1.0 + 0.35 * mean_locality
+            cost = perimeter * concavity_factor * locality_factor
+
+            if cost < best_cost_local:
+                best_cost_local = cost
+                best_thresh_local = float(t)
+                best_small_local = small_faces
+
+        return best_thresh_local, best_cost_local, best_small_local
+
+    best_thresh, best_cost, best_small = _select_threshold(min_ratio=0.02)
+
+    # Smooth, high-face meshes often have near-zero explicit concave edges.
+    # In that regime, tiny local partitions can dominate on perimeter alone.
+    # If that happens, re-run with a slightly larger minimum partition and
+    # exclude near-half splits to keep the cut focused.
+    if best_thresh is not None:
+        best_ratio = float(best_small) / float(faces_count)
+        use_smooth_guard = (
+            faces_count >= 8000 and
+            concave_edge_ratio < 0.002 and
+            best_ratio < 0.05
+        )
+        if use_smooth_guard:
+            alt_thresh, alt_cost, alt_small = _select_threshold(
+                min_ratio=0.05,
+                max_ratio=0.35
+            )
+            if alt_thresh is not None:
+                logger.debug(
+                    "valley_seam: smooth-mesh guard adjusted threshold "
+                    "(concave_ratio=%.4f, ratio %.3f -> %.3f)",
+                    concave_edge_ratio,
+                    best_ratio,
+                    float(alt_small) / float(faces_count),
+                )
+                best_thresh = alt_thresh
+                best_cost = alt_cost
+                best_small = alt_small
+
+    if best_thresh is None:
+        best_thresh = 0.25
+        logger.debug("valley_seam: no valid threshold found, fallback to score=0.25")
+
+    mask_a = score < best_thresh
+    mask_a[face_index] = True
+    set_a = numpy.where(mask_a)[0].tolist()
+    set_b = numpy.where(~mask_a)[0].tolist()
+
+    if len(set_a) > len(set_b):
+        set_a, set_b = set_b, set_a
+
+    # Keep refinement for smaller meshes where it meaningfully improves the seam.
+    if faces_count <= 4000:
+        set_a, set_b = refine_partition_with_mincut(mesh, set_a, set_b, score, best_thresh)
+
+    return set_a, set_b, face_index, sink_face
+
+
 def find_shortest_seam_partition(
     mesh: "trimesh.Trimesh",
     click_position: numpy.ndarray,
@@ -800,26 +1148,41 @@ def _find_shortest_seam_partition_impl(
     dist_sink = None
     max_d = numpy.max(dist[finite_mask])
     
-    # Base sink on Distance and anti-alignment with the clicked face
+    # Base sink on geodesic distance and (if provided) click-direction anti-alignment.
+    # Opposite surface normals should steer sink selection to different regions.
     if surface_normal is not None and len(mesh.triangles_center) > 0:
+        normal = numpy.asarray(surface_normal, dtype=numpy.float64)
+        normal_norm = numpy.linalg.norm(normal)
+        if normal_norm > 1e-8:
+            normal = normal / normal_norm
+        else:
+            normal = None
+
         face_centers = mesh.triangles_center
-        # Score = normalized distance + normalized opposite alignment
-        norm_dist = dist / max_d
-        
-        # Vector from source to all other faces
-        vecs = face_centers - point
-        norms = numpy.linalg.norm(vecs, axis=1)
-        valid = norms > 1e-6
-        
-        if numpy.any(valid):
-            vecs[valid] = vecs[valid] / norms[valid, numpy.newaxis]
-            # Alignment score: 1.0 if perfectly anti-parallel to normal (directly opposite)
-            align_score = numpy.zeros_like(norm_dist)
-            align_score[valid] = numpy.maximum(0, numpy.dot(vecs[valid], -surface_normal))
-            
-            # Combine scores (weight distance slightly higher to ensure it's a true "pole")
-            combined = (norm_dist * 0.7) + (align_score * 0.3)
-            sink_face = int(numpy.argmax(combined))
+        norm_dist = numpy.where(finite_mask, dist / max(max_d, 1e-12), 0.0)
+
+        if normal is not None:
+            # Vector from click/source region to each face center
+            vecs = face_centers - point
+            norms = numpy.linalg.norm(vecs, axis=1)
+            valid = norms > 1e-6
+
+            if numpy.any(valid):
+                vecs[valid] = vecs[valid] / norms[valid, numpy.newaxis]
+
+                # Signed anti-alignment: +1 means directly opposite click normal,
+                # -1 means same direction as click normal.
+                align_score = numpy.full_like(norm_dist, 0.0)
+                align_score[valid] = numpy.dot(vecs[valid], -normal)
+
+                # Bias toward geodesic poles while letting opposite click normals
+                # steer the destination to different sides on complex meshes.
+                combined = numpy.full_like(norm_dist, -numpy.inf)
+                combined[finite_mask] = (
+                    (0.65 * norm_dist[finite_mask]) +
+                    (0.35 * align_score[finite_mask])
+                )
+                sink_face = int(numpy.argmax(combined))
             
     if sink_face is None:
         sink_face = int(numpy.argmax(dist))
@@ -921,15 +1284,6 @@ def _find_shortest_seam_partition_impl(
         v1_coords = mesh.vertices[cross_edges_vertex_indices[:, 1]]
         edge_lengths = numpy.linalg.norm(v0_coords - v1_coords, axis=1)
         
-        if abs(t - 0.334) < 0.01:
-            # DEBUG DUMP: let's export the edges!
-            try:
-                perim_len = numpy.sum(edge_lengths)
-                numpy.savez('debug_in_a.npz', in_a=in_a)
-                _log(f"Exported debug_in_a.npz with {numpy.sum(in_a)} faces, perimeter: {perim_len:.2f}")
-            except Exception as e:
-                _log(f"Failed to export path: {e}")
-
         # Penalize non-planar loops using PCA
         unique_pts = numpy.unique(cross_edges_vertex_indices.reshape(-1, 1), axis=0)
         # Get coordinates of unique vertices
@@ -950,20 +1304,29 @@ def _find_shortest_seam_partition_impl(
                 pca_penalty = 1.0 # No penalty
                 
         # Prefer straight geodesic cuts across small perimeters
-        cost = numpy.sum(edge_lengths) * pca_penalty
-        print(f"DEBUG THRESHOLD SWEEP: t={t:.3f}, cost={cost:.2f}, perim_len={numpy.sum(edge_lengths):.2f}, pca={pca_penalty:.2f}, len_a={len_a}")
+        perim_len = numpy.sum(edge_lengths)
+        cost = perim_len * pca_penalty
+        logger.debug(
+            "threshold sweep: t=%.3f cost=%.2f perim_len=%.2f pca=%.2f len_a=%d",
+            t,
+            cost,
+            perim_len,
+            pca_penalty,
+            len_a,
+        )
 
         if cost < best_cost:
             best_cost = cost
             best_thresh = t
             best_len_a = len_a
     
-    print(f"DEBUG BEST THRESHOLD: t={best_thresh:.3f}, best_cost={best_cost:.2f}")
-
     if best_thresh is None:
         # Fallback: split at score = 0.5 (equidistant boundary)
+        _log("DEBUG BEST THRESHOLD: none valid, fallback to score=0.5")
         best_thresh = 0.5
         _log(f"  No valid threshold found, fallback to score=0.5")
+    else:
+        _log(f"DEBUG BEST THRESHOLD: t={best_thresh:.3f}, best_cost={best_cost:.2f}")
 
     _log(f"  Best score_thresh={best_thresh:.3f}, cut_cost={best_cost:.1f}, set_a~={best_len_a}")
 
@@ -979,10 +1342,15 @@ def _find_shortest_seam_partition_impl(
 
     _log(f"  Partition computed in {time.perf_counter()-t5:.3f}s")
 
-    from collections import deque
-    
-    _log(f"  Refining partition with min-cut bottleneck search...")
-    set_a, set_b = refine_partition_with_mincut(mesh, set_a, set_b, score, best_thresh)
+    # Min-cut refinement is expensive on larger meshes and can exceed the UI timeout.
+    # Keep it for small/medium meshes where it improves seam quality, but skip it on
+    # large captures so shortest-seam remains responsive.
+    REFINE_MAX_FACES = 4000
+    if faces_count <= REFINE_MAX_FACES:
+        _log(f"  Refining partition with min-cut bottleneck search...")
+        set_a, set_b = refine_partition_with_mincut(mesh, set_a, set_b, score, best_thresh)
+    else:
+        _log(f"  Skipping min-cut refinement for large mesh ({faces_count} faces)")
 
     total_time = time.perf_counter() - t0
     _log(f"  DONE. set_a={len(set_a)}, set_b={len(set_b)} faces. Total time: {total_time:.3f}s")
@@ -993,8 +1361,8 @@ def refine_partition_with_mincut(
     mesh: "trimesh.Trimesh",
     initial_set_a: list,
     initial_set_b: list,
-    score: numpy.ndarray,
-    best_thresh: float,
+    score: Optional[numpy.ndarray] = None,
+    best_thresh: Optional[float] = None,
     min_face_fraction: float = 0.005,
 ) -> Tuple[list, list]:
     from collections import deque
@@ -1005,6 +1373,22 @@ def refine_partition_with_mincut(
         logger.debug("refine_partition: partitions too small to refine (%d/%d)",
                      len(initial_set_a), len(initial_set_b))
         return initial_set_a, initial_set_b
+
+    if score is None or best_thresh is None:
+        logger.debug(
+            "refine_partition: score/best_thresh not provided, "
+            "falling back to boundary smoothing only"
+        )
+        return smooth_partition_boundary(mesh, initial_set_a, initial_set_b)
+
+    if len(score) != faces_count:
+        logger.warning(
+            "refine_partition: invalid score length (%d != %d), "
+            "falling back to boundary smoothing only",
+            len(score),
+            faces_count,
+        )
+        return smooth_partition_boundary(mesh, initial_set_a, initial_set_b)
 
     # We will build a flow network with a Super-Source and Super-Sink.
     # Source Region: faces very close to the click point (score near 0)

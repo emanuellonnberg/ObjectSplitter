@@ -87,6 +87,7 @@ from .core.plane_calculator import (
     vertical_cut_plane,
     find_smallest_cut_plane,
     find_valley_cut_plane,
+    find_valley_seam_partition,
     find_shortest_seam_partition,
     refine_partition_with_mincut,
 )
@@ -115,6 +116,7 @@ class ObjectSplitter(Tool):
     CUT_MODE_RADIAL = "radial"              # Radial geodesic cut (dual-Dijkstra)
     CUT_MODE_PATH = "path"                  # Multi-point geodesic path cut
     CUT_MODE_VALLEY = "valley"              # Geographic valley/groove detection
+    CUT_MODE_VALLEY_SEAM = "valley_seam"    # Concavity-biased seam cut
 
     def __init__(self):
         super().__init__()
@@ -283,6 +285,7 @@ class ObjectSplitter(Tool):
             {"value": self.CUT_MODE_RADIAL, "text": "Radial (geodesic)"},
             {"value": self.CUT_MODE_PATH, "text": "Path (multi-point)"},
             {"value": self.CUT_MODE_VALLEY, "text": "Valley (geographic groove)"},
+            {"value": self.CUT_MODE_VALLEY_SEAM, "text": "Valley Seam (concavity path)"},
         ]
 
     def getCutHeightPercent(self) -> float:
@@ -627,7 +630,14 @@ class ObjectSplitter(Tool):
         plane_size = max(mesh_size[0], mesh_size[2]) * 1.2  # 20% larger than mesh
 
         # For smallest/shortest seam: show arrow at click point along surface normal
-        if self._cut_mode in (self.CUT_MODE_SMALLEST, self.CUT_MODE_SHORTEST, self.CUT_MODE_RADIAL, self.CUT_MODE_PATH, self.CUT_MODE_VALLEY):
+        if self._cut_mode in (
+            self.CUT_MODE_SMALLEST,
+            self.CUT_MODE_SHORTEST,
+            self.CUT_MODE_RADIAL,
+            self.CUT_MODE_PATH,
+            self.CUT_MODE_VALLEY,
+            self.CUT_MODE_VALLEY_SEAM,
+        ):
             center = numpy.array([picked_position.x, picked_position.y, picked_position.z])
             mesh_size_max = max(mesh_size[0], mesh_size[1], mesh_size[2])
             marker_size = max(0.5, mesh_size_max * 0.012)  # 1.2% of mesh or 0.5mm
@@ -895,6 +905,40 @@ class ObjectSplitter(Tool):
                            search_result.area, search_result.samples_tested,
                            str(search_result.plane.normal),
                            str(search_result.plane.origin))
+            elif self._cut_mode == self.CUT_MODE_VALLEY_SEAM:
+                # Concavity-biased seam path around the clicked region.
+                self._updateProgress("Tracing concave valley seam...", 15)
+                snap_point, source_face = snap_point_to_mesh_surface(tm, click_pos_arr)
+                click_face_id = source_face
+
+                valley_seam_surface_normal = None
+                if source_face is not None and source_face < len(tm.face_normals):
+                    valley_seam_surface_normal = numpy.array(
+                        tm.face_normals[source_face], dtype=numpy.float64
+                    )
+
+                try:
+                    face_set_a, face_set_b, src, sink = find_valley_seam_partition(
+                        tm,
+                        snap_point,
+                        source_face_hint=source_face,
+                        surface_normal=valley_seam_surface_normal,
+                    )
+                    Logger.log(
+                        "i",
+                        "Valley seam returned. A=%d, B=%d, src=%d, sink=%d",
+                        len(face_set_a),
+                        len(face_set_b),
+                        src,
+                        sink,
+                    )
+                except Exception as e:
+                    Logger.log("w", "Valley seam error: %s", e)
+                    import traceback
+                    Logger.log("w", traceback.format_exc())
+                    face_set_a, face_set_b = [], []
+
+                plane = None  # Non-planar seam mode
 
             elif self._cut_mode == self.CUT_MODE_SHORTEST:
                 # Shortest Seam: plane search + refine_partition_with_mincut
@@ -986,10 +1030,20 @@ class ObjectSplitter(Tool):
 
             # Perform the split (delegates to core.mesh_splitter)
             self._updateProgress("Splitting mesh...", 40)
-            if self._cut_mode in (self.CUT_MODE_SHORTEST, self.CUT_MODE_RADIAL):
+            if self._cut_mode in (
+                self.CUT_MODE_SHORTEST,
+                self.CUT_MODE_RADIAL,
+                self.CUT_MODE_VALLEY_SEAM,
+            ):
+                if self._cut_mode == self.CUT_MODE_SHORTEST:
+                    strategy_name = "shortest_seam"
+                elif self._cut_mode == self.CUT_MODE_RADIAL:
+                    strategy_name = "radial"
+                else:
+                    strategy_name = "valley_seam"
                 split_result = split_by_face_sets(
                     tm, face_set_a, face_set_b,
-                    strategy_name="shortest_seam" if self._cut_mode == self.CUT_MODE_SHORTEST else "radial",
+                    strategy_name=strategy_name,
                     attempt_hole_fill=False,
                 )
             elif self._cut_mode in (self.CUT_MODE_SMALLEST, self.CUT_MODE_VALLEY):
@@ -1022,8 +1076,12 @@ class ObjectSplitter(Tool):
 
             # Add connectors if enabled (delegates to core.connectors)
             if self._connector_enabled:
-                if self._cut_mode == self.CUT_MODE_SHORTEST:
-                    Logger.log("w", "Skipping connectors - not supported for shortest seam mode")
+                if self._cut_mode in (
+                    self.CUT_MODE_SHORTEST,
+                    self.CUT_MODE_RADIAL,
+                    self.CUT_MODE_VALLEY_SEAM,
+                ):
+                    Logger.log("w", "Skipping connectors - not supported for non-planar seam modes")
                 elif split_result.capped and plane is not None:
                     self._updateProgress("Adding connectors...", 60)
                     config = ConnectorConfig(

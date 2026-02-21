@@ -11,7 +11,7 @@ The modes fall into three categories:
 1. **Planar (simple)** -- Horizontal, Vertical. Instant. Good for basic splits.
 2. **Planar (search)** -- Smallest Section, Valley. Search many orientations to
    find the optimal plane. Good for necks, joints, and narrow features.
-3. **Non-planar (geodesic)** -- Shortest Seam, Radial, Path. Cut along the mesh
+3. **Non-planar (geodesic)** -- Shortest Seam, Radial, Valley Seam, Path. Cut along the mesh
    surface instead of through a flat plane. Good for organic shapes where no
    single plane produces a clean seam.
 
@@ -479,6 +479,38 @@ partition flood-fill.
 
 ---
 
+## 8. Valley seam (concavity path)
+
+**Mode string:** `valley_seam`
+**Source:** `core/plane_calculator.py` -- `find_valley_seam_partition()`
+
+Valley Seam is a non-planar mode that prefers seams running through concave
+surface regions near the click. It is intended for "throat/groove" separations
+where planar valley can produce a straight notch.
+
+### How it works
+
+1. Build the face adjacency graph.
+2. Compute a weighted edge cost:
+   - lower cost on concave adjacencies,
+   - higher cost on convex adjacencies,
+   - mild locality penalty for edges far from the click.
+3. Run dual Dijkstra (source/sink) on this weighted graph.
+4. Sweep score thresholds and select the boundary minimizing weighted seam cost.
+5. Return face partitions directly (non-planar split path).
+
+### When to use it
+
+- Cutting around a clicked feature along a natural groove/seam.
+- Organic or rounded "throat" geometry where a flat valley plane is not ideal.
+
+### Complexity
+
+Similar to radial/shortest coarse partitioning: O(F log F) for two Dijkstra
+passes plus O(F + E) threshold evaluation.
+
+---
+
 ## Mesh splitting strategies
 
 Once a cut plane or face partition is determined, the actual mesh splitting is
@@ -534,3 +566,4 @@ watertightness.
 | Shortest seam | Surface-following | Full | Click point | Organic protrusions |
 | Radial | Surface-following | Full | Click point | Quick geodesic preview |
 | Path | Surface-following | Manual | Waypoints | Precise custom cuts |
+| Valley seam | Surface-following | Full | Click point | Concave groove/throat seams |

@@ -328,14 +328,14 @@ def split_by_local_plane(
     plane_origin: numpy.ndarray,
     candidate_normals: List[numpy.ndarray],
     source_face_id: int,
-    min_face_fraction: float = 0.005,
+    min_face_fraction: float = 0.02,
 ) -> SplitResult:
     """
     Split mesh at the click point using a plane-guided local separation.
 
     Tries candidate plane normals in order (sorted by cross-section area).
     Skips any that produce a partition where either piece has fewer than
-    min_face_fraction of total faces (prevents single-triangle cuts from
+    min_face_fraction of total faces (prevents tiny sliver cuts from
     surface-grazing planes).
 
     Args:
@@ -343,7 +343,8 @@ def split_by_local_plane(
         plane_origin: A point on the cutting plane.
         candidate_normals: List of normal vectors to try, ordered by preference.
         source_face_id: The face the user clicked on.
-        min_face_fraction: Minimum fraction of total faces for each piece (default 0.5%).
+        min_face_fraction: Minimum fraction of total faces for each piece
+            (default 2%).
 
     Returns:
         SplitResult with the separated piece and the rest.
@@ -492,7 +493,7 @@ def split_by_shortest_seam(
     """
     return split_by_face_sets(mesh, face_set_a, face_set_b,
                               strategy_name="shortest_seam",
-                              attempt_hole_fill=True)
+                              attempt_hole_fill=False)
 
 
 def _manual_cap_mesh(

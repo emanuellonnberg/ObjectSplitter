@@ -12,7 +12,7 @@ to create the partition.
 
 import heapq
 import logging
-from collections import deque
+from collections import deque, defaultdict
 from typing import List, Tuple, Optional
 
 import numpy
@@ -234,10 +234,20 @@ def partition_faces_by_path(
     faces = numpy.asarray(mesh.faces, dtype=numpy.int64)
 
     # 1. Build set of path edges (as frozensets for undirected lookup)
+    oriented_path_edges = []
     path_edges = set()
     for i in range(len(vertex_path) - 1):
-        path_edges.add(frozenset((vertex_path[i], vertex_path[i + 1])))
+        u = int(vertex_path[i])
+        v = int(vertex_path[i + 1])
+        if u == v:
+            continue
+        oriented_path_edges.append((u, v))
+        path_edges.add(frozenset((u, v)))
+    oriented_edge_lookup = set(oriented_path_edges)
     path_vertex_set = set(vertex_path)
+    is_closed_loop = (
+        len(vertex_path) >= 4 and int(vertex_path[0]) == int(vertex_path[-1])
+    )
 
     logger.info("Path has %d edges, %d unique vertices",
                 len(path_edges), len(path_vertex_set))
@@ -276,38 +286,116 @@ def partition_faces_by_path(
                     face_adj[fi].append(fj)
                     face_adj[fj].append(fi)
 
-    # 3. Assign sides using a normal-based test for boundary faces.
-    #    For each face touching the path, determine its side by checking
-    #    which side of the path direction its centroid falls on.
+    # 3. Assign initial sides for boundary faces.
+    #    Closed loops get edge-local opposite-side seeds (more stable for
+    #    curved/non-linear loops). Open paths keep the global tangent fallback.
     face_side = numpy.full(n_faces, -1, dtype=numpy.int32)  # -1 = unassigned
+    vertices = numpy.asarray(mesh.vertices, dtype=numpy.float64)
+    centroids = mesh.triangles_center
+    face_normals = numpy.asarray(mesh.face_normals, dtype=numpy.float64)
 
-    # Compute path direction as a polyline
-    path_verts = numpy.asarray(mesh.vertices, dtype=numpy.float64)[vertex_path]
-    # Average tangent direction
-    if len(path_verts) >= 2:
+    if is_closed_loop:
+        # For each path edge, the two incident faces should belong to opposite
+        # sides. Use a local edge frame to seed those labels.
+        seed_votes = defaultdict(list)
+        for edge in path_edges:
+            incident = edge_to_faces.get(edge, [])
+            if len(incident) < 2:
+                continue
+
+            fi = int(incident[0])
+            fj = int(incident[1])
+            u, v = tuple(edge)
+            u = int(u)
+            v = int(v)
+            if (v, u) in oriented_edge_lookup and (u, v) not in oriented_edge_lookup:
+                u, v = v, u
+
+            p0 = vertices[u]
+            p1 = vertices[v]
+            tangent = p1 - p0
+            tangent_len = numpy.linalg.norm(tangent)
+            if tangent_len <= 1e-10:
+                continue
+            tangent /= tangent_len
+
+            n_ref = face_normals[fi] + face_normals[fj]
+            n_ref_len = numpy.linalg.norm(n_ref)
+            if n_ref_len <= 1e-10:
+                n_ref = numpy.array([0.0, 0.0, 1.0], dtype=numpy.float64)
+                n_ref_len = 1.0
+            n_ref /= n_ref_len
+
+            side_dir = numpy.cross(tangent, n_ref)
+            side_len = numpy.linalg.norm(side_dir)
+            if side_len <= 1e-10:
+                side_dir = numpy.cross(tangent, numpy.array([0.0, 0.0, 1.0], dtype=numpy.float64))
+                side_len = numpy.linalg.norm(side_dir)
+                if side_len <= 1e-10:
+                    continue
+            side_dir /= side_len
+
+            edge_mid = 0.5 * (p0 + p1)
+            si = float(numpy.dot(centroids[fi] - edge_mid, side_dir))
+            sj = float(numpy.dot(centroids[fj] - edge_mid, side_dir))
+            if si >= sj:
+                seed_votes[fi].append(0)
+                seed_votes[fj].append(1)
+            else:
+                seed_votes[fi].append(1)
+                seed_votes[fj].append(0)
+
+        for fi, votes in seed_votes.items():
+            count_0 = votes.count(0)
+            count_1 = votes.count(1)
+            face_side[int(fi)] = 0 if count_0 >= count_1 else 1
+
+    needs_global_seed = (
+        (not is_closed_loop) or
+        (not numpy.any(face_side == 0)) or
+        (not numpy.any(face_side == 1))
+    )
+
+    if needs_global_seed:
+        # Compute path direction as a polyline fallback.
+        path_verts = vertices[numpy.asarray(vertex_path, dtype=numpy.int64)]
+        if len(path_verts) >= 2:
+            path_tangent = path_verts[-1] - path_verts[0]
+            tangent_len = numpy.linalg.norm(path_tangent)
+            if tangent_len > 1e-10:
+                path_tangent /= tangent_len
+            else:
+                path_tangent = numpy.array([1.0, 0.0, 0.0])
+        else:
+            path_tangent = numpy.array([1.0, 0.0, 0.0])
+
+        path_center = path_verts.mean(axis=0)
+        for fi in face_path_edges:
+            face_center = centroids[fi]
+            to_face = face_center - path_center
+            cross = numpy.cross(path_tangent, to_face)
+            side_val = numpy.dot(cross, face_normals[fi])
+            face_side[fi] = 0 if side_val >= 0 else 1
+    else:
+        # Closed-loop path had enough local seeds; assign remaining boundary
+        # faces with global fallback to complete the boundary front.
+        path_verts = vertices[numpy.asarray(vertex_path, dtype=numpy.int64)]
+        path_center = path_verts.mean(axis=0)
         path_tangent = path_verts[-1] - path_verts[0]
         tangent_len = numpy.linalg.norm(path_tangent)
         if tangent_len > 1e-10:
             path_tangent /= tangent_len
         else:
             path_tangent = numpy.array([1.0, 0.0, 0.0])
-    else:
-        path_tangent = numpy.array([1.0, 0.0, 0.0])
 
-    # Use a reference normal (average face normal of path-adjacent faces)
-    # to create a consistent left/right classification
-    path_center = path_verts.mean(axis=0)
-
-    # For boundary faces: use cross product of path tangent and face-to-centroid
-    # vector to determine side
-    centroids = mesh.triangles_center
-    for fi in face_path_edges:
-        face_center = centroids[fi]
-        to_face = face_center - path_center
-        cross = numpy.cross(path_tangent, to_face)
-        # Use the dominant component of cross to determine side
-        side_val = numpy.dot(cross, mesh.face_normals[fi])
-        face_side[fi] = 0 if side_val >= 0 else 1
+        for fi in face_path_edges:
+            if face_side[fi] >= 0:
+                continue
+            face_center = centroids[fi]
+            to_face = face_center - path_center
+            cross = numpy.cross(path_tangent, to_face)
+            side_val = numpy.dot(cross, face_normals[fi])
+            face_side[fi] = 0 if side_val >= 0 else 1
 
     # 4. Flood-fill from assigned boundary faces
     for fi in range(n_faces):
