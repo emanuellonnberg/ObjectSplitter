@@ -492,7 +492,7 @@ def split_by_shortest_seam(
     """
     return split_by_face_sets(mesh, face_set_a, face_set_b,
                               strategy_name="shortest_seam",
-                              attempt_hole_fill=False)
+                              attempt_hole_fill=True)
 
 
 def _manual_cap_mesh(
