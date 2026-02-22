@@ -398,3 +398,45 @@ def create_pin_mesh_data(
     ], dtype=numpy.float32)
     indices = numpy.array(faces, dtype=numpy.int32)
     return vertices, indices
+
+
+def create_dot_mesh_data(
+    center: numpy.ndarray,
+    size: float = 0.8,
+) -> Tuple[numpy.ndarray, numpy.ndarray]:
+    """
+    Generate a simple octahedral dot marker centered on a point.
+
+    Args:
+        center: 3D point for dot center.
+        size: Dot radius-like scale.
+
+    Returns:
+        (vertices, indices) as numpy arrays.
+    """
+    c = numpy.asarray(center, dtype=numpy.float64)
+    s = float(size)
+
+    # Octahedron vertices (axis-aligned)
+    verts = numpy.array([
+        [0.0, s, 0.0],    # top
+        [0.0, -s, 0.0],   # bottom
+        [s, 0.0, 0.0],    # +x
+        [-s, 0.0, 0.0],   # -x
+        [0.0, 0.0, s],    # +z
+        [0.0, 0.0, -s],   # -z
+    ], dtype=numpy.float64)
+    verts = (verts + c).astype(numpy.float32)
+
+    faces = numpy.array([
+        [0, 2, 4],
+        [0, 4, 3],
+        [0, 3, 5],
+        [0, 5, 2],
+        [1, 4, 2],
+        [1, 3, 4],
+        [1, 5, 3],
+        [1, 2, 5],
+    ], dtype=numpy.int32)
+
+    return verts, faces

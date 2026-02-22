@@ -145,6 +145,25 @@ class TestFullValleyWorkflow:
             sphere_mesh, search.plane.origin, candidate_normals, face_id)
         assert result.success
 
+    def test_sphere_valley_cut_with_sdf_bias(self, sphere_mesh):
+        """Valley mode with SDF bias should still produce a valid split."""
+        center = sphere_mesh.centroid + numpy.array([2.0, 0.0, 0.0])
+        search = find_valley_cut_plane(
+            sphere_mesh,
+            center,
+            search_resolution=6,
+            use_sdf_bias=True,
+        )
+        from core.plane_calculator import snap_point_to_mesh_surface
+        snap_point, face_id = snap_point_to_mesh_surface(sphere_mesh, center)
+        if face_id is None:
+            face_id = 0
+        candidate_normals = ([n for _, n in search.top_candidates]
+                             if search.top_candidates else [search.plane.normal])
+        result = split_by_local_plane(
+            sphere_mesh, search.plane.origin, candidate_normals, face_id)
+        assert result.success
+
 
 class TestFullValleySeamWorkflow:
     """End-to-end seam-based valley tests."""
@@ -153,6 +172,25 @@ class TestFullValleySeamWorkflow:
         click = numpy.array([15.0, 0.0, 0.0])
         set_a, set_b, _, _ = find_valley_seam_partition(
             sphere_mesh, click, surface_normal=numpy.array([1.0, 0.0, 0.0])
+        )
+        result = split_by_face_sets(
+            sphere_mesh,
+            set_a,
+            set_b,
+            strategy_name="valley_seam",
+            attempt_hole_fill=False,
+        )
+        assert result.success
+        assert len(result.upper.faces) > 0
+        assert len(result.lower.faces) > 0
+
+    def test_sphere_valley_seam_with_sdf_bias(self, sphere_mesh):
+        click = numpy.array([15.0, 0.0, 0.0])
+        set_a, set_b, _, _ = find_valley_seam_partition(
+            sphere_mesh,
+            click,
+            surface_normal=numpy.array([1.0, 0.0, 0.0]),
+            use_sdf_bias=True,
         )
         result = split_by_face_sets(
             sphere_mesh,
@@ -242,6 +280,48 @@ class TestCaptureAndReplay:
             assert result['split_result'].success
             # Plane origin should be the overridden value
             assert result['plane'].origin[1] == pytest.approx(3.0)
+
+    def test_replay_valley_mode(self, sphere_mesh):
+        """Captured valley mode should replay through valley search + local partition."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            click = sphere_mesh.centroid + numpy.array([2.0, 0.0, 0.0])
+            path = capture_operation(
+                mesh=sphere_mesh,
+                cut_mode="valley",
+                click_position=click,
+                search_resolution=6,
+                valley_sdf_bias_enabled=True,
+                connector_enabled=False,
+                name="test_valley_replay",
+                capture_dir=tmpdir,
+            )
+            result = replay_operation(path)
+            assert result["split_result"].success
+            assert result["plane"] is not None
+            assert os.path.exists(os.path.join(path, "valley_trace_replay.json"))
+
+    def test_replay_valley_seam_with_anchor_points(self, sphere_mesh):
+        """Captured valley seam with point anchors should replay successfully."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            click = sphere_mesh.centroid + numpy.array([15.0, 0.0, 0.0])
+            anchors = [
+                click.tolist(),
+                (sphere_mesh.centroid + numpy.array([-15.0, 0.0, 0.0])).tolist(),
+            ]
+            path = capture_operation(
+                mesh=sphere_mesh,
+                cut_mode="valley_seam",
+                click_position=click,
+                search_resolution=6,
+                valley_sdf_bias_enabled=True,
+                anchor_points=anchors,
+                connector_enabled=False,
+                name="test_valley_seam_anchor_replay",
+                capture_dir=tmpdir,
+            )
+            result = replay_operation(path)
+            assert result["split_result"].success
+            assert os.path.exists(os.path.join(path, "valley_seam_trace_replay.json"))
 
 
 class TestVisualization:

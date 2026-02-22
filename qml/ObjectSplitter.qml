@@ -135,7 +135,14 @@ Item {
         Column {
             width: parent.width
             spacing: Math.round(UM.Theme.getSize("default_margin").height / 2)
-            visible: UM.ActiveTool && UM.ActiveTool.properties.getValue("CutMode") === "path"
+            visible: UM.ActiveTool && (
+                UM.ActiveTool.properties.getValue("CutMode") === "path" ||
+                (
+                    (UM.ActiveTool.properties.getValue("CutMode") === "valley" ||
+                     UM.ActiveTool.properties.getValue("CutMode") === "valley_seam") &&
+                    UM.ActiveTool.properties.getValue("MultiPointAnchorsEnabled")
+                )
+            )
 
             Label {
                 text: "Points placed: " + (UM.ActiveTool ? UM.ActiveTool.properties.getValue("PathPointCount") : 0)
@@ -144,9 +151,21 @@ Item {
                 renderType: Text.NativeRendering
             }
 
+            Label {
+                width: parent.width
+                text: (UM.ActiveTool && UM.ActiveTool.properties.getValue("CutMode") === "path")
+                      ? "Click to place path points, then Cut Along Path."
+                      : "Click to place anchor points, then Cut Using Points."
+                font: UM.Theme.getFont("default_italic")
+                color: UM.Theme.getColor("text_inactive")
+                wrapMode: Text.WordWrap
+                renderType: Text.NativeRendering
+            }
+
             CheckBox {
                 id: closeLoopCheckbox
                 text: "Close loop"
+                visible: UM.ActiveTool && UM.ActiveTool.properties.getValue("CutMode") === "path"
                 checked: UM.ActiveTool ? UM.ActiveTool.properties.getValue("PathCloseLoop") : false
                 onClicked: {
                     if (UM.ActiveTool) {
@@ -164,21 +183,74 @@ Item {
                     height: UM.Theme.getSize("setting_control").height
                     onClicked: {
                         if (UM.ActiveTool) {
-                            UM.ActiveTool.setProperty("CutMode", "path")  // triggers clear
+                            UM.ActiveTool.setProperty("ClearPathPoints", true)
                         }
                     }
                 }
 
                 Button {
-                    text: "Cut Along Path"
+                    text: (UM.ActiveTool && UM.ActiveTool.properties.getValue("CutMode") === "path") ? "Cut Along Path" : "Cut Using Points"
                     width: 100
                     height: UM.Theme.getSize("setting_control").height
-                    enabled: UM.ActiveTool && UM.ActiveTool.properties.getValue("PathPointCount") >= 2
+                    enabled: UM.ActiveTool && (
+                        (UM.ActiveTool.properties.getValue("CutMode") === "path" && UM.ActiveTool.properties.getValue("PathPointCount") >= 2) ||
+                        (UM.ActiveTool.properties.getValue("CutMode") !== "path" && UM.ActiveTool.properties.getValue("PathPointCount") >= 1)
+                    )
                     onClicked: {
                         if (UM.ActiveTool) {
-                            UM.ActiveTool.setProperty("TriggerPathCut", true)
+                            if (UM.ActiveTool.properties.getValue("CutMode") === "path") {
+                                UM.ActiveTool.setProperty("TriggerPathCut", true)
+                            } else {
+                                UM.ActiveTool.setProperty("TriggerAnchoredCut", true)
+                            }
                         }
                     }
+                }
+            }
+
+            Button {
+                text: "Suggest Path"
+                width: 120
+                height: UM.Theme.getSize("setting_control").height
+                enabled: UM.ActiveTool && UM.ActiveTool.properties.getValue("PathPointCount") >= 2
+                onClicked: {
+                    if (UM.ActiveTool) {
+                        UM.ActiveTool.setProperty("TriggerSuggestPath", true)
+                    }
+                }
+            }
+        }
+
+        // Multi-point anchor toggle for valley modes
+        Row {
+            spacing: Math.round(UM.Theme.getSize("default_margin").width / 2)
+            visible: UM.ActiveTool && (
+                UM.ActiveTool.properties.getValue("CutMode") === "valley" ||
+                UM.ActiveTool.properties.getValue("CutMode") === "valley_seam"
+            )
+
+            CheckBox {
+                id: multiPointAnchorsCheckBox
+                checked: UM.ActiveTool ? UM.ActiveTool.properties.getValue("MultiPointAnchorsEnabled") : false
+
+                onCheckedChanged: {
+                    if (UM.ActiveTool) {
+                        UM.ActiveTool.setProperty("MultiPointAnchorsEnabled", checked)
+                    }
+                }
+            }
+
+            Label {
+                height: multiPointAnchorsCheckBox.height
+                text: "Use point anchors"
+                font: UM.Theme.getFont("default")
+                color: UM.Theme.getColor("text")
+                verticalAlignment: Text.AlignVCenter
+                renderType: Text.NativeRendering
+
+                MouseArea {
+                    anchors.fill: parent
+                    onClicked: multiPointAnchorsCheckBox.checked = !multiPointAnchorsCheckBox.checked
                 }
             }
         }
@@ -280,6 +352,54 @@ Item {
                 text: "Higher = more accurate but slower"
                 font: UM.Theme.getFont("default_italic")
                 color: UM.Theme.getColor("text_inactive")
+                renderType: Text.NativeRendering
+            }
+        }
+
+        // Valley SDF Bias (experimental, valley modes only)
+        Column {
+            width: parent.width
+            spacing: Math.round(UM.Theme.getSize("default_margin").height / 2)
+            visible: UM.ActiveTool && (
+                UM.ActiveTool.properties.getValue("CutMode") === "valley" ||
+                UM.ActiveTool.properties.getValue("CutMode") === "valley_seam"
+            )
+
+            Row {
+                spacing: Math.round(UM.Theme.getSize("default_margin").width / 2)
+
+                CheckBox {
+                    id: valleySdfCheckBox
+                    checked: UM.ActiveTool ? UM.ActiveTool.properties.getValue("ValleySdfBiasEnabled") : false
+
+                    onCheckedChanged: {
+                        if (UM.ActiveTool) {
+                            UM.ActiveTool.setProperty("ValleySdfBiasEnabled", checked)
+                        }
+                    }
+                }
+
+                Label {
+                    height: valleySdfCheckBox.height
+                    text: "Use SDF thinness bias (experimental)"
+                    font: UM.Theme.getFont("default")
+                    color: UM.Theme.getColor("text")
+                    verticalAlignment: Text.AlignVCenter
+                    renderType: Text.NativeRendering
+
+                    MouseArea {
+                        anchors.fill: parent
+                        onClicked: valleySdfCheckBox.checked = !valleySdfCheckBox.checked
+                    }
+                }
+            }
+
+            Label {
+                width: parent.width
+                text: "Favors thin groove/throat regions in valley and valley seam modes."
+                font: UM.Theme.getFont("default_italic")
+                color: UM.Theme.getColor("text_inactive")
+                wrapMode: Text.WordWrap
                 renderType: Text.NativeRendering
             }
         }

@@ -631,6 +631,57 @@ def test_fork_valley_seam_rounded_throat_orthographic_signature():
     _assert_center_gap_axis_aligned(img_big, max_drift_ratio=0.05, rows_from_top=6)
 
 
+def test_fork_valley_seam_rounded_throat_with_sdf_bias():
+    """
+    Experimental SDF bias should preserve rounded-throat valley-seam behavior:
+    focused partition near click and stable top-center gap alignment.
+    """
+    mesh = _create_rounded_fork()
+    click_pt = np.array([0, 22, 0], dtype=float)
+    snap_pt, click_face_id = snap_point_to_mesh_surface(mesh, click_pt)
+    assert click_face_id is not None
+
+    click_surface_normal = np.array(mesh.face_normals[click_face_id], dtype=np.float64)
+    set_a, set_b, src, _ = find_valley_seam_partition(
+        mesh,
+        snap_pt,
+        source_face_hint=click_face_id,
+        surface_normal=click_surface_normal,
+        use_sdf_bias=True,
+    )
+    result = split_by_face_sets(
+        mesh,
+        set_a,
+        set_b,
+        strategy_name="valley_seam",
+        attempt_hole_fill=False,
+    )
+    assert result.success
+
+    small_set = set_a if len(set_a) <= len(set_b) else set_b
+    assert src in small_set, "SDF-biased seam should keep source face in smaller partition."
+
+    if len(result.upper.faces) <= len(result.lower.faces):
+        small_mesh, big_mesh = result.upper, result.lower
+    else:
+        small_mesh, big_mesh = result.lower, result.upper
+
+    ratio = len(small_mesh.faces) / len(mesh.faces)
+    assert 0.04 <= ratio <= 0.40, (
+        f"SDF-biased rounded fork seam should stay focused, got {ratio:.2%} "
+        f"({len(small_mesh.faces)}/{len(mesh.faces)} faces)."
+    )
+
+    img_small = generate_projection(small_mesh, view_axis=2, resolution=24, custom_bounds=mesh.bounds)
+    img_big = generate_projection(big_mesh, view_axis=2, resolution=24, custom_bounds=mesh.bounds)
+
+    assert img_small.sum() >= 16, f"SDF-biased seam piece too sparse.\n{print_image(img_small)}"
+    top_band = [img_big[:, -2], img_big[:, -3], img_big[:, -4]]
+    max_runs = max(_count_true_runs(row) for row in top_band)
+    assert max_runs >= 3, f"SDF-biased seam remainder lost top tooth structure.\n{print_image(img_big)}"
+    _assert_center_gap_axis_aligned(img_big, max_drift_ratio=0.05, rows_from_top=6)
+
+
 def test_fork_shortest_rounded_throat_orthographic_signature():
     """
     Shortest mode on the rounded fork should produce a focused non-planar split

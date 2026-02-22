@@ -10,6 +10,9 @@ No Cura dependencies - uses only trimesh and numpy.
 
 import numpy
 import logging
+import json
+import os
+import time
 from typing import Tuple, Optional
 from dataclasses import dataclass
 
@@ -21,6 +24,46 @@ except ImportError:
 from .geometry import plane_normal_from_spherical
 
 logger = logging.getLogger("objectsplitter.plane_calculator")
+
+
+def _to_jsonable(value):
+    """Convert numpy-heavy values to JSON-serializable Python types."""
+    if isinstance(value, numpy.ndarray):
+        return value.tolist()
+    if isinstance(value, (numpy.integer,)):
+        return int(value)
+    if isinstance(value, (numpy.floating,)):
+        return float(value)
+    if isinstance(value, dict):
+        return {str(k): _to_jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_jsonable(v) for v in value]
+    return value
+
+
+def _write_json_trace(path: Optional[str], payload: dict) -> None:
+    """Best-effort JSON trace write; never raises."""
+    if not path:
+        return
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(_to_jsonable(payload), f, indent=2, sort_keys=True)
+    except Exception as e:
+        logger.debug("Failed to write trace '%s': %s", path, e)
+
+
+def _as_anchor_array(anchor_points) -> numpy.ndarray:
+    """Normalize optional anchor points to a float64 (N, 3) array."""
+    if anchor_points is None:
+        return numpy.zeros((0, 3), dtype=numpy.float64)
+    arr = numpy.asarray(anchor_points, dtype=numpy.float64)
+    if arr.size == 0:
+        return numpy.zeros((0, 3), dtype=numpy.float64)
+    arr = arr.reshape(-1, 3)
+    return arr
 
 
 def _section_to_2d(section):
@@ -132,6 +175,104 @@ def snap_point_to_mesh_surface(
 
     # Fallback: use mesh centroid (point is likely wrong)
     return numpy.array(mesh.centroid, dtype=numpy.float64), None
+
+
+def _estimate_face_thinness_sdf(
+    mesh: "trimesh.Trimesh",
+    face_ids: numpy.ndarray,
+    max_faces: int = 3000,
+) -> numpy.ndarray:
+    """
+    Experimental Shape Diameter Function (SDF-like) proxy.
+
+    For each sampled face, cast rays from the face center in +/- face-normal
+    directions and estimate local thickness as the sum of first-hit distances.
+    Convert thickness to a normalized "thinness" score in [0, 1], where:
+      1.0 = thin region (valley/throat-like), 0.0 = thick region.
+
+    Returns:
+        thinness array of length len(mesh.faces), zeros for unsampled/invalid.
+    """
+    n_faces = len(mesh.faces)
+    thinness = numpy.zeros(n_faces, dtype=numpy.float64)
+    if face_ids is None or len(face_ids) == 0:
+        return thinness
+
+    face_ids = numpy.asarray(face_ids, dtype=numpy.int64)
+    face_ids = face_ids[(face_ids >= 0) & (face_ids < n_faces)]
+    if face_ids.size == 0:
+        return thinness
+
+    if face_ids.size > max_faces:
+        face_ids = face_ids[:max_faces]
+
+    centers = numpy.asarray(mesh.triangles_center, dtype=numpy.float64)[face_ids]
+    normals = numpy.asarray(mesh.face_normals, dtype=numpy.float64)[face_ids]
+    normal_norms = numpy.linalg.norm(normals, axis=1)
+    valid_normals = normal_norms > 1e-10
+    if not numpy.any(valid_normals):
+        return thinness
+    normals[valid_normals] = normals[valid_normals] / normal_norms[valid_normals, numpy.newaxis]
+
+    mesh_diag = float(numpy.linalg.norm(mesh.bounds[1] - mesh.bounds[0]))
+    eps = max(1e-5, mesh_diag * 1e-6)
+
+    origins_fwd = centers + normals * eps
+    origins_bwd = centers - normals * eps
+    dirs_fwd = normals.copy()
+    dirs_bwd = -normals
+
+    origins = numpy.vstack((origins_fwd, origins_bwd))
+    directions = numpy.vstack((dirs_fwd, dirs_bwd))
+    n_rays = origins.shape[0]
+    min_dist = numpy.full(n_rays, numpy.inf, dtype=numpy.float64)
+
+    try:
+        locations, index_ray, _ = mesh.ray.intersects_location(
+            origins,
+            directions,
+            multiple_hits=True,
+        )
+    except Exception as e:
+        logger.debug("SDF proxy ray query failed: %s", e)
+        return thinness
+
+    if index_ray is None or len(index_ray) == 0:
+        return thinness
+
+    index_ray = numpy.asarray(index_ray, dtype=numpy.int64)
+    ray_origins_hit = origins[index_ray]
+    hit_dist = numpy.linalg.norm(locations - ray_origins_hit, axis=1)
+
+    # Ignore near-zero self hits.
+    valid_hits = hit_dist > (eps * 2.0)
+    if not numpy.any(valid_hits):
+        return thinness
+    numpy.minimum.at(min_dist, index_ray[valid_hits], hit_dist[valid_hits])
+
+    n = len(face_ids)
+    d_fwd = min_dist[:n]
+    d_bwd = min_dist[n:]
+    valid = numpy.isfinite(d_fwd) & numpy.isfinite(d_bwd)
+    if not numpy.any(valid):
+        return thinness
+
+    thickness = d_fwd[valid] + d_bwd[valid]
+    if thickness.size < 8:
+        return thinness
+
+    p10 = float(numpy.percentile(thickness, 10.0))
+    p90 = float(numpy.percentile(thickness, 90.0))
+    if p90 <= p10 + 1e-12:
+        return thinness
+
+    # Smaller thickness => larger thinness score.
+    scaled = (thickness - p10) / (p90 - p10)
+    local_thinness = 1.0 - numpy.clip(scaled, 0.0, 1.0)
+
+    valid_face_ids = face_ids[valid]
+    thinness[valid_face_ids] = local_thinness
+    return thinness
 
 
 @dataclass
@@ -374,6 +515,9 @@ def find_valley_cut_plane(
     sweep_fraction: float = 0.15,
     n_sweep_steps: int = 11,
     n_top_candidates: int = 20,
+    use_sdf_bias: bool = False,
+    anchor_points=None,
+    debug_trace_path: Optional[str] = None,
 ) -> SmallestPlaneSearchResult:
     """
     Find a cut plane that follows a geographic valley or groove near the click.
@@ -403,11 +547,35 @@ def find_valley_cut_plane(
         sweep_fraction: How far to sweep as fraction of mesh diagonal (default 15%).
         n_sweep_steps: Number of positions to test during the sweep phase.
         n_top_candidates: How many coarse candidates to refine in phase 2.
+        use_sdf_bias: Experimental SDF-thinness bias (opt-in).
+        anchor_points: Optional 1..N anchor points that must remain near the
+            selected plane (strong intent anchoring for curved meshes).
 
     Returns:
         SmallestPlaneSearchResult with the best groove-following plane.
     """
     plane_origin = numpy.asarray(click_position, dtype=numpy.float64)
+    trace = {
+        "mode": "valley",
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "inputs": {
+            "click_position": plane_origin.copy(),
+            "search_resolution": int(search_resolution),
+            "collect_all_samples": bool(collect_all_samples),
+            "sweep_fraction": float(sweep_fraction),
+            "n_sweep_steps": int(n_sweep_steps),
+            "n_top_candidates": int(n_top_candidates),
+            "use_sdf_bias": bool(use_sdf_bias),
+            "surface_normal": surface_normal.copy() if surface_normal is not None else None,
+            "anchor_count": 0,
+        },
+        "coarse": {},
+        "sdf": {},
+        "result": {},
+        "errors": [],
+    }
+    anchors = _as_anchor_array(anchor_points)
+    trace["inputs"]["anchor_count"] = int(len(anchors))
 
     # Alignment bias (same as find_smallest_cut_plane)
     ALIGNMENT_BIAS = 0.5
@@ -429,16 +597,56 @@ def find_valley_cut_plane(
     # Minimum area threshold (same as smallest mode)
     avg_face_area = mesh.area / max(len(mesh.faces), 1)
     min_section_area = avg_face_area * 5.0
+    trace["coarse"]["avg_face_area"] = float(avg_face_area)
+    trace["coarse"]["min_section_area"] = float(min_section_area)
 
     # Sweep distance: fraction of mesh diagonal
     extent = mesh.bounds[1] - mesh.bounds[0]
     mesh_diagonal = float(numpy.linalg.norm(extent))
     sweep_distance = mesh_diagonal * sweep_fraction
+    trace["coarse"]["mesh_diagonal"] = float(mesh_diagonal)
+    trace["coarse"]["sweep_distance"] = float(sweep_distance)
 
     logger.debug("Valley cut search: sweep_distance=%.2f (%.0f%% of diagonal %.2f), "
                  "%d sweep steps, resolution=%d",
                  sweep_distance, sweep_fraction * 100, mesh_diagonal,
                  n_sweep_steps, search_resolution)
+
+    sdf_face_ids = numpy.array([], dtype=numpy.int64)
+    sdf_face_centers = None
+    sdf_face_thinness = None
+    trace["sdf"] = {
+        "enabled": bool(use_sdf_bias),
+        "sampled_faces": 0,
+        "nonzero_thin_faces": 0,
+    }
+    if use_sdf_bias and len(mesh.faces) > 0:
+        try:
+            face_centers = numpy.asarray(mesh.triangles_center, dtype=numpy.float64)
+            center_d = numpy.linalg.norm(face_centers - plane_origin, axis=1)
+            keep = int(min(len(face_centers), 3000))
+            sdf_face_ids = numpy.argsort(center_d)[:keep]
+            sdf_face_centers = face_centers[sdf_face_ids]
+            sdf_face_thinness = _estimate_face_thinness_sdf(
+                mesh,
+                sdf_face_ids,
+                max_faces=keep,
+            )
+            logger.debug(
+                "Valley cut SDF bias: sampled=%d valid=%d",
+                len(sdf_face_ids),
+                int(numpy.count_nonzero(sdf_face_thinness[sdf_face_ids] > 0.0)),
+            )
+            trace["sdf"]["sampled_faces"] = int(len(sdf_face_ids))
+            trace["sdf"]["nonzero_thin_faces"] = int(
+                numpy.count_nonzero(sdf_face_thinness[sdf_face_ids] > 0.0)
+            )
+        except Exception as e:
+            logger.debug("Valley cut SDF setup failed: %s", e)
+            trace["errors"].append(f"sdf_setup: {e}")
+            sdf_face_ids = numpy.array([], dtype=numpy.int64)
+            sdf_face_centers = None
+            sdf_face_thinness = None
 
     # ---- Phase 1: Coarse search (same as smallest mode) ----
     all_samples = [] if collect_all_samples else None
@@ -468,6 +676,16 @@ def find_valley_cut_plane(
 
                     if area > 0:
                         score = _compute_score(area, normal)
+                        if len(anchors) > 0:
+                            coarse_dist = numpy.abs(numpy.dot(anchors - plane_origin, normal))
+                            mean_dist = float(numpy.mean(coarse_dist))
+                            max_dist = float(numpy.max(coarse_dist))
+                            anchor_factor = (
+                                1.0 +
+                                anchor_weight_mean * (mean_dist / max(mesh_diagonal, 1e-6)) +
+                                anchor_weight_max * (max_dist / max(mesh_diagonal, 1e-6))
+                            )
+                            score *= anchor_factor
                         coarse_all.append((score, area, normal.copy()))
                         if area >= min_section_area:
                             coarse_candidates.append((score, area,
@@ -477,6 +695,8 @@ def find_valley_cut_plane(
                     all_samples.append((normal.copy(), float('nan')))
                 logger.debug("Valley phase 1: section failed for normal=%s: %s",
                              normal, e)
+                if len(trace["errors"]) < 50:
+                    trace["errors"].append(f"phase1_section: {e}")
                 continue
 
     # Sort by score and take top N for refinement.
@@ -491,10 +711,43 @@ def find_valley_cut_plane(
         top_coarse = coarse_all[:n_top_candidates]
         logger.debug("Valley phase 1: min_section_area filter removed all "
                      "candidates, using %d unfiltered", len(top_coarse))
+        trace["coarse"]["used_unfiltered_fallback"] = True
+    else:
+        trace["coarse"]["used_unfiltered_fallback"] = False
 
     logger.debug("Valley phase 1: %d valid candidates from %d samples, "
                  "refining top %d",
                  len(coarse_candidates), samples_tested, len(top_coarse))
+    trace["coarse"]["samples_tested"] = int(samples_tested)
+    trace["coarse"]["valid_candidates"] = int(len(coarse_candidates))
+    trace["coarse"]["refined_candidates"] = int(len(top_coarse))
+    trace["coarse"]["top_coarse_preview"] = [
+        {
+            "score": float(score),
+            "area": float(area),
+            "normal": normal.copy(),
+        }
+        for score, area, normal in top_coarse[: min(20, len(top_coarse))]
+    ]
+    anchor_weight_mean = 5.0
+    anchor_weight_max = 2.0
+    if len(anchors) > 0:
+        trace["coarse"]["anchor_weight_mean"] = float(anchor_weight_mean)
+        trace["coarse"]["anchor_weight_max"] = float(anchor_weight_max)
+
+    # Anti-graze floor for sweep phase:
+    # avoid selecting tiny near-tangent slivers that are much smaller than
+    # the local coarse sections near the click.
+    if top_coarse:
+        coarse_area_median = float(numpy.median([area for _, area, _ in top_coarse]))
+    else:
+        coarse_area_median = float(min_section_area)
+    sweep_min_area = max(min_section_area, 0.25 * coarse_area_median)
+    if len(mesh.faces) >= 20000:
+        # Large dense meshes are especially prone to grazing minima.
+        sweep_min_area = max(sweep_min_area, min_section_area * 2.0)
+    trace["coarse"]["coarse_area_median"] = float(coarse_area_median)
+    trace["coarse"]["sweep_min_area"] = float(sweep_min_area)
 
     # ---- Phase 2: Sweep each top candidate to find the groove ----
     best_normal = numpy.array([0.0, 1.0, 0.0])
@@ -502,6 +755,8 @@ def find_valley_cut_plane(
     best_score = float('inf')
     best_area = float('inf')
     valid_candidates = []
+    refined_preview = []
+    graze_fallback_candidates = 0
 
     for _, coarse_area, normal in top_coarse:
         # Sweep positions along this normal, centered at the click point
@@ -509,6 +764,8 @@ def find_valley_cut_plane(
 
         sweep_best_area = float('inf')
         sweep_best_offset = 0.0
+        sweep_best_any_area = float('inf')
+        sweep_best_any_offset = 0.0
 
         for offset in offsets:
             sweep_origin = plane_origin + offset * normal
@@ -519,23 +776,87 @@ def find_valley_cut_plane(
                     path_2d, to_3D = _section_to_2d(section)
                     area = _local_section_area(path_2d, to_3D, sweep_origin)
 
-                    if area > 0 and area < sweep_best_area:
-                        sweep_best_area = area
-                        sweep_best_offset = offset
+                    if area > 0:
+                        if area < sweep_best_any_area:
+                            sweep_best_any_area = area
+                            sweep_best_any_offset = offset
+                        if area >= sweep_min_area and area < sweep_best_area:
+                            sweep_best_area = area
+                            sweep_best_offset = offset
             except Exception:
                 continue
 
+        used_graze_fallback = False
         if not numpy.isfinite(sweep_best_area):
-            continue
+            # If no non-grazing section exists for this normal, keep a fallback
+            # candidate but penalize it heavily so true groove sections win.
+            if not numpy.isfinite(sweep_best_any_area):
+                continue
+            sweep_best_area = sweep_best_any_area
+            sweep_best_offset = sweep_best_any_offset
+            used_graze_fallback = True
+            graze_fallback_candidates += 1
 
-        # Score the swept result: area * alignment bias * proximity bias
-        # Prefer planes closer to the click point (mild penalty for offset)
-        proximity_penalty = 1.0 + 0.3 * (abs(sweep_best_offset) / max(sweep_distance, 1e-6))
+        # Score the swept result: area * alignment bias * proximity bias.
+        # Strongly discourage sweep-edge picks that can detach from clicked intent.
+        offset_ratio = abs(sweep_best_offset) / max(sweep_distance, 1e-6)
+        proximity_penalty = 1.0 + 0.25 * offset_ratio + 1.5 * (offset_ratio ** 2)
+        if offset_ratio > 0.85:
+            proximity_penalty *= 1.4
         score = _compute_score(sweep_best_area, normal) * proximity_penalty
-
+        if used_graze_fallback:
+            score *= 2.5
         swept_origin = plane_origin + sweep_best_offset * normal
+        if len(anchors) > 0:
+            anchor_dist = numpy.abs(numpy.dot(anchors - swept_origin, normal))
+            mean_dist = float(numpy.mean(anchor_dist))
+            max_dist = float(numpy.max(anchor_dist))
+            anchor_factor = (
+                1.0 +
+                anchor_weight_mean * (mean_dist / max(mesh_diagonal, 1e-6)) +
+                anchor_weight_max * (max_dist / max(mesh_diagonal, 1e-6))
+            )
+            score *= anchor_factor
+        else:
+            mean_dist = 0.0
+            max_dist = 0.0
+            anchor_factor = 1.0
+
+        if (
+            use_sdf_bias and
+            sdf_face_thinness is not None and
+            sdf_face_centers is not None and
+            len(sdf_face_ids) > 0
+        ):
+            try:
+                local_idx = int(
+                    numpy.argmin(
+                        numpy.linalg.norm(sdf_face_centers - swept_origin, axis=1)
+                    )
+                )
+                thinness = float(sdf_face_thinness[sdf_face_ids[local_idx]])
+                # Thin regions should win against similarly-sized sections.
+                sdf_factor = max(0.65, 1.0 - 0.35 * thinness)
+                score *= sdf_factor
+            except Exception:
+                pass
+
         valid_candidates.append((score, sweep_best_area, normal.copy(),
                                  swept_origin.copy()))
+        if len(refined_preview) < 40:
+            refined_preview.append({
+                "score": float(score),
+                "area": float(sweep_best_area),
+                "offset": float(sweep_best_offset),
+                "offset_ratio": float(offset_ratio),
+                "proximity_penalty": float(proximity_penalty),
+                "anchor_mean_dist": float(mean_dist),
+                "anchor_max_dist": float(max_dist),
+                "anchor_factor": float(anchor_factor),
+                "used_graze_fallback": bool(used_graze_fallback),
+                "normal": normal.copy(),
+                "origin": swept_origin.copy(),
+            })
 
         if score < best_score:
             best_score = score
@@ -584,6 +905,24 @@ def find_valley_cut_plane(
                  best_area, best_score, best_normal,
                  float(numpy.linalg.norm(best_origin - plane_origin)),
                  samples_tested, len(valid_candidates))
+    trace["result"] = {
+        "best_area": float(best_area),
+        "best_score": float(best_score),
+        "best_normal": best_normal.copy(),
+        "best_origin": best_origin.copy(),
+        "origin_offset": float(numpy.linalg.norm(best_origin - plane_origin)),
+        "refined_candidates": int(len(valid_candidates)),
+        "graze_fallback_candidates": int(graze_fallback_candidates),
+        "top_candidates_preview": [
+            {
+                "area": float(area),
+                "normal": normal.copy(),
+            }
+            for area, normal in top_candidates[: min(20, len(top_candidates))]
+        ],
+        "refined_preview": refined_preview,
+    }
+    _write_json_trace(debug_trace_path, trace)
 
     return SmallestPlaneSearchResult(
         plane=CutPlane(origin=best_origin, normal=best_normal),
@@ -598,7 +937,11 @@ def find_valley_seam_partition(
     mesh: "trimesh.Trimesh",
     click_position: numpy.ndarray,
     source_face_hint: Optional[int] = None,
+    target_face_hint: Optional[int] = None,
     surface_normal: Optional[numpy.ndarray] = None,
+    use_sdf_bias: bool = False,
+    anchor_points=None,
+    debug_trace_path: Optional[str] = None,
 ) -> Tuple[list, list, int, int]:
     """
     Compute a seam-based valley partition that prefers concave surface paths.
@@ -610,10 +953,15 @@ def find_valley_seam_partition(
 
     The computation runs in a worker thread with a hard timeout, matching the
     behavior of radial/shortest seam search.
+
+    Optional multi-point controls:
+      - target_face_hint: explicit sink face hint (e.g., from a second click).
+      - anchor_points: 1..N points to bias seam locality toward the clicked
+        feature corridor.
     """
     import threading
 
-    HARD_TIMEOUT_SEC = 10.0
+    HARD_TIMEOUT_SEC = 15.0
     result_holder = [None]
     error_holder = [None]
     cancel_event = threading.Event()
@@ -624,7 +972,11 @@ def find_valley_seam_partition(
                 mesh,
                 click_position,
                 source_face_hint,
+                target_face_hint,
                 surface_normal,
+                use_sdf_bias,
+                anchor_points,
+                debug_trace_path,
                 cancel_event,
             )
         except Exception as e:
@@ -646,9 +998,21 @@ def find_valley_seam_partition(
             "(thread still running, cancel sent)."
         )
         logger.warning(msg)
+        _write_json_trace(debug_trace_path, {
+            "mode": "valley_seam",
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "status": "timeout",
+            "error": msg,
+        })
         raise TimeoutError(msg)
 
     if error_holder[0] is not None:
+        _write_json_trace(debug_trace_path, {
+            "mode": "valley_seam",
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "status": "error",
+            "error": str(error_holder[0]),
+        })
         raise error_holder[0]
 
     if result_holder[0] is None:
@@ -662,10 +1026,27 @@ def _find_valley_seam_partition_impl(
     mesh: "trimesh.Trimesh",
     click_position: numpy.ndarray,
     source_face_hint: Optional[int] = None,
+    target_face_hint: Optional[int] = None,
     surface_normal: Optional[numpy.ndarray] = None,
+    use_sdf_bias: bool = False,
+    anchor_points=None,
+    debug_trace_path: Optional[str] = None,
     cancel_event=None,
 ) -> Tuple[list, list, int, int]:
     import heapq
+    _log_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "..",
+        "valley_seam_debug.log",
+    )
+
+    def _log(msg: str) -> None:
+        try:
+            logger.info(msg)
+            with open(_log_path, "a", encoding="utf-8") as f:
+                f.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
+        except Exception:
+            pass
 
     def _check_cancel():
         if cancel_event is not None and cancel_event.is_set():
@@ -673,6 +1054,29 @@ def _find_valley_seam_partition_impl(
 
     point = numpy.asarray(click_position, dtype=numpy.float64).reshape(1, -1)
     face_index = source_face_hint
+    trace = {
+        "mode": "valley_seam",
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "inputs": {
+            "click_position": point.reshape(3).copy(),
+            "source_face_hint": source_face_hint,
+            "target_face_hint": target_face_hint,
+            "surface_normal": surface_normal.copy() if surface_normal is not None else None,
+            "use_sdf_bias": bool(use_sdf_bias),
+            "anchor_count": 0,
+        },
+        "mesh": {},
+        "sdf": {"enabled": bool(use_sdf_bias)},
+        "source_sink": {},
+        "threshold_sweep": {},
+        "result": {},
+    }
+    anchors = _as_anchor_array(anchor_points)
+    trace["inputs"]["anchor_count"] = int(len(anchors))
+    _log(
+        "valley_seam start: faces=%d source_hint=%s sdf=%s" %
+        (len(mesh.faces), str(source_face_hint), str(use_sdf_bias))
+    )
 
     if face_index is None:
         try:
@@ -693,6 +1097,8 @@ def _find_valley_seam_partition_impl(
             face_index = int(faces_with_vertex[0]) if faces_with_vertex.size > 0 else 0
         else:
             face_index = 0
+    trace["source_sink"]["source_face"] = int(face_index)
+    _log(f"valley_seam source face: {face_index}")
 
     faces_count = len(mesh.faces)
     if faces_count < 4:
@@ -703,6 +1109,8 @@ def _find_valley_seam_partition_impl(
     num_adj = len(adj_pairs)
     if num_adj == 0:
         raise RuntimeError("valley_seam: mesh has no face adjacency")
+    trace["mesh"]["faces_count"] = int(faces_count)
+    trace["mesh"]["adjacency_count"] = int(num_adj)
 
     f1_arr = adj_pairs[:, 0].astype(numpy.int32)
     f2_arr = adj_pairs[:, 1].astype(numpy.int32)
@@ -727,18 +1135,64 @@ def _find_valley_seam_partition_impl(
             concave_edge_ratio = float(numpy.count_nonzero(~convex_mask)) / float(num_adj)
     except Exception as e:
         logger.debug("valley_seam: concavity extraction failed: %s", e)
+    trace["mesh"]["concave_edge_ratio"] = float(concave_edge_ratio)
 
     click = point.reshape(3)
     edge_midpoints = 0.5 * (c1 + c2)
     mesh_diag = float(numpy.linalg.norm(mesh.bounds[1] - mesh.bounds[0]))
     mesh_diag = max(mesh_diag, 1e-6)
     locality_norm = numpy.linalg.norm(edge_midpoints - click, axis=1) / mesh_diag
+    if len(anchors) > 0:
+        anchor_mid_d = numpy.min(
+            numpy.linalg.norm(
+                edge_midpoints[:, numpy.newaxis, :] - anchors[numpy.newaxis, :, :],
+                axis=2,
+            ),
+            axis=1,
+        ) / mesh_diag
+        locality_norm = numpy.minimum(locality_norm, anchor_mid_d)
+    edge_thinness = numpy.zeros(num_adj, dtype=numpy.float64)
+    trace["mesh"]["mesh_diagonal"] = float(mesh_diag)
+
+    if use_sdf_bias:
+        try:
+            face_click_d = numpy.linalg.norm(face_centroids - click, axis=1)
+            local_radius = mesh_diag * 0.45
+            local_face_ids = numpy.where(face_click_d <= local_radius)[0]
+            if local_face_ids.size == 0:
+                keep = int(min(faces_count, 1500))
+                local_face_ids = numpy.argsort(face_click_d)[:keep]
+            elif local_face_ids.size > 3000:
+                order = numpy.argsort(face_click_d[local_face_ids])
+                local_face_ids = local_face_ids[order[:3000]]
+
+            face_thinness = _estimate_face_thinness_sdf(
+                mesh,
+                local_face_ids,
+                max_faces=3000,
+            )
+            edge_thinness = 0.5 * (face_thinness[f1_arr] + face_thinness[f2_arr])
+            logger.debug(
+                "valley_seam SDF bias: local_faces=%d, nonzero_faces=%d",
+                len(local_face_ids),
+                int(numpy.count_nonzero(face_thinness > 0.0)),
+            )
+            trace["sdf"]["local_radius"] = float(local_radius)
+            trace["sdf"]["local_faces"] = int(len(local_face_ids))
+            trace["sdf"]["nonzero_faces"] = int(numpy.count_nonzero(face_thinness > 0.0))
+        except Exception as e:
+            logger.debug("valley_seam: SDF bias setup failed: %s", e)
+            edge_thinness = numpy.zeros(num_adj, dtype=numpy.float64)
+            trace["sdf"]["error"] = str(e)
 
     # Favor concave edges and keep seams local to the click neighborhood.
     # Lower weights are preferred by Dijkstra.
     geo_weights_per_adj = base_edge_lengths.copy()
     geo_weights_per_adj *= (1.0 + 0.55 * convex_strength)
     geo_weights_per_adj /= (1.0 + 2.6 * concave_strength)
+    if use_sdf_bias:
+        # Thin regions should be easier to traverse when tracing groove seams.
+        geo_weights_per_adj /= (1.0 + 1.2 * edge_thinness)
     geo_weights_per_adj *= (1.0 + 0.75 * locality_norm)
     geo_weights_per_adj = numpy.maximum(geo_weights_per_adj, base_edge_lengths * 0.05)
 
@@ -800,7 +1254,29 @@ def _find_valley_seam_partition_impl(
         max_dist = 1.0
 
     sink_face = None
-    if surface_normal is not None and len(mesh.triangles_center) > 0:
+    if target_face_hint is not None:
+        tfi = int(target_face_hint)
+        if 0 <= tfi < faces_count and tfi != face_index:
+            sink_face = tfi
+            trace["source_sink"]["sink_seed"] = "target_face_hint"
+    if sink_face is None and len(anchors) >= 2:
+        target_point = anchors[-1]
+        try:
+            from trimesh.proximity import ProximityQuery
+            pq = ProximityQuery(mesh)
+            _, _, target_face_ids = pq.on_surface(target_point.reshape(1, -1))
+            if target_face_ids is not None and len(target_face_ids) > 0:
+                tfi = int(target_face_ids[0])
+            else:
+                tfi = -1
+        except Exception:
+            d = numpy.linalg.norm(mesh.triangles_center - target_point, axis=1)
+            tfi = int(numpy.argmin(d)) if len(d) > 0 else -1
+        if 0 <= tfi < faces_count and tfi != face_index:
+            sink_face = tfi
+            trace["source_sink"]["sink_seed"] = "anchor_last_point"
+
+    if sink_face is None and surface_normal is not None and len(mesh.triangles_center) > 0:
         normal = numpy.asarray(surface_normal, dtype=numpy.float64)
         normal_norm = numpy.linalg.norm(normal)
         if normal_norm > 1e-8:
@@ -809,6 +1285,7 @@ def _find_valley_seam_partition_impl(
 
             vecs = mesh.triangles_center - click
             norms = numpy.linalg.norm(vecs, axis=1)
+            euclid_ratio = norms / max(mesh_diag, 1e-6)
             valid = norms > 1e-6
             if numpy.any(valid):
                 vecs[valid] = vecs[valid] / norms[valid, numpy.newaxis]
@@ -816,6 +1293,9 @@ def _find_valley_seam_partition_impl(
                 align_score[valid] = numpy.dot(vecs[valid], -normal)
 
                 candidate_mask = finite_mask & (norm_dist >= 0.15)
+                max_sink_euclid_ratio = 0.24 if faces_count >= 20000 else 0.40
+                candidate_mask &= (euclid_ratio <= max_sink_euclid_ratio)
+                trace["source_sink"]["max_sink_euclid_ratio"] = float(max_sink_euclid_ratio)
                 combined = numpy.full_like(norm_dist, -numpy.inf)
                 if numpy.any(candidate_mask):
                     combined[candidate_mask] = (
@@ -823,7 +1303,15 @@ def _find_valley_seam_partition_impl(
                         (0.40 * align_score[candidate_mask])
                     )
                 else:
-                    combined[finite_mask] = norm_dist[finite_mask]
+                    # If no local candidate survives the Euclidean cap, relax it.
+                    relaxed_mask = finite_mask & (norm_dist >= 0.15)
+                    if numpy.any(relaxed_mask):
+                        combined[relaxed_mask] = (
+                            (0.60 * norm_dist[relaxed_mask]) +
+                            (0.40 * align_score[relaxed_mask])
+                        )
+                    else:
+                        combined[finite_mask] = norm_dist[finite_mask]
                 sink_face = int(numpy.argmax(combined))
 
     if sink_face is None:
@@ -834,6 +1322,8 @@ def _find_valley_seam_partition_impl(
         finite_dist = numpy.where(finite_mask, dist_src, -1.0)
         finite_dist[face_index] = -1.0
         sink_face = int(numpy.argmax(finite_dist))
+    trace["source_sink"]["sink_face"] = int(sink_face)
+    _log(f"valley_seam sink face: {sink_face}")
 
     dist_sink = _run_dijkstra(sink_face)
 
@@ -857,6 +1347,26 @@ def _find_valley_seam_partition_impl(
         mesh.vertices[adj_edges[:, 0]] - mesh.vertices[adj_edges[:, 1]],
         axis=1,
     )
+    threshold_samples = []
+
+    if faces_count >= 20000:
+        min_ratio_base = 0.05
+    elif faces_count >= 8000:
+        min_ratio_base = 0.035
+    else:
+        min_ratio_base = 0.02
+    max_ratio_base = 0.40
+    target_ratio = 0.12 if faces_count >= 20000 else 0.10
+
+    def _ratio_penalty(ratio: float) -> float:
+        # Harder penalty below the minimum useful partition size.
+        if ratio < min_ratio_base:
+            return 1.0 + 4.0 * ((min_ratio_base - ratio) / max(min_ratio_base, 1e-6)) ** 2
+        # Mild penalty above broad upper bound to avoid half-object splits.
+        if ratio > max_ratio_base:
+            return 1.0 + 1.5 * ((ratio - max_ratio_base) / max(1.0 - max_ratio_base, 1e-6)) ** 2
+        # Soft pull toward a feature-sized target partition.
+        return 1.0 + 0.6 * (abs(ratio - target_ratio) / max(target_ratio, 1e-6))
 
     def _select_threshold(min_ratio: float, max_ratio: Optional[float] = None):
         min_faces_threshold = max(10, int(faces_count * min_ratio))
@@ -881,10 +1391,26 @@ def _find_valley_seam_partition_impl(
             perimeter = float(numpy.sum(boundary_edge_lengths[cross_mask]))
             mean_concavity = float(numpy.mean(concave_strength[cross_mask]))
             mean_locality = float(numpy.mean(locality_norm[cross_mask]))
+            mean_thinness = float(numpy.mean(edge_thinness[cross_mask])) if use_sdf_bias else 0.0
 
             concavity_factor = max(0.2, 1.0 - 0.65 * mean_concavity)
             locality_factor = 1.0 + 0.35 * mean_locality
-            cost = perimeter * concavity_factor * locality_factor
+            sdf_factor = max(0.65, 1.0 - 0.35 * mean_thinness) if use_sdf_bias else 1.0
+            ratio_factor = _ratio_penalty(ratio)
+            cost = perimeter * concavity_factor * locality_factor * sdf_factor * ratio_factor
+            if len(threshold_samples) < 120:
+                threshold_samples.append({
+                    "threshold": float(t),
+                    "len_a": int(len_a),
+                    "len_b": int(len_b),
+                    "small_ratio": float(ratio),
+                    "perimeter": float(perimeter),
+                    "mean_concavity": float(mean_concavity),
+                    "mean_locality": float(mean_locality),
+                    "mean_thinness": float(mean_thinness),
+                    "ratio_factor": float(ratio_factor),
+                    "cost": float(cost),
+                })
 
             if cost < best_cost_local:
                 best_cost_local = cost
@@ -893,12 +1419,16 @@ def _find_valley_seam_partition_impl(
 
         return best_thresh_local, best_cost_local, best_small_local
 
-    best_thresh, best_cost, best_small = _select_threshold(min_ratio=0.02)
+    best_thresh, best_cost, best_small = _select_threshold(
+        min_ratio=min_ratio_base,
+        max_ratio=max_ratio_base,
+    )
 
     # Smooth, high-face meshes often have near-zero explicit concave edges.
     # In that regime, tiny local partitions can dominate on perimeter alone.
     # If that happens, re-run with a slightly larger minimum partition and
     # exclude near-half splits to keep the cut focused.
+    smooth_guard_used = False
     if best_thresh is not None:
         best_ratio = float(best_small) / float(faces_count)
         use_smooth_guard = (
@@ -922,10 +1452,12 @@ def _find_valley_seam_partition_impl(
                 best_thresh = alt_thresh
                 best_cost = alt_cost
                 best_small = alt_small
+                smooth_guard_used = True
 
     if best_thresh is None:
         best_thresh = 0.25
         logger.debug("valley_seam: no valid threshold found, fallback to score=0.25")
+        _log("valley_seam threshold fallback -> 0.25")
 
     mask_a = score < best_thresh
     mask_a[face_index] = True
@@ -936,8 +1468,35 @@ def _find_valley_seam_partition_impl(
         set_a, set_b = set_b, set_a
 
     # Keep refinement for smaller meshes where it meaningfully improves the seam.
+    refined = False
     if faces_count <= 4000:
         set_a, set_b = refine_partition_with_mincut(mesh, set_a, set_b, score, best_thresh)
+        refined = True
+    final_ratio = float(len(set_a)) / float(faces_count) if faces_count > 0 else 0.0
+
+    trace["threshold_sweep"] = {
+        "chosen_threshold": float(best_thresh),
+        "best_cost": float(best_cost) if numpy.isfinite(best_cost) else None,
+        "best_small_faces": int(best_small),
+        "min_ratio_base": float(min_ratio_base),
+        "max_ratio_base": float(max_ratio_base),
+        "target_ratio": float(target_ratio),
+        "smooth_guard_used": bool(smooth_guard_used),
+        "samples": threshold_samples,
+    }
+    trace["result"] = {
+        "set_a_size": int(len(set_a)),
+        "set_b_size": int(len(set_b)),
+        "set_a_ratio": float(final_ratio),
+        "source_face": int(face_index),
+        "sink_face": int(sink_face),
+        "refined_with_mincut": bool(refined),
+    }
+    _write_json_trace(debug_trace_path, trace)
+    _log(
+        "valley_seam done: threshold=%.4f ratio=%.3f A=%d B=%d src=%d sink=%d" %
+        (float(best_thresh), float(final_ratio), len(set_a), len(set_b), int(face_index), int(sink_face))
+    )
 
     return set_a, set_b, face_index, sink_face
 

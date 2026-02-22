@@ -80,7 +80,7 @@ from .core.geometry import (
     transform_point_to_local,
     create_plane_mesh_data,
     create_marker_mesh_data,
-    create_pin_mesh_data,
+    create_dot_mesh_data,
 )
 from .core.plane_calculator import (
     horizontal_cut_plane,
@@ -144,7 +144,25 @@ class ObjectSplitter(Tool):
 
         prefs = Application.getInstance().getPreferences()
         prefs.addPreference("objectsplitter/openscad_path", "")
+        prefs.addPreference("objectsplitter/valley_sdf_bias_enabled", False)
+        prefs.addPreference("objectsplitter/multi_point_anchors_enabled", False)
+        prefs.addPreference("objectsplitter/path_close_loop", True)
         self._openscad_path = prefs.getValue("objectsplitter/openscad_path")
+        valley_sdf_pref = prefs.getValue("objectsplitter/valley_sdf_bias_enabled")
+        self._valley_sdf_bias_enabled = (
+            valley_sdf_pref if isinstance(valley_sdf_pref, bool)
+            else str(valley_sdf_pref).strip().lower() in ("1", "true", "yes", "on")
+        )
+        anchor_pref = prefs.getValue("objectsplitter/multi_point_anchors_enabled")
+        self._multi_point_anchors_enabled = (
+            anchor_pref if isinstance(anchor_pref, bool)
+            else str(anchor_pref).strip().lower() in ("1", "true", "yes", "on")
+        )
+        close_loop_pref = prefs.getValue("objectsplitter/path_close_loop")
+        self._path_close_loop = (
+            close_loop_pref if isinstance(close_loop_pref, bool)
+            else str(close_loop_pref).strip().lower() in ("1", "true", "yes", "on")
+        )
         # Search settings for smallest cut
         self._search_resolution = 18  # Number of angles to search
 
@@ -155,7 +173,11 @@ class ObjectSplitter(Tool):
         self._path_waypoints = []  # List of 3D positions (numpy arrays)
         self._path_node = None  # The node being path-cut
         self._path_preview_nodes = []  # Marker nodes for each waypoint
-        self._path_close_loop = False  # Whether to close the path loop
+        self._path_suggestion_nodes = []  # Marker nodes for suggested path
+        # Whether to close the path loop. Default is on and persisted in prefs.
+        # (Value already loaded above.)
+        self._drag_waypoint_index = None
+        self._drag_waypoint_node = None
 
         # State
         self._selection_pass = None
@@ -172,6 +194,7 @@ class ObjectSplitter(Tool):
             "ShowPreview",
             "TrimeshAvailable",
             "SearchResolution",
+            "ValleySdfBiasEnabled",
             # Connector properties
             "ConnectorEnabled",
             "OpenScadPath",
@@ -185,6 +208,11 @@ class ObjectSplitter(Tool):
             "PathPointCount",
             "PathCloseLoop",
             "TriggerPathCut",
+            "TriggerSuggestPath",
+            # Multi-point anchoring for valley/seam modes
+            "MultiPointAnchorsEnabled",
+            "TriggerAnchoredCut",
+            "ClearPathPoints",
         )
 
         Logger.log("d", "Object Splitter Tool initialized (trimesh available: %s)", str(TRIMESH_AVAILABLE))
@@ -318,6 +346,18 @@ class ObjectSplitter(Tool):
             self._search_resolution = int(value)
             self.propertyChanged.emit()
 
+    def getValleySdfBiasEnabled(self) -> bool:
+        return self._valley_sdf_bias_enabled
+
+    def setValleySdfBiasEnabled(self, value: bool) -> None:
+        enabled = bool(value)
+        if enabled != self._valley_sdf_bias_enabled:
+            self._valley_sdf_bias_enabled = enabled
+            prefs = Application.getInstance().getPreferences()
+            prefs.setValue("objectsplitter/valley_sdf_bias_enabled", enabled)
+            Logger.log("i", "Valley SDF bias enabled: %s", str(enabled))
+            self.propertyChanged.emit()
+
     # Connector properties
     def getConnectorEnabled(self) -> bool:
         return self._connector_enabled
@@ -392,8 +432,14 @@ class ObjectSplitter(Tool):
         return self._path_close_loop
 
     def setPathCloseLoop(self, value: bool):
-        self._path_close_loop = bool(value)
-        self.propertyChanged.emit()
+        enabled = bool(value)
+        if enabled != self._path_close_loop:
+            self._path_close_loop = enabled
+            prefs = Application.getInstance().getPreferences()
+            prefs.setValue("objectsplitter/path_close_loop", enabled)
+            # Suggested path preview can become stale when loop setting flips.
+            self._clearSuggestedPath()
+            self.propertyChanged.emit()
 
     def getTriggerPathCut(self) -> bool:
         return False  # Write-only property, always reads as False
@@ -403,10 +449,49 @@ class ObjectSplitter(Tool):
         if value:
             self._executePathCut()
 
+    def getTriggerSuggestPath(self) -> bool:
+        return False  # Write-only property
+
+    def setTriggerSuggestPath(self, value: bool):
+        """Called from QML to compute and show a suggested geodesic path."""
+        if value:
+            self._suggestPathFromPoints()
+
+    def getMultiPointAnchorsEnabled(self) -> bool:
+        return self._multi_point_anchors_enabled
+
+    def setMultiPointAnchorsEnabled(self, value: bool) -> None:
+        enabled = bool(value)
+        if enabled != self._multi_point_anchors_enabled:
+            self._multi_point_anchors_enabled = enabled
+            prefs = Application.getInstance().getPreferences()
+            prefs.setValue("objectsplitter/multi_point_anchors_enabled", enabled)
+            Logger.log("i", "Multi-point anchors enabled: %s", str(enabled))
+            self.propertyChanged.emit()
+
+    def getTriggerAnchoredCut(self) -> bool:
+        return False  # Write-only property
+
+    def setTriggerAnchoredCut(self, value: bool):
+        """Called from QML to trigger an anchored valley/valley-seam cut."""
+        if value:
+            self._executeAnchoredCut()
+
+    def getClearPathPoints(self) -> bool:
+        return False  # Write-only property
+
+    def setClearPathPoints(self, value: bool):
+        """Called from QML to clear any placed points."""
+        if value:
+            self._clearPathWaypoints()
+
     def _clearPathWaypoints(self):
         """Clear all path waypoints and remove preview markers."""
         self._path_waypoints.clear()
         self._path_node = None
+        self._drag_waypoint_index = None
+        self._drag_waypoint_node = None
+        self._clearSuggestedPath()
         for node in self._path_preview_nodes:
             try:
                 scene = self._controller.getScene()
@@ -418,8 +503,18 @@ class ObjectSplitter(Tool):
         self._removePreview()
         self.propertyChanged.emit()
 
+    def _clearSuggestedPath(self):
+        """Remove suggested path preview markers."""
+        for node in self._path_suggestion_nodes:
+            try:
+                if node.getParent():
+                    node.setParent(None)
+            except Exception:
+                pass
+        self._path_suggestion_nodes.clear()
+
     def _addPathWaypoint(self, position, picked_node):
-        """Add a waypoint for path mode and show a pin marker."""
+        """Add a waypoint for path/anchor modes and show a visible dot marker."""
         pos_arr = numpy.array([position.x, position.y, position.z])
 
         # Ensure all waypoints are on the same node
@@ -429,50 +524,192 @@ class ObjectSplitter(Tool):
 
         self._path_node = picked_node
         self._path_waypoints.append(pos_arr)
+        self._clearSuggestedPath()  # Invalidate previous suggestion
         Logger.log("i", "Path mode: added waypoint %d at %s",
                    len(self._path_waypoints), pos_arr)
 
-        # Draw pin marker at this point
-        mesh_data = picked_node.getMeshData()
-        if mesh_data:
-            transformed = mesh_data.getTransformed(picked_node.getWorldTransformation())
-            verts = transformed.getVertices()
-            mesh_size = verts.max(axis=0) - verts.min(axis=0)
-            mesh_size_max = max(mesh_size[0], mesh_size[1], mesh_size[2])
-            pin_size = max(0.8, mesh_size_max * 0.02)  # Slightly larger than arrow for visibility
-
-            # Compute face normal at click point for pin orientation
-            face_normal = None
-            try:
-                indices_raw = transformed.getIndices()
-                verts_arr = numpy.asarray(verts, dtype=numpy.float64)
-                if indices_raw is not None:
-                    indices_arr = numpy.asarray(indices_raw, dtype=numpy.int32)
-                else:
-                    indices_arr = numpy.arange(len(verts_arr), dtype=numpy.int32).reshape(-1, 3)
-                tm_snap = trimesh.Trimesh(vertices=verts_arr, faces=indices_arr)
-                tm_snap.merge_vertices()
-                from .core.plane_calculator import snap_point_to_mesh_surface
-                _, face_id = snap_point_to_mesh_surface(tm_snap, pos_arr)
-                if face_id is not None and face_id < len(tm_snap.face_normals):
-                    face_normal = numpy.array(tm_snap.face_normals[face_id], dtype=numpy.float64)
-            except Exception:
-                pass  # Fall back to default Y-up pin
-
+        # Draw a dot marker at this point
+        if picked_node.getMeshData():
+            dot_size = self._getWaypointDotSize(picked_node)
             marker_node = self._createPreviewNode()
-            vertices, indices = create_pin_mesh_data(pos_arr, pin_size, face_normal)
+            vertices, indices = create_dot_mesh_data(pos_arr, dot_size)
             mesh_builder = MeshBuilder()
             mesh_builder.setVertices(vertices)
             mesh_builder.setIndices(indices)
             n_verts = len(vertices)
-            # Cyan pins for placed waypoints (distinct from orange hover arrow)
-            colors = numpy.array([[0.0, 0.85, 0.9, 0.9]] * n_verts, dtype=numpy.float32)
+            # Black dots for placed waypoints/anchors.
+            colors = numpy.array([[0.0, 0.0, 0.0, 1.0]] * n_verts, dtype=numpy.float32)
             mesh_builder.setColors(colors)
             mesh_builder.calculateNormals()
             marker_node.setMeshData(mesh_builder.build())
+            scene_root = self._controller.getScene().getRoot()
+            marker_node.setParent(scene_root)
             self._path_preview_nodes.append(marker_node)
 
         self.propertyChanged.emit()
+
+    def _isPointPlacementMode(self) -> bool:
+        return (
+            self._cut_mode == self.CUT_MODE_PATH or
+            (
+                self._multi_point_anchors_enabled and
+                self._cut_mode in (self.CUT_MODE_VALLEY, self.CUT_MODE_VALLEY_SEAM)
+            )
+        )
+
+    def _getWaypointDotSize(self, node) -> float:
+        mesh_data = node.getMeshData()
+        if mesh_data is None:
+            return 0.8
+        transformed = mesh_data.getTransformed(node.getWorldTransformation())
+        verts = transformed.getVertices()
+        if verts is None or len(verts) == 0:
+            return 0.8
+        mesh_size = verts.max(axis=0) - verts.min(axis=0)
+        mesh_size_max = max(mesh_size[0], mesh_size[1], mesh_size[2])
+        return max(0.4, float(mesh_size_max) * 0.01)
+
+    def _findNearbyWaypointIndex(self, position, picked_node) -> Optional[int]:
+        if self._path_node is None or self._path_node != picked_node:
+            return None
+        if not self._path_waypoints:
+            return None
+
+        pos_arr = numpy.array([position.x, position.y, position.z], dtype=numpy.float64)
+        waypoints = numpy.asarray(self._path_waypoints, dtype=numpy.float64)
+        if waypoints.ndim != 2 or waypoints.shape[1] != 3:
+            return None
+
+        dists = numpy.linalg.norm(waypoints - pos_arr[None, :], axis=1)
+        idx = int(numpy.argmin(dists))
+        pick_radius = max(0.9, self._getWaypointDotSize(picked_node) * 2.5)
+        if float(dists[idx]) <= pick_radius:
+            return idx
+        return None
+
+    def _updateWaypointMarker(self, index: int):
+        if self._path_node is None:
+            return
+        if index < 0 or index >= len(self._path_waypoints):
+            return
+        if index >= len(self._path_preview_nodes):
+            return
+
+        pos_arr = numpy.asarray(self._path_waypoints[index], dtype=numpy.float64)
+        dot_size = self._getWaypointDotSize(self._path_node)
+        marker_node = self._path_preview_nodes[index]
+
+        vertices, indices = create_dot_mesh_data(pos_arr, dot_size)
+        mesh_builder = MeshBuilder()
+        mesh_builder.setVertices(vertices)
+        mesh_builder.setIndices(indices)
+        n_verts = len(vertices)
+        colors = numpy.array([[0.0, 0.0, 0.0, 1.0]] * n_verts, dtype=numpy.float32)
+        mesh_builder.setColors(colors)
+        mesh_builder.calculateNormals()
+        marker_node.setMeshData(mesh_builder.build())
+
+        scene_root = self._controller.getScene().getRoot()
+        if marker_node.getParent() != scene_root:
+            marker_node.setParent(scene_root)
+
+    def _movePathWaypoint(self, index: int, position):
+        if index < 0 or index >= len(self._path_waypoints):
+            return
+        pos_arr = numpy.array([position.x, position.y, position.z], dtype=numpy.float64)
+        self._path_waypoints[index] = pos_arr
+        self._clearSuggestedPath()
+        self._updateWaypointMarker(index)
+
+    def _dragWaypointToMouse(self, mouse_x: float, mouse_y: float):
+        if self._drag_waypoint_index is None or self._drag_waypoint_node is None:
+            return
+
+        if self._selection_pass is None:
+            self._selection_pass = Application.getInstance().getRenderer().getRenderPass("selection")
+        picked_node = self._controller.getScene().findObject(
+            self._selection_pass.getIdAtPosition(mouse_x, mouse_y)
+        )
+        if picked_node != self._drag_waypoint_node:
+            return
+
+        active_camera = self._controller.getScene().getActiveCamera()
+        if self._picking_pass is None:
+            self._picking_pass = PickingPass(active_camera.getViewportWidth(), active_camera.getViewportHeight())
+        self._picking_pass.render()
+        picked_position = self._picking_pass.getPickedPosition(mouse_x, mouse_y)
+        if picked_position is None:
+            return
+        self._movePathWaypoint(self._drag_waypoint_index, picked_position)
+
+    def _suggestPathFromPoints(self):
+        """Compute a geodesic path suggestion from placed points and show dotted preview."""
+        if len(self._path_waypoints) < 2:
+            Logger.log("w", "Suggest path: need at least 2 points")
+            return
+        if self._path_node is None:
+            Logger.log("w", "Suggest path: no node selected")
+            return
+
+        try:
+            self._showProgress("Object Splitter", "Computing suggested path...", 0, 100)
+            extraction = self._extractTrimesh(self._path_node)
+            if extraction is None:
+                return
+            tm, _, _ = extraction
+
+            from .core.path_cutter import chain_paths
+            self._updateProgress("Tracing geodesic path...", 35)
+            waypoints = [p.copy() for p in self._path_waypoints]
+            if self._path_close_loop and len(waypoints) >= 3:
+                if not numpy.allclose(waypoints[0], waypoints[-1]):
+                    waypoints.append(waypoints[0].copy())
+            vertex_path = chain_paths(tm, waypoints)
+            if not vertex_path:
+                Logger.log("w", "Suggest path: no path returned")
+                return
+
+            path_points = numpy.asarray(tm.vertices[vertex_path], dtype=numpy.float64)
+            self._updateProgress("Rendering path preview...", 75)
+            self._showSuggestedPath(path_points)
+            Logger.log("i", "Suggested path displayed with %d vertices", len(path_points))
+        except Exception as e:
+            Logger.log("w", "Suggest path failed: %s", str(e))
+        finally:
+            self._closeProgress()
+
+    def _showSuggestedPath(self, path_points: numpy.ndarray):
+        """Show a dotted preview of the suggested path."""
+        self._clearSuggestedPath()
+        if path_points is None or len(path_points) == 0:
+            return
+
+        mesh_size_max = max(
+            1.0,
+            float(numpy.linalg.norm(path_points.max(axis=0) - path_points.min(axis=0)))
+        )
+        dot_size = max(0.2, mesh_size_max * 0.005)
+        max_dots = 80
+        step = max(1, int(numpy.ceil(len(path_points) / max_dots)))
+        sampled = path_points[::step]
+        if len(sampled) == 0 or not numpy.allclose(sampled[-1], path_points[-1]):
+            sampled = numpy.vstack([sampled, path_points[-1]])
+
+        for pt in sampled:
+            marker_node = self._createPreviewNode()
+            vertices, indices = create_dot_mesh_data(pt, dot_size)
+            mesh_builder = MeshBuilder()
+            mesh_builder.setVertices(vertices)
+            mesh_builder.setIndices(indices)
+            n_verts = len(vertices)
+            # Blue dotted line for suggested path.
+            colors = numpy.array([[0.05, 0.45, 1.0, 0.95]] * n_verts, dtype=numpy.float32)
+            mesh_builder.setColors(colors)
+            mesh_builder.calculateNormals()
+            marker_node.setMeshData(mesh_builder.build())
+            scene_root = self._controller.getScene().getRoot()
+            marker_node.setParent(scene_root)
+            self._path_suggestion_nodes.append(marker_node)
 
     def _executePathCut(self):
         """Execute the cut along the accumulated path waypoints."""
@@ -491,14 +728,45 @@ class ObjectSplitter(Tool):
         self._clearPathWaypoints()
         self._performPathCut(node, waypoints)
 
+    def _executeAnchoredCut(self):
+        """Execute valley/valley-seam cut using 1+ placed anchor points."""
+        if self._cut_mode not in (self.CUT_MODE_VALLEY, self.CUT_MODE_VALLEY_SEAM):
+            Logger.log("w", "Anchored cut is only supported for valley modes")
+            return
+        if len(self._path_waypoints) < 1:
+            Logger.log("w", "Anchored cut: place at least 1 point")
+            return
+        if self._path_node is None:
+            Logger.log("w", "Anchored cut: no node selected")
+            return
+
+        node = self._path_node
+        anchor_points = [pt.copy() for pt in self._path_waypoints]
+        click_point = anchor_points[0]
+        self._clearPathWaypoints()
+        self._performCut(node, Vector(*click_point.tolist()), anchor_points=anchor_points)
+
     def event(self, event):
         super().event(event)
         modifiers = QApplication.keyboardModifiers()
         ctrl_is_active = modifiers & Qt.KeyboardModifier.ControlModifier
 
-        # Handle mouse move for preview
-        if event.type == Event.MouseMoveEvent and self._show_preview:
-            self._updatePreview(event.x, event.y)
+        if event.type == Event.MouseMoveEvent:
+            if self._drag_waypoint_index is not None:
+                buttons = getattr(event, "buttons", [])
+                if MouseEvent.LeftButton in buttons:
+                    self._dragWaypointToMouse(event.x, event.y)
+                    return
+                self._drag_waypoint_index = None
+                self._drag_waypoint_node = None
+
+            if self._show_preview:
+                self._updatePreview(event.x, event.y)
+            return
+
+        if event.type == Event.MouseReleaseEvent and self._drag_waypoint_index is not None:
+            self._drag_waypoint_index = None
+            self._drag_waypoint_node = None
             return
 
         # (Right-click no longer triggers path cut — use the Cut button instead)
@@ -543,8 +811,18 @@ class ObjectSplitter(Tool):
             picking_pass.render()
             picked_position = picking_pass.getPickedPosition(event.x, event.y)
 
-            # PATH MODE: accumulate waypoints instead of cutting immediately
-            if self._cut_mode == self.CUT_MODE_PATH:
+            if picked_position is None:
+                Logger.log("d", "No picked position")
+                return
+
+            if self._isPointPlacementMode():
+                hit_idx = self._findNearbyWaypointIndex(picked_position, picked_node)
+                if hit_idx is not None:
+                    self._drag_waypoint_index = hit_idx
+                    self._drag_waypoint_node = picked_node
+                    self._movePathWaypoint(hit_idx, picked_position)
+                    Logger.log("d", "Dragging point %d", hit_idx + 1)
+                    return
                 self._addPathWaypoint(picked_position, picked_node)
                 return
 
@@ -564,6 +842,7 @@ class ObjectSplitter(Tool):
         if enable:
             Logger.log("d", "ObjectSplitter: Tool enabled, panel should be visible")
         else:
+            self._clearSuggestedPath()
             self._removePreview()
 
     # ==========================================================================
@@ -602,6 +881,20 @@ class ObjectSplitter(Tool):
                 self._removePreview()
                 return
 
+        # Path and anchor-placement modes do not need a hover arrow/normal preview.
+        # Hiding it avoids visual lag and click-position confusion.
+        if self._cut_mode == self.CUT_MODE_PATH:
+            self._removePreview()
+            self._hover_node = picked_node
+            return
+        if (
+            self._multi_point_anchors_enabled and
+            self._cut_mode in (self.CUT_MODE_VALLEY, self.CUT_MODE_VALLEY_SEAM)
+        ):
+            self._removePreview()
+            self._hover_node = picked_node
+            return
+
         # Get 3D position under mouse
         active_camera = self._controller.getScene().getActiveCamera()
         if self._picking_pass is None:
@@ -634,33 +927,15 @@ class ObjectSplitter(Tool):
             self.CUT_MODE_SMALLEST,
             self.CUT_MODE_SHORTEST,
             self.CUT_MODE_RADIAL,
-            self.CUT_MODE_PATH,
             self.CUT_MODE_VALLEY,
             self.CUT_MODE_VALLEY_SEAM,
         ):
             center = numpy.array([picked_position.x, picked_position.y, picked_position.z])
             mesh_size_max = max(mesh_size[0], mesh_size[1], mesh_size[2])
             marker_size = max(0.5, mesh_size_max * 0.012)  # 1.2% of mesh or 0.5mm
-
-            # Compute face normal at hover point for arrow direction
-            face_normal = None
-            try:
-                indices = transformed_mesh.getIndices()
-                verts_arr = numpy.asarray(vertices, dtype=numpy.float64)
-                if indices is not None:
-                    indices_arr = numpy.asarray(indices, dtype=numpy.int32)
-                else:
-                    indices_arr = numpy.arange(len(verts_arr), dtype=numpy.int32).reshape(-1, 3)
-                tm_preview = trimesh.Trimesh(vertices=verts_arr, faces=indices_arr)
-                tm_preview.merge_vertices()
-                from .core.plane_calculator import snap_point_to_mesh_surface
-                _, face_id = snap_point_to_mesh_surface(tm_preview, center)
-                if face_id is not None and face_id < len(tm_preview.face_normals):
-                    face_normal = numpy.array(tm_preview.face_normals[face_id], dtype=numpy.float64)
-            except Exception:
-                pass  # Fall back to default Y-up arrow
-
-            self._createOrUpdateMarker(center, marker_size, face_normal)
+            # Marker orientation is intentionally fixed for preview performance.
+            # Surface-normal-based orientation is computed only when executing the cut.
+            self._createOrUpdateMarker(center, marker_size, None)
             self._hover_node = picked_node
             return
 
@@ -693,7 +968,7 @@ class ObjectSplitter(Tool):
         mesh_builder.setVertices(vertices)
         mesh_builder.setIndices(indices)
         n_verts = len(vertices)
-        colors = numpy.array([[1.0, 0.3, 0.0, 0.7]] * n_verts, dtype=numpy.float32)
+        colors = numpy.array([[0.05, 0.05, 0.05, 0.85]] * n_verts, dtype=numpy.float32)
         mesh_builder.setColors(colors)
         mesh_builder.calculateNormals()
         self._preview_node.setMeshData(mesh_builder.build())
@@ -803,7 +1078,12 @@ class ObjectSplitter(Tool):
 
         return tm, local_vertices, vertices
 
-    def _performCut(self, node: CuraSceneNode, click_position: Vector):
+    def _performCut(
+        self,
+        node: CuraSceneNode,
+        click_position: Vector,
+        anchor_points: Optional[list] = None,
+    ):
         """Perform the cut operation on the given node using core algorithms."""
         self._showProgress("Object Splitter", "Preparing mesh...", 0, 100)
 
@@ -817,6 +1097,13 @@ class ObjectSplitter(Tool):
             tm, local_vertices, world_vertices = extraction
 
             click_pos_arr = numpy.array([click_position.x, click_position.y, click_position.z])
+            anchor_points_arr = None
+            if anchor_points:
+                anchor_points_arr = [
+                    numpy.asarray(p, dtype=numpy.float64).reshape(3)
+                    for p in anchor_points
+                ]
+            capture_path = None
 
             # Compute local coordinate transform for accurate cutting
             R = None
@@ -830,18 +1117,21 @@ class ObjectSplitter(Tool):
             if self._capture_dir:
                 try:
                     from .core.debug_capture import capture_operation
-                    capture_operation(
+                    capture_path = capture_operation(
                         mesh=tm,
                         cut_mode=self._cut_mode,
                         click_position=click_pos_arr,
                         height_percent=self._cut_height_percent,
                         search_resolution=self._search_resolution,
+                        valley_sdf_bias_enabled=self._valley_sdf_bias_enabled,
+                        anchor_points=anchor_points_arr,
                         connector_enabled=self._connector_enabled,
                         connector_diameter=self._connector_diameter,
                         connector_height=self._connector_height,
                         connector_clearance=self._connector_clearance,
                         capture_dir=self._capture_dir,
                     )
+                    Logger.log("i", "Debug capture written to: %s", capture_path)
                 except Exception as e:
                     Logger.log("w", "Debug capture failed: %s", str(e))
 
@@ -898,13 +1188,20 @@ class ObjectSplitter(Tool):
                 search_result = find_valley_cut_plane(
                     tm, snap_point, self._search_resolution,
                     surface_normal=valley_surface_normal,
+                    use_sdf_bias=self._valley_sdf_bias_enabled,
+                    anchor_points=anchor_points_arr,
+                    debug_trace_path=(
+                        os.path.join(capture_path, "valley_trace.json")
+                        if capture_path else None
+                    ),
                 )
                 plane = search_result.plane
                 Logger.log("i", "Valley cut: area=%.2f mm^2, tested %d orientations, "
-                           "normal=%s, origin=%s",
+                           "normal=%s, origin=%s, sdf_bias=%s",
                            search_result.area, search_result.samples_tested,
                            str(search_result.plane.normal),
-                           str(search_result.plane.origin))
+                           str(search_result.plane.origin),
+                           str(self._valley_sdf_bias_enabled))
             elif self._cut_mode == self.CUT_MODE_VALLEY_SEAM:
                 # Concavity-biased seam path around the clicked region.
                 self._updateProgress("Tracing concave valley seam...", 15)
@@ -916,21 +1213,36 @@ class ObjectSplitter(Tool):
                     valley_seam_surface_normal = numpy.array(
                         tm.face_normals[source_face], dtype=numpy.float64
                     )
+                target_face_hint = None
+                if anchor_points_arr and len(anchor_points_arr) >= 2:
+                    _, target_face = snap_point_to_mesh_surface(
+                        tm, numpy.asarray(anchor_points_arr[-1], dtype=numpy.float64)
+                    )
+                    if target_face is not None:
+                        target_face_hint = int(target_face)
 
                 try:
                     face_set_a, face_set_b, src, sink = find_valley_seam_partition(
                         tm,
                         snap_point,
                         source_face_hint=source_face,
+                        target_face_hint=target_face_hint,
                         surface_normal=valley_seam_surface_normal,
+                        use_sdf_bias=self._valley_sdf_bias_enabled,
+                        anchor_points=anchor_points_arr,
+                        debug_trace_path=(
+                            os.path.join(capture_path, "valley_seam_trace.json")
+                            if capture_path else None
+                        ),
                     )
                     Logger.log(
                         "i",
-                        "Valley seam returned. A=%d, B=%d, src=%d, sink=%d",
+                        "Valley seam returned. A=%d, B=%d, src=%d, sink=%d, sdf_bias=%s",
                         len(face_set_a),
                         len(face_set_b),
                         src,
                         sink,
+                        str(self._valley_sdf_bias_enabled),
                     )
                 except Exception as e:
                     Logger.log("w", "Valley seam error: %s", e)

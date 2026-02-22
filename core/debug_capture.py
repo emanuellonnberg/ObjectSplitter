@@ -40,16 +40,18 @@ class CapturedOperation:
     mesh_file: str  # .stl or .ply file
 
     # Cut parameters
-    cut_mode: str  # "horizontal", "vertical", "smallest", "shortest", "valley_seam"
+    cut_mode: str  # "horizontal", "vertical", "smallest", "valley", "shortest", "valley_seam"
     click_position: list  # [x, y, z]
     height_percent: float  # for horizontal mode
-    search_resolution: int  # for smallest mode
+    search_resolution: int  # for smallest/valley mode
 
     # Connector parameters
     connector_enabled: bool
     connector_diameter: float
     connector_height: float
     connector_clearance: float
+    valley_sdf_bias_enabled: bool = False
+    anchor_points: Optional[list] = None
 
     # Optional: plane override (for replaying with a known plane)
     plane_origin: Optional[list] = None
@@ -72,6 +74,8 @@ def capture_operation(
     click_position: numpy.ndarray,
     height_percent: float = 50.0,
     search_resolution: int = 18,
+    valley_sdf_bias_enabled: bool = False,
+    anchor_points: Optional[list] = None,
     connector_enabled: bool = True,
     connector_diameter: float = 4.0,
     connector_height: float = 3.0,
@@ -89,7 +93,9 @@ def capture_operation(
         cut_mode: The cutting mode string.
         click_position: 3D click position.
         height_percent: Horizontal cut height percentage.
-        search_resolution: Search resolution for smallest mode.
+        search_resolution: Search resolution for smallest/valley mode.
+        valley_sdf_bias_enabled: Enables SDF bias for valley/valley_seam replay.
+        anchor_points: Optional list of 3D anchor points used by the cut mode.
         connector_enabled: Whether connectors are enabled.
         connector_diameter: Connector peg diameter.
         connector_height: Connector peg height.
@@ -123,6 +129,11 @@ def capture_operation(
         click_position=click_position.tolist() if hasattr(click_position, 'tolist') else list(click_position),
         height_percent=height_percent,
         search_resolution=search_resolution,
+        valley_sdf_bias_enabled=valley_sdf_bias_enabled,
+        anchor_points=(
+            [numpy.asarray(p, dtype=numpy.float64).reshape(3).tolist() for p in anchor_points]
+            if anchor_points else None
+        ),
         connector_enabled=connector_enabled,
         connector_diameter=connector_diameter,
         connector_height=connector_height,
@@ -182,17 +193,24 @@ def replay_operation(capture_path: str) -> dict:
     from .plane_calculator import (
         horizontal_cut_plane, vertical_cut_plane,
         find_smallest_cut_plane, find_shortest_seam_partition,
-        find_valley_seam_partition, CutPlane
+        find_valley_cut_plane, find_valley_seam_partition,
+        snap_point_to_mesh_surface, CutPlane
     )
     from .mesh_splitter import (
         slice_mesh_with_fallback,
         split_by_shortest_seam,
+        split_by_local_plane,
         split_by_face_sets,
     )
     from .connectors import add_connectors, ConnectorConfig
 
     mesh, params = load_captured_operation(capture_path)
     click_pos = numpy.array(params.click_position)
+    anchor_points = None
+    if getattr(params, "anchor_points", None):
+        anchor_points = [numpy.asarray(p, dtype=numpy.float64).reshape(3) for p in params.anchor_points]
+    search_result = None
+    valley_face_id = None
 
     # Determine cut plane
     if params.plane_origin is not None and params.plane_normal is not None:
@@ -207,6 +225,26 @@ def replay_operation(capture_path: str) -> dict:
         search_result = find_smallest_cut_plane(
             mesh, click_pos, params.search_resolution, collect_all_samples=True)
         plane = search_result.plane
+    elif params.cut_mode == "valley":
+        valley_click = click_pos
+        if anchor_points and len(anchor_points) > 0:
+            valley_click = numpy.asarray(anchor_points[0], dtype=numpy.float64)
+        snap_point, valley_face_id = snap_point_to_mesh_surface(mesh, valley_click)
+        valley_surface_normal = None
+        if valley_face_id is not None and valley_face_id < len(mesh.face_normals):
+            valley_surface_normal = numpy.array(
+                mesh.face_normals[valley_face_id], dtype=numpy.float64
+            )
+        search_result = find_valley_cut_plane(
+            mesh,
+            snap_point,
+            params.search_resolution,
+            surface_normal=valley_surface_normal,
+            use_sdf_bias=bool(getattr(params, "valley_sdf_bias_enabled", False)),
+            anchor_points=anchor_points,
+            debug_trace_path=os.path.join(capture_path, "valley_trace_replay.json"),
+        )
+        plane = search_result.plane
     elif params.cut_mode == "shortest":
         plane = None  # Handled differently
     elif params.cut_mode == "valley_seam":
@@ -218,8 +256,46 @@ def replay_operation(capture_path: str) -> dict:
     if params.cut_mode == "shortest":
         face_set_a, face_set_b, _, _ = find_shortest_seam_partition(mesh, click_pos)
         split_result = split_by_shortest_seam(mesh, face_set_a, face_set_b)
+    elif params.cut_mode == "valley":
+        if valley_face_id is None:
+            valley_click = click_pos
+            if anchor_points and len(anchor_points) > 0:
+                valley_click = numpy.asarray(anchor_points[0], dtype=numpy.float64)
+            _, valley_face_id = snap_point_to_mesh_surface(mesh, valley_click)
+        if valley_face_id is None:
+            valley_face_id = 0
+        candidate_normals = (
+            [n for _, n in search_result.top_candidates]
+            if search_result is not None and search_result.top_candidates
+            else [plane.normal]
+        )
+        split_result = split_by_local_plane(
+            mesh, plane.origin, candidate_normals, valley_face_id
+        )
     elif params.cut_mode == "valley_seam":
-        face_set_a, face_set_b, _, _ = find_valley_seam_partition(mesh, click_pos)
+        source_face_hint = None
+        target_face_hint = None
+        seam_click = click_pos
+        seam_surface_normal = None
+        if anchor_points and len(anchor_points) > 0:
+            seam_click = numpy.asarray(anchor_points[0], dtype=numpy.float64)
+            seam_click, source_face_hint = snap_point_to_mesh_surface(mesh, seam_click)
+            if source_face_hint is not None and source_face_hint < len(mesh.face_normals):
+                seam_surface_normal = numpy.array(mesh.face_normals[source_face_hint], dtype=numpy.float64)
+            if len(anchor_points) >= 2:
+                _, target_face_hint = snap_point_to_mesh_surface(
+                    mesh, numpy.asarray(anchor_points[-1], dtype=numpy.float64)
+                )
+        face_set_a, face_set_b, _, _ = find_valley_seam_partition(
+            mesh,
+            seam_click,
+            source_face_hint=source_face_hint,
+            target_face_hint=target_face_hint,
+            surface_normal=seam_surface_normal,
+            use_sdf_bias=bool(getattr(params, "valley_sdf_bias_enabled", False)),
+            anchor_points=anchor_points,
+            debug_trace_path=os.path.join(capture_path, "valley_seam_trace_replay.json"),
+        )
         split_result = split_by_face_sets(
             mesh,
             face_set_a,

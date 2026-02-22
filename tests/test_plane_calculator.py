@@ -3,6 +3,7 @@
 
 """Tests for core.plane_calculator module."""
 
+import json
 import numpy
 import pytest
 from numpy.testing import assert_allclose
@@ -202,6 +203,65 @@ class TestFindValleyCutPlane:
         assert result.top_candidates is not None
         assert len(result.top_candidates) > 0
 
+    def test_sdf_bias_returns_valid_result(self, sphere_mesh):
+        """SDF thinness bias path should return a stable, valid valley result."""
+        center = sphere_mesh.centroid + numpy.array([1.0, 0.5, 0.0])
+        result = find_valley_cut_plane(
+            sphere_mesh,
+            center,
+            search_resolution=6,
+            use_sdf_bias=True,
+        )
+        assert result.area > 0
+        assert result.samples_tested > 0
+        assert result.plane is not None
+        assert numpy.linalg.norm(result.plane.normal) > 0.9
+
+    def test_anchor_points_bias_plane_toward_points(self, sphere_mesh):
+        """Multi-point anchors should keep the returned plane closer to anchors."""
+        click = sphere_mesh.centroid + numpy.array([5.0, 0.0, 0.0])
+        anchors = [
+            click + numpy.array([0.0, 2.0, 0.0]),
+            click + numpy.array([0.0, -2.0, 0.0]),
+        ]
+        result_anchored = find_valley_cut_plane(
+            sphere_mesh,
+            click,
+            search_resolution=6,
+            anchor_points=anchors,
+        )
+        result_unanchored = find_valley_cut_plane(
+            sphere_mesh,
+            click,
+            search_resolution=6,
+        )
+
+        def _mean_plane_distance(res):
+            n = numpy.asarray(res.plane.normal, dtype=numpy.float64)
+            o = numpy.asarray(res.plane.origin, dtype=numpy.float64)
+            d = numpy.abs(numpy.dot(numpy.asarray(anchors) - o, n))
+            return float(numpy.mean(d))
+
+        assert _mean_plane_distance(result_anchored) <= _mean_plane_distance(result_unanchored) + 1e-6
+
+    def test_writes_debug_trace_json(self, sphere_mesh, tmp_path):
+        """Valley mode should emit a structured debug trace when requested."""
+        center = sphere_mesh.centroid + numpy.array([1.0, 0.5, 0.0])
+        trace_path = tmp_path / "valley_trace.json"
+        result = find_valley_cut_plane(
+            sphere_mesh,
+            center,
+            search_resolution=6,
+            debug_trace_path=str(trace_path),
+        )
+        assert result.area > 0
+        assert trace_path.exists()
+        data = json.loads(trace_path.read_text(encoding="utf-8"))
+        assert data["mode"] == "valley"
+        assert "coarse" in data
+        assert "result" in data
+        assert data["result"]["best_area"] > 0.0
+
 
 class TestFindShortestSeamPartition:
     """Tests for geodesic shortest-seam partitioning."""
@@ -288,6 +348,59 @@ class TestFindValleySeamPartition:
             sphere_mesh, click, surface_normal=numpy.array([0.0, -1.0, 0.0])
         )
         assert sink_up != sink_down
+
+    def test_sdf_bias_partition_invariants(self, sphere_mesh):
+        """SDF bias should preserve core partition invariants for valley seam."""
+        click = numpy.array([15.0, 0.0, 0.0])
+        set_a, set_b, src, sink = find_valley_seam_partition(
+            sphere_mesh,
+            click,
+            surface_normal=numpy.array([1.0, 0.0, 0.0]),
+            use_sdf_bias=True,
+        )
+        assert len(set_a) > 0
+        assert len(set_b) > 0
+        assert len(set_a) + len(set_b) == len(sphere_mesh.faces)
+        assert len(set(set_a) & set(set_b)) == 0
+        assert 0 <= src < len(sphere_mesh.faces)
+        assert 0 <= sink < len(sphere_mesh.faces)
+
+    def test_target_face_hint_sets_sink(self, sphere_mesh):
+        """Providing target_face_hint should anchor sink selection."""
+        click = numpy.array([15.0, 0.0, 0.0])
+        target_pt = numpy.array([-15.0, 0.0, 0.0])
+        _, source_face = snap_point_to_mesh_surface(sphere_mesh, click)
+        _, target_face = snap_point_to_mesh_surface(sphere_mesh, target_pt)
+        assert source_face is not None
+        assert target_face is not None
+        set_a, set_b, src, sink = find_valley_seam_partition(
+            sphere_mesh,
+            click,
+            source_face_hint=source_face,
+            target_face_hint=target_face,
+        )
+        assert len(set_a) > 0 and len(set_b) > 0
+        assert src == source_face
+        assert sink == target_face
+
+    def test_writes_debug_trace_json(self, sphere_mesh, tmp_path):
+        """Valley seam mode should emit a structured debug trace when requested."""
+        click = numpy.array([15.0, 0.0, 0.0])
+        trace_path = tmp_path / "valley_seam_trace.json"
+        set_a, set_b, src, sink = find_valley_seam_partition(
+            sphere_mesh,
+            click,
+            surface_normal=numpy.array([1.0, 0.0, 0.0]),
+            debug_trace_path=str(trace_path),
+        )
+        assert len(set_a) > 0 and len(set_b) > 0
+        assert 0 <= src < len(sphere_mesh.faces)
+        assert 0 <= sink < len(sphere_mesh.faces)
+        assert trace_path.exists()
+        data = json.loads(trace_path.read_text(encoding="utf-8"))
+        assert data["mode"] == "valley_seam"
+        assert "source_sink" in data
+        assert "threshold_sweep" in data
 
 
 class TestSnapPointToMeshSurface:
