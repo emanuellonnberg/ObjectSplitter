@@ -100,6 +100,7 @@ from .core.mesh_splitter import (
 )
 from .core.connectors import (
     add_connectors,
+    add_connectors_at_position,
     ConnectorConfig,
 )
 
@@ -1502,7 +1503,9 @@ class ObjectSplitter(Tool):
             split_result = split_by_face_sets(
                 tm, face_set_a, face_set_b,
                 strategy_name="path_cut",
-                attempt_hole_fill=False,
+                # For path cuts, enabling connectors benefits from watertight
+                # halves, so try hole-filling when connectors are requested.
+                attempt_hole_fill=self._connector_enabled,
             )
 
             Logger.log("i", "Path cut split result: %s", split_result.summary())
@@ -1515,9 +1518,66 @@ class ObjectSplitter(Tool):
             mesh_upper = split_result.upper
             mesh_lower = split_result.lower
 
-            # Connectors not supported for path mode (no cut plane)
+            # Path-mode connectors (non-planar): place at seam midpoint and use
+            # centroid-separation as an approximate connector direction.
             if self._connector_enabled:
-                Logger.log("w", "Skipping connectors - not supported for path cut mode")
+                if len(vertex_path) >= 2:
+                    try:
+                        Logger.log(
+                            "i",
+                            "Path connectors: attempting (capped=%s, upper_watertight=%s, lower_watertight=%s)",
+                            str(split_result.capped),
+                            str(bool(mesh_upper.is_watertight)),
+                            str(bool(mesh_lower.is_watertight)),
+                        )
+                        self._updateProgress("Adding connectors...", 80)
+                        path_points = numpy.asarray(tm.vertices[vertex_path], dtype=numpy.float64)
+                        connector_pos = numpy.asarray(
+                            path_points[len(path_points) // 2], dtype=numpy.float64
+                        )
+
+                        normal_guess = numpy.asarray(
+                            mesh_upper.centroid - mesh_lower.centroid, dtype=numpy.float64
+                        )
+                        if numpy.linalg.norm(normal_guess) < 1e-9:
+                            normal_guess = numpy.asarray(
+                                path_points[-1] - path_points[0], dtype=numpy.float64
+                            )
+
+                        config = ConnectorConfig(
+                            enabled=True,
+                            diameter=self._connector_diameter,
+                            height=self._connector_height,
+                            clearance=self._connector_clearance,
+                            sides=self._connector_sides,
+                        )
+                        connector_result = add_connectors_at_position(
+                            mesh_upper=mesh_upper,
+                            mesh_lower=mesh_lower,
+                            connector_position=connector_pos,
+                            connector_normal=normal_guess,
+                            config=config,
+                        )
+                        if connector_result.connectors_added:
+                            mesh_upper = connector_result.upper
+                            mesh_lower = connector_result.lower
+                            Logger.log(
+                                "i",
+                                "Path connectors added: peg on %s, hole on %s (engine: %s)",
+                                connector_result.peg_on,
+                                connector_result.hole_on,
+                                connector_result.hole_engine,
+                            )
+                        else:
+                            Logger.log(
+                                "w",
+                                "Path connectors skipped: %s",
+                                connector_result.skipped_reason,
+                            )
+                    except Exception as e:
+                        Logger.log("w", "Path connectors error: %s", str(e))
+                else:
+                    Logger.log("w", "Path connectors skipped: path too short")
 
             # Create scene nodes and replace original
             node_upper = self._createMeshNode(

@@ -88,6 +88,300 @@ class SplitResult:
                 f"tried: {', '.join(self.strategies_attempted)}")
 
 
+def _signed_area_2d(poly: numpy.ndarray) -> float:
+    """Return the signed area of a simple 2D polygon."""
+    x = poly[:, 0]
+    y = poly[:, 1]
+    return 0.5 * float(numpy.sum(x * numpy.roll(y, -1) - numpy.roll(x, -1) * y))
+
+
+def _point_in_triangle_2d(p, a, b, c, eps: float = 1e-12) -> bool:
+    """Strict point-in-triangle test in 2D (excludes edges)."""
+    v0 = c - a
+    v1 = b - a
+    v2 = p - a
+    den = v0[0] * v1[1] - v1[0] * v0[1]
+    if abs(den) <= eps:
+        return False
+    u = (v2[0] * v1[1] - v1[0] * v2[1]) / den
+    v = (v0[0] * v2[1] - v2[0] * v0[1]) / den
+    w = 1.0 - u - v
+    return (u > eps) and (v > eps) and (w > eps)
+
+
+def _triangulate_polygon_earclip(poly: numpy.ndarray) -> Optional[numpy.ndarray]:
+    """
+    Triangulate a simple 2D polygon with ear clipping.
+    Returns face indices into `poly` or None on failure.
+    """
+    n = len(poly)
+    if n < 3:
+        return None
+
+    area = _signed_area_2d(poly)
+    if abs(area) < 1e-12:
+        return None
+
+    ccw = area > 0.0
+    remaining = list(range(n))
+    faces = []
+    max_iters = n * n
+    iters = 0
+
+    while len(remaining) > 3 and iters < max_iters:
+        iters += 1
+        ear_found = False
+        m = len(remaining)
+        for i in range(m):
+            ia = remaining[(i - 1) % m]
+            ib = remaining[i]
+            ic = remaining[(i + 1) % m]
+            a = poly[ia]
+            b = poly[ib]
+            c = poly[ic]
+
+            cross = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+            if ccw:
+                if cross <= 1e-12:
+                    continue
+            else:
+                if cross >= -1e-12:
+                    continue
+
+            has_inside = False
+            for ip in remaining:
+                if ip in (ia, ib, ic):
+                    continue
+                if _point_in_triangle_2d(poly[ip], a, b, c):
+                    has_inside = True
+                    break
+            if has_inside:
+                continue
+
+            if ccw:
+                faces.append([ia, ib, ic])
+            else:
+                faces.append([ia, ic, ib])
+            del remaining[i]
+            ear_found = True
+            break
+
+        if not ear_found:
+            return None
+
+    if len(remaining) == 3:
+        ia, ib, ic = remaining
+        if ccw:
+            faces.append([ia, ib, ic])
+        else:
+            faces.append([ia, ic, ib])
+
+    if not faces:
+        return None
+    return numpy.asarray(faces, dtype=numpy.int32)
+
+
+def _sanitize_boundary_loop(loop_3d: numpy.ndarray) -> Optional[numpy.ndarray]:
+    """Remove closure duplicate and consecutive duplicate points."""
+    pts = numpy.asarray(loop_3d, dtype=numpy.float64)
+    if pts.ndim != 2 or pts.shape[1] != 3 or len(pts) < 3:
+        return None
+
+    # Drop repeated closing point.
+    if len(pts) >= 2 and numpy.linalg.norm(pts[0] - pts[-1]) <= 1e-8:
+        pts = pts[:-1]
+    if len(pts) < 3:
+        return None
+
+    dedup = [pts[0]]
+    for p in pts[1:]:
+        if numpy.linalg.norm(p - dedup[-1]) > 1e-8:
+            dedup.append(p)
+    pts = numpy.asarray(dedup, dtype=numpy.float64)
+    if len(pts) < 3:
+        return None
+    return pts
+
+
+def _fit_loop_plane(loop_3d: numpy.ndarray):
+    """Fit a best-fit plane basis (origin, u, v) to a 3D boundary loop."""
+    origin = loop_3d.mean(axis=0)
+    centered = loop_3d - origin
+    try:
+        _, _, vh = numpy.linalg.svd(centered, full_matrices=False)
+    except Exception:
+        return None
+    if vh.shape[0] < 2:
+        return None
+    u = vh[0]
+    v = vh[1]
+    nu = numpy.linalg.norm(u)
+    nv = numpy.linalg.norm(v)
+    if nu < 1e-12 or nv < 1e-12:
+        return None
+    u = u / nu
+    v = v / nv
+    # Re-orthogonalize.
+    n = numpy.cross(u, v)
+    nn = numpy.linalg.norm(n)
+    if nn < 1e-12:
+        return None
+    n = n / nn
+    v = numpy.cross(n, u)
+    vn = numpy.linalg.norm(v)
+    if vn < 1e-12:
+        return None
+    v = v / vn
+    return origin, u, v
+
+
+def _triangulate_boundary_loop_2d(loop_2d: numpy.ndarray) -> Tuple[Optional[numpy.ndarray], Optional[numpy.ndarray]]:
+    """
+    Triangulate a 2D closed loop using trimesh Path2D when available,
+    with ear-clipping fallback.
+    Returns (vertices_2d, faces) or (None, None).
+    """
+    if len(loop_2d) < 3:
+        return None, None
+
+    try:
+        entities = [
+            trimesh.path.entities.Line([i, (i + 1) % len(loop_2d)])
+            for i in range(len(loop_2d))
+        ]
+        path2d = trimesh.path.Path2D(
+            entities=entities,
+            vertices=loop_2d.astype(numpy.float64),
+        )
+        verts_2d, faces = path2d.triangulate()
+        if (
+            verts_2d is not None and len(verts_2d) >= 3 and
+            faces is not None and len(faces) > 0
+        ):
+            return (
+                numpy.asarray(verts_2d, dtype=numpy.float64),
+                numpy.asarray(faces, dtype=numpy.int32),
+            )
+    except Exception as e:
+        logger.debug("Path2D triangulation failed, falling back to ear clipping: %s", e)
+
+    faces = _triangulate_polygon_earclip(loop_2d)
+    if faces is None or len(faces) == 0:
+        return None, None
+    return loop_2d.astype(numpy.float64), faces
+
+
+def _cap_open_boundaries(mesh: "trimesh.Trimesh") -> Optional["trimesh.Trimesh"]:
+    """
+    Cap all open boundary loops of a mesh by triangulating each loop.
+    Works for non-planar loops by projecting to a best-fit plane.
+    """
+    try:
+        outline = mesh.outline()
+    except Exception as e:
+        logger.debug("outline() failed while capping boundaries: %s", e)
+        return None
+
+    if outline is None or not hasattr(outline, "discrete"):
+        return None
+
+    cap_meshes = []
+    loops = outline.discrete
+    if loops is None or len(loops) == 0:
+        return None
+
+    for li, loop in enumerate(loops):
+        loop_3d = _sanitize_boundary_loop(loop)
+        if loop_3d is None or len(loop_3d) < 3:
+            continue
+
+        basis = _fit_loop_plane(loop_3d)
+        if basis is None:
+            logger.debug("Boundary loop %d: best-fit plane failed", li)
+            continue
+        origin, u, v = basis
+        centered = loop_3d - origin
+        loop_2d = numpy.column_stack([
+            centered @ u,
+            centered @ v,
+        ])
+
+        verts_2d, faces_2d = _triangulate_boundary_loop_2d(loop_2d)
+        if verts_2d is None or faces_2d is None or len(faces_2d) == 0:
+            logger.debug("Boundary loop %d: triangulation failed", li)
+            continue
+
+        # Reconstruct cap vertices in 3D. Snap triangulation vertices that
+        # coincide with loop boundary points back to the exact original 3D
+        # boundary coordinates so merge_vertices can stitch the seam cleanly.
+        verts_3d = (
+            origin[None, :] +
+            verts_2d[:, 0:1] * u[None, :] +
+            verts_2d[:, 1:2] * v[None, :]
+        )
+        if len(loop_2d) > 0:
+            snapped = verts_3d.copy()
+            for vi in range(len(verts_2d)):
+                d2 = numpy.linalg.norm(loop_2d - verts_2d[vi], axis=1)
+                bi = int(numpy.argmin(d2))
+                if float(d2[bi]) <= 1e-7:
+                    snapped[vi] = loop_3d[bi]
+            verts_3d = snapped
+        cap = trimesh.Trimesh(
+            vertices=verts_3d.astype(numpy.float64),
+            faces=faces_2d.astype(numpy.int64),
+            process=False,
+            validate=False,
+        )
+        cap_meshes.append(cap)
+
+    if not cap_meshes:
+        return None
+
+    combined = trimesh.util.concatenate([mesh] + cap_meshes)
+    try:
+        combined.merge_vertices(digits_vertex=7)
+        combined.remove_unreferenced_vertices()
+        combined.fix_normals()
+    except Exception as e:
+        logger.debug("Post-cap cleanup failed: %s", e)
+    return combined
+
+
+def _attempt_watertight_repair(mesh: "trimesh.Trimesh") -> "trimesh.Trimesh":
+    """Try progressively stronger repairs to make a mesh watertight."""
+    repaired = mesh.copy()
+    try:
+        repaired.merge_vertices()
+        repaired.remove_unreferenced_vertices()
+    except Exception:
+        pass
+
+    if repaired.is_watertight:
+        return repaired
+
+    # Fast trivial-hole repair (triangles/quads only).
+    try:
+        repaired.fill_holes()
+    except Exception as e:
+        logger.debug("fill_holes failed: %s", e)
+
+    if repaired.is_watertight:
+        return repaired
+
+    # General boundary-loop capping for large path seams.
+    capped = _cap_open_boundaries(repaired)
+    if capped is None:
+        return repaired
+
+    try:
+        if not capped.is_watertight:
+            capped.fill_holes()
+    except Exception:
+        pass
+    return capped
+
+
 def slice_mesh_with_fallback(
     mesh: "trimesh.Trimesh",
     plane_origin: numpy.ndarray,
@@ -452,14 +746,11 @@ def split_by_face_sets(
         capped = False
         try:
             if attempt_hole_fill and (not upper.is_watertight or not lower.is_watertight):
-                upper_filled = upper.copy()
-                lower_filled = lower.copy()
-                upper_filled.fill_holes()
-                lower_filled.fill_holes()
-                if upper_filled.is_watertight and lower_filled.is_watertight:
-                    upper = upper_filled
-                    lower = lower_filled
-                    capped = True
+                upper_repaired = _attempt_watertight_repair(upper)
+                lower_repaired = _attempt_watertight_repair(lower)
+                upper = upper_repaired
+                lower = lower_repaired
+                capped = bool(upper.is_watertight and lower.is_watertight)
         except Exception as e:
             logger.debug("Hole filling after %s failed: %s", strategy_name, e)
 

@@ -15,6 +15,7 @@ from core.connectors import (
     create_hole_mesh,
     try_boolean_difference,
     add_connectors,
+    add_connectors_at_position,
     ConnectorConfig,
     ConnectorResult,
 )
@@ -294,6 +295,39 @@ class TestAddConnectorsEdgeCases:
                     assert cr.peg_on == "upper"
                 else:
                     assert cr.peg_on == "lower"
+
+
+class TestAddConnectorsAtPosition:
+    """Tests for explicit-position connector placement helper."""
+
+    def test_invalid_normal_skips(self, cube_mesh):
+        origin = numpy.array([0, 0, 0], dtype=float)
+        normal = numpy.array([0, 1, 0], dtype=float)
+        result = slice_mesh_with_fallback(cube_mesh, origin, normal)
+        assert result.success
+        cr = add_connectors_at_position(
+            result.upper,
+            result.lower,
+            connector_position=origin,
+            connector_normal=numpy.array([0.0, 0.0, 0.0]),
+            config=ConnectorConfig(),
+        )
+        assert not cr.connectors_added
+        assert cr.skipped_reason == "invalid connector normal"
+
+    def test_pipeline_runs_with_explicit_point(self, cube_mesh):
+        origin = numpy.array([0, 0, 0], dtype=float)
+        normal = numpy.array([0, 1, 0], dtype=float)
+        result = slice_mesh_with_fallback(cube_mesh, origin, normal)
+        if result.success and result.capped:
+            cr = add_connectors_at_position(
+                result.upper,
+                result.lower,
+                connector_position=origin,
+                connector_normal=normal,
+                config=ConnectorConfig(),
+            )
+            assert isinstance(cr, ConnectorResult)
 
 
 class TestCreatePegHoleArbitraryNormals:

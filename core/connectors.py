@@ -249,51 +249,100 @@ def add_connectors(
             upper=mesh_upper, lower=mesh_lower,
             skipped_reason="connectors disabled")
 
-    upper_role, lower_role = determine_peg_side(mesh_upper, mesh_lower)
-
     connector_pos = find_connector_position(mesh_upper, plane_origin, plane_normal)
     if connector_pos is None:
         return ConnectorResult(
             upper=mesh_upper, lower=mesh_lower,
             skipped_reason="no valid connector position found")
 
-    peg = create_peg_mesh(connector_pos, plane_normal, config.diameter, config.height, config.sides)
-    hole = create_hole_mesh(connector_pos, plane_normal, config.diameter, config.height,
-                            config.clearance, config.sides)
+    return add_connectors_at_position(
+        mesh_upper=mesh_upper,
+        mesh_lower=mesh_lower,
+        connector_position=connector_pos,
+        connector_normal=plane_normal,
+        config=config,
+    )
 
-    try:
-        if upper_role == "peg":
-            hole_mesh, hole_engine = try_boolean_difference(mesh_lower, hole)
-            if hole_mesh is not None and len(hole_mesh.vertices) > 0:
-                result_upper = trimesh.util.concatenate([mesh_upper, peg])
-                return ConnectorResult(
-                    upper=result_upper, lower=hole_mesh,
-                    connector_position=connector_pos,
-                    peg_on="upper", hole_on="lower",
-                    hole_engine=hole_engine)
-            else:
-                return ConnectorResult(
-                    upper=mesh_upper, lower=mesh_lower,
-                    connector_position=connector_pos,
-                    skipped_reason="boolean difference for hole failed")
-        else:
-            hole_mesh, hole_engine = try_boolean_difference(mesh_upper, hole)
-            if hole_mesh is not None and len(hole_mesh.vertices) > 0:
-                result_lower = trimesh.util.concatenate([mesh_lower, peg])
-                return ConnectorResult(
-                    upper=hole_mesh, lower=result_lower,
-                    connector_position=connector_pos,
-                    peg_on="lower", hole_on="upper",
-                    hole_engine=hole_engine)
-            else:
-                return ConnectorResult(
-                    upper=mesh_upper, lower=mesh_lower,
-                    connector_position=connector_pos,
-                    skipped_reason="boolean difference for hole failed")
 
-    except Exception as e:
-        logger.error("Error adding connectors: %s", e)
+def add_connectors_at_position(
+    mesh_upper: "trimesh.Trimesh",
+    mesh_lower: "trimesh.Trimesh",
+    connector_position: numpy.ndarray,
+    connector_normal: numpy.ndarray,
+    config: ConnectorConfig = None,
+) -> ConnectorResult:
+    """
+    Add a peg/hole connector at a caller-provided point and direction.
+
+    Useful for non-planar splits (e.g. path cuts) where no single cut plane
+    exists, but we still have a seam point and an estimated split direction.
+    """
+    if config is None:
+        config = ConnectorConfig()
+
+    if not config.enabled:
         return ConnectorResult(
             upper=mesh_upper, lower=mesh_lower,
-            connector_position=connector_pos,
-            skipped_reason=str(e))
+            skipped_reason="connectors disabled")
+
+    pos = numpy.asarray(connector_position, dtype=numpy.float64).reshape(3)
+    normal = numpy.asarray(connector_normal, dtype=numpy.float64).reshape(3)
+    normal_norm = numpy.linalg.norm(normal)
+    if normal_norm < 1e-9:
+        return ConnectorResult(
+            upper=mesh_upper, lower=mesh_lower,
+            connector_position=pos,
+            skipped_reason="invalid connector normal")
+    normal = normal / normal_norm
+
+    peg = create_peg_mesh(pos, normal, config.diameter, config.height, config.sides)
+    hole = create_hole_mesh(
+        pos,
+        normal,
+        config.diameter,
+        config.height,
+        config.clearance,
+        config.sides,
+    )
+
+    preferred_upper_role, _ = determine_peg_side(mesh_upper, mesh_lower)
+    role_orders = [preferred_upper_role]
+    role_orders.append("hole" if preferred_upper_role == "peg" else "peg")
+
+    if mesh_upper.is_watertight and not mesh_lower.is_watertight:
+        role_orders = ["hole", "peg"]
+    elif mesh_lower.is_watertight and not mesh_upper.is_watertight:
+        role_orders = ["peg", "hole"]
+
+    last_error = None
+
+    for upper_role in role_orders:
+        try:
+            if upper_role == "peg":
+                hole_mesh, hole_engine = try_boolean_difference(mesh_lower, hole)
+                if hole_mesh is not None and len(hole_mesh.vertices) > 0:
+                    result_upper = trimesh.util.concatenate([mesh_upper, peg])
+                    return ConnectorResult(
+                        upper=result_upper, lower=hole_mesh,
+                        connector_position=pos,
+                        peg_on="upper", hole_on="lower",
+                        hole_engine=hole_engine)
+                last_error = "boolean difference for hole failed on lower"
+            else:
+                hole_mesh, hole_engine = try_boolean_difference(mesh_upper, hole)
+                if hole_mesh is not None and len(hole_mesh.vertices) > 0:
+                    result_lower = trimesh.util.concatenate([mesh_lower, peg])
+                    return ConnectorResult(
+                        upper=hole_mesh, lower=result_lower,
+                        connector_position=pos,
+                        peg_on="lower", hole_on="upper",
+                        hole_engine=hole_engine)
+                last_error = "boolean difference for hole failed on upper"
+        except Exception as e:
+            last_error = str(e)
+            logger.error("Error adding connectors (%s peg side): %s", upper_role, e)
+
+    return ConnectorResult(
+        upper=mesh_upper, lower=mesh_lower,
+        connector_position=pos,
+        skipped_reason=last_error or "boolean difference for hole failed on both sides")

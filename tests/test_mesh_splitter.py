@@ -17,6 +17,7 @@ from core.mesh_splitter import (
     SplitResult,
 )
 from core.plane_calculator import find_shortest_seam_partition, find_smallest_cut_plane
+from core.path_cutter import chain_paths, partition_faces_by_path
 
 
 class TestSliceMeshWithFallback:
@@ -261,12 +262,12 @@ class TestSplitByLocalPlane:
         assert "local_plane_partition" in result.strategies_attempted
 
     def test_split_preserves_faces(self, cube_mesh):
-        """Total faces should be preserved."""
+        """Total faces should be preserved or increased by optional capping."""
         normals = [numpy.array([0.0, 1.0, 0.0])]
         result = split_by_local_plane(cube_mesh, cube_mesh.centroid, normals, 0)
         assert result.success
         total = len(result.upper.faces) + len(result.lower.faces)
-        assert total == len(cube_mesh.faces)
+        assert total >= len(cube_mesh.faces)
 
     def test_empty_candidates_fails(self, cube_mesh):
         """No candidate normals should fail gracefully."""
@@ -454,3 +455,55 @@ class TestFallbackChain:
         assert result.success
         assert result.strategy_used == "uncapped_slice"
         assert not result.capped
+
+
+class TestFaceSetCapping:
+    """Tests for watertight capping after face-set partition splits."""
+
+    def test_large_boundary_holes_are_capped(self, sphere_mesh):
+        """
+        A large open hemisphere boundary cannot be closed by trivial fill_holes.
+        split_by_face_sets(attempt_hole_fill=True) should now cap it.
+        """
+        centroids = sphere_mesh.triangles_center
+        set_a = numpy.where(centroids[:, 1] >= 0.0)[0].tolist()
+        set_b = numpy.where(centroids[:, 1] < 0.0)[0].tolist()
+
+        result = split_by_face_sets(
+            sphere_mesh,
+            set_a,
+            set_b,
+            strategy_name="hemisphere_partition",
+            attempt_hole_fill=True,
+        )
+        assert result.success
+        assert result.capped
+        assert result.upper.is_watertight
+        assert result.lower.is_watertight
+
+    def test_closed_path_partition_can_be_capped(self, sphere_mesh):
+        """
+        Path-based closed-loop partitions should be eligible for seam capping,
+        enabling downstream connector operations.
+        """
+        waypoints = [
+            sphere_mesh.centroid + numpy.array([15.0, 0.0, 0.0]),
+            sphere_mesh.centroid + numpy.array([0.0, 0.0, 15.0]),
+            sphere_mesh.centroid + numpy.array([-15.0, 0.0, 0.0]),
+            sphere_mesh.centroid + numpy.array([0.0, 0.0, -15.0]),
+            sphere_mesh.centroid + numpy.array([15.0, 0.0, 0.0]),
+        ]
+        vertex_path = chain_paths(sphere_mesh, waypoints)
+        set_a, set_b = partition_faces_by_path(sphere_mesh, vertex_path)
+
+        result = split_by_face_sets(
+            sphere_mesh,
+            set_a,
+            set_b,
+            strategy_name="path_cut",
+            attempt_hole_fill=True,
+        )
+        assert result.success
+        assert result.capped
+        assert result.upper.is_watertight
+        assert result.lower.is_watertight
