@@ -12,7 +12,7 @@ from core.plane_calculator import (
     find_valley_cut_plane,
 )
 from core.mesh_splitter import slice_mesh_with_fallback, split_by_local_plane, split_by_face_sets
-from core.path_cutter import chain_paths, partition_faces_by_path
+from core.path_cutter import chain_paths, partition_faces_by_path, isolate_region_by_loops
 
 
 def generate_projection(mesh: trimesh.Trimesh, view_axis: int = 2, resolution: int = 20, custom_bounds=None) -> np.ndarray:
@@ -212,6 +212,27 @@ def _create_rounded_fork():
     fork = trimesh.creation.extrude_polygon(poly, height=5.0)
     vertices, faces = trimesh.remesh.subdivide(fork.vertices, fork.faces)
     vertices, faces = trimesh.remesh.subdivide(vertices, faces)
+    vertices, faces = trimesh.remesh.subdivide(vertices, faces)
+    return trimesh.Trimesh(vertices=vertices, faces=faces)
+
+
+def _create_double_bridge_plate():
+    """Create a closed solid with an upper plate attached by two narrow bridges."""
+    try:
+        from shapely.geometry import box
+        from shapely.ops import unary_union
+    except ImportError:
+        pytest.skip("shapely not available")
+
+    poly = unary_union([
+        box(-30.0, -20.0, 30.0, 12.0),
+        box(-18.0, 24.0, 18.0, 40.0),
+        box(-14.0, 12.0, -6.0, 24.0),
+        box(6.0, 12.0, 14.0, 24.0),
+    ]).buffer(0)
+
+    mesh = trimesh.creation.extrude_polygon(poly, height=6.0)
+    vertices, faces = trimesh.remesh.subdivide(mesh.vertices, mesh.faces)
     vertices, faces = trimesh.remesh.subdivide(vertices, faces)
     return trimesh.Trimesh(vertices=vertices, faces=faces)
 
@@ -837,3 +858,70 @@ def test_fork_path_rounded_throat_orthographic_signature():
     max_runs = max(_count_true_runs(row) for row in top_band)
     assert max_runs == 2, f"Rounded path remainder should show two top tooth columns.\n{print_image(img_big)}"
     _assert_center_gap_axis_aligned(img_big, max_drift_ratio=0.05, rows_from_top=6)
+
+
+def test_path_isolate_double_bridge_orthographic_signature():
+    """
+    Multi-loop path isolate should extract the upper plate from a part with two
+    separate bridge connections, leaving the base in the remainder.
+    """
+    mesh = _create_double_bridge_plate()
+    left_loop = [
+        np.array([-14.5, 18.0, 0.0], dtype=float),
+        np.array([-14.5, 18.0, 6.0], dtype=float),
+        np.array([-5.5, 18.0, 6.0], dtype=float),
+        np.array([-5.5, 18.0, 0.0], dtype=float),
+        np.array([-14.5, 18.0, 0.0], dtype=float),
+    ]
+    right_loop = [
+        np.array([5.5, 18.0, 0.0], dtype=float),
+        np.array([5.5, 18.0, 6.0], dtype=float),
+        np.array([14.5, 18.0, 6.0], dtype=float),
+        np.array([14.5, 18.0, 0.0], dtype=float),
+        np.array([5.5, 18.0, 0.0], dtype=float),
+    ]
+
+    loop_vertex_paths = [chain_paths(mesh, left_loop), chain_paths(mesh, right_loop)]
+    for vertex_path in loop_vertex_paths:
+        assert len(vertex_path) >= 12
+        assert vertex_path[0] == vertex_path[-1]
+
+    _, target_face_id = snap_point_to_mesh_surface(mesh, np.array([0.0, 32.0, 3.0], dtype=float))
+    assert target_face_id is not None
+
+    extracted_faces, remainder_faces = isolate_region_by_loops(mesh, loop_vertex_paths, target_face_id)
+    result = split_by_face_sets(
+        mesh,
+        extracted_faces,
+        remainder_faces,
+        strategy_name="path_isolate",
+        attempt_hole_fill=False,
+    )
+    assert result.success
+
+    extracted_mesh = result.upper
+    remainder_mesh = result.lower
+    ratio = len(extracted_mesh.faces) / len(mesh.faces)
+    assert 0.45 <= ratio <= 0.60, (
+        f"Expected a meaningful isolated upper plate, got {ratio:.2%} "
+        f"({len(extracted_mesh.faces)}/{len(mesh.faces)} faces)."
+    )
+
+    img_extracted = generate_projection(extracted_mesh, view_axis=2, resolution=28, custom_bounds=mesh.bounds)
+    img_remainder = generate_projection(remainder_mesh, view_axis=2, resolution=28, custom_bounds=mesh.bounds)
+    assert img_extracted.sum() > 20
+    assert img_remainder.sum() > 40
+
+    extracted_y = np.where(img_extracted.any(axis=0))[0]
+    remainder_y = np.where(img_remainder.any(axis=0))[0]
+    assert extracted_y.size > 0 and remainder_y.size > 0
+    assert extracted_y.mean() > remainder_y.mean() + 4.0, (
+        f"Expected isolated region to sit above the remainder.\n"
+        f"Extracted:\n{print_image(img_extracted)}\nRemainder:\n{print_image(img_remainder)}"
+    )
+
+    top_band_sum = img_extracted[:, -6:].sum()
+    bottom_band_sum = img_extracted[:, :6].sum()
+    assert top_band_sum > bottom_band_sum * 2, (
+        f"Expected isolated region to occupy the upper plate band.\n{print_image(img_extracted)}"
+    )

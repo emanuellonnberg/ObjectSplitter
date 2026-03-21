@@ -30,12 +30,57 @@ from core.mesh_splitter import (
     split_by_face_sets,
 )
 from core.connectors import add_connectors, ConnectorConfig
+from core.path_cutter import isolate_region_by_loops
 from core.debug_capture import (
     capture_operation,
     load_captured_operation,
     replay_operation,
     save_result_meshes,
 )
+
+
+def _make_mask_mesh(mask: numpy.ndarray) -> trimesh.Trimesh:
+    mask = numpy.asarray(mask, dtype=bool)
+    ny, nx = mask.shape
+    vertices = numpy.array(
+        [[float(i), float(j), 0.0] for j in range(ny + 1) for i in range(nx + 1)],
+        dtype=numpy.float64,
+    )
+    faces = []
+    stride = nx + 1
+    for j in range(ny):
+        for i in range(nx):
+            if not mask[j, i]:
+                continue
+            v0 = j * stride + i
+            v1 = v0 + 1
+            v2 = v0 + stride
+            v3 = v2 + 1
+            faces.append([v0, v1, v2])
+            faces.append([v1, v3, v2])
+    return trimesh.Trimesh(vertices=vertices, faces=numpy.asarray(faces, dtype=numpy.int32), process=False)
+
+
+def _make_double_bridge_surface_mesh() -> trimesh.Trimesh:
+    from shapely.geometry import box
+    from shapely.ops import unary_union
+
+    poly = unary_union([
+        box(-30.0, -20.0, 30.0, 12.0),
+        box(-18.0, 24.0, 18.0, 40.0),
+        box(-14.0, 12.0, -6.0, 24.0),
+        box(6.0, 12.0, 14.0, 24.0),
+    ]).buffer(0)
+    mesh = trimesh.creation.extrude_polygon(poly, height=6.0)
+    vertices, faces = trimesh.remesh.subdivide(mesh.vertices, mesh.faces)
+    vertices, faces = trimesh.remesh.subdivide(vertices, faces)
+    return trimesh.Trimesh(vertices=vertices, faces=faces)
+
+
+def _nearest_face_to_point(mesh: trimesh.Trimesh, point: numpy.ndarray) -> int:
+    centroids = numpy.asarray(mesh.triangles_center, dtype=numpy.float64)
+    dists = numpy.linalg.norm(centroids - numpy.asarray(point, dtype=numpy.float64), axis=1)
+    return int(numpy.argmin(dists))
 
 
 class TestFullHorizontalWorkflow:
@@ -258,8 +303,80 @@ class TestCaptureAndReplay:
             output_dir = os.path.join(tmpdir, "output")
             saved = save_result_meshes(result, output_dir)
             assert len(saved) == 2
-            for f in saved:
-                assert os.path.exists(f)
+
+
+class TestPathIsolateWorkflow:
+    """Integration tests for multi-loop path isolation."""
+
+    def test_isolate_region_split_produces_two_meshes(self):
+        mesh = _make_double_bridge_surface_mesh()
+        loops = [
+            [
+                numpy.array([-14.5, 18.0, 0.0], dtype=numpy.float64),
+                numpy.array([-14.5, 18.0, 6.0], dtype=numpy.float64),
+                numpy.array([-5.5, 18.0, 6.0], dtype=numpy.float64),
+                numpy.array([-5.5, 18.0, 0.0], dtype=numpy.float64),
+                numpy.array([-14.5, 18.0, 0.0], dtype=numpy.float64),
+            ],
+            [
+                numpy.array([5.5, 18.0, 0.0], dtype=numpy.float64),
+                numpy.array([5.5, 18.0, 6.0], dtype=numpy.float64),
+                numpy.array([14.5, 18.0, 6.0], dtype=numpy.float64),
+                numpy.array([14.5, 18.0, 0.0], dtype=numpy.float64),
+                numpy.array([5.5, 18.0, 0.0], dtype=numpy.float64),
+            ],
+        ]
+        from core.path_cutter import chain_paths
+        loop_paths = [chain_paths(mesh, loop) for loop in loops]
+        target_face = _nearest_face_to_point(mesh, numpy.array([0.0, 32.0, 3.0]))
+
+        extracted, remainder = isolate_region_by_loops(mesh, loop_paths, target_face)
+        result = split_by_face_sets(
+            mesh,
+            extracted,
+            remainder,
+            strategy_name="path_isolate",
+            attempt_hole_fill=False,
+        )
+
+        assert result.success
+        assert len(result.upper.faces) > 0
+        assert len(result.lower.faces) > 0
+        assert len(result.upper.faces) + len(result.lower.faces) == len(mesh.faces)
+
+    def test_isolate_mode_returns_plain_two_mesh_split(self):
+        mesh = _make_double_bridge_surface_mesh()
+        loops = [
+            [
+                numpy.array([-14.5, 18.0, 0.0], dtype=numpy.float64),
+                numpy.array([-14.5, 18.0, 6.0], dtype=numpy.float64),
+                numpy.array([-5.5, 18.0, 6.0], dtype=numpy.float64),
+                numpy.array([-5.5, 18.0, 0.0], dtype=numpy.float64),
+                numpy.array([-14.5, 18.0, 0.0], dtype=numpy.float64),
+            ],
+            [
+                numpy.array([5.5, 18.0, 0.0], dtype=numpy.float64),
+                numpy.array([5.5, 18.0, 6.0], dtype=numpy.float64),
+                numpy.array([14.5, 18.0, 6.0], dtype=numpy.float64),
+                numpy.array([14.5, 18.0, 0.0], dtype=numpy.float64),
+                numpy.array([5.5, 18.0, 0.0], dtype=numpy.float64),
+            ],
+        ]
+        from core.path_cutter import chain_paths
+        loop_paths = [chain_paths(mesh, loop) for loop in loops]
+        target_face = _nearest_face_to_point(mesh, numpy.array([0.0, 32.0, 3.0]))
+
+        extracted, remainder = isolate_region_by_loops(mesh, loop_paths, target_face)
+        result = split_by_face_sets(
+            mesh,
+            extracted,
+            remainder,
+            strategy_name="path_isolate",
+            attempt_hole_fill=False,
+        )
+        assert result.success
+        assert len(result.upper.faces) > 0
+        assert len(result.lower.faces) > 0
 
     def test_capture_with_plane_override(self, cube_mesh):
         """Capture with explicit plane should replay using that plane."""

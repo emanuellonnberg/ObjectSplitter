@@ -4,7 +4,7 @@
 import QtQuick 2.15
 import QtQuick.Controls 2.15
 
-import UM 1.6 as UM
+import UM 1.5 as UM
 import Cura 1.0 as Cura
 
 Item {
@@ -84,7 +84,7 @@ Item {
                 id: cutModeComboBox
                 width: 170
                 height: UM.Theme.getSize("setting_control").height
-                model: ["Horizontal", "Vertical", "Smallest Section", "Shortest Seam", "Radial (geodesic)", "Path (multi-point)", "Valley (groove)", "Valley Seam (concavity)"]
+                model: ["Horizontal", "Vertical", "Smallest Section", "Shortest Seam", "Radial (geodesic)", "Path (multi-point)", "Path Isolate (multi-loop)", "Valley (groove)", "Valley Seam (concavity)"]
                 currentIndex: {
                     if (UM.ActiveTool) {
                         var mode = UM.ActiveTool.properties.getValue("CutMode")
@@ -94,14 +94,15 @@ Item {
                         if (mode === "shortest") return 3
                         if (mode === "radial") return 4
                         if (mode === "path") return 5
-                        if (mode === "valley") return 6
-                        if (mode === "valley_seam") return 7
+                        if (mode === "path_isolate") return 6
+                        if (mode === "valley") return 7
+                        if (mode === "valley_seam") return 8
                     }
                     return 0
                 }
                 onActivated: {
                     if (UM.ActiveTool) {
-                        var modeMap = ["horizontal", "vertical", "smallest", "shortest", "radial", "path", "valley", "valley_seam"]
+                        var modeMap = ["horizontal", "vertical", "smallest", "shortest", "radial", "path", "path_isolate", "valley", "valley_seam"]
                         UM.ActiveTool.setProperty("CutMode", modeMap[currentIndex])
                     }
                 }
@@ -120,6 +121,7 @@ Item {
                     if (mode === "shortest") return "Plane search + min-cut refinement"
                     if (mode === "radial") return "Geodesic distance partition from click"
                     if (mode === "path") return "Click to place points, then press Cut"
+                    if (mode === "path_isolate") return "Place one or more closed loops, pick a target region, then isolate it"
                     if (mode === "valley") return "Find and follow a valley/groove near click"
                     if (mode === "valley_seam") return "Concavity-biased seam around clicked feature"
                 }
@@ -174,6 +176,73 @@ Item {
                 }
             }
 
+            CheckBox {
+                id: capPathEndsCheckbox
+                text: "Cap Path Cut"
+                visible: UM.ActiveTool && UM.ActiveTool.properties.getValue("CutMode") === "path"
+                checked: UM.ActiveTool ? UM.ActiveTool.properties.getValue("PathCapEnds") : true
+                onClicked: {
+                    if (UM.ActiveTool) {
+                        UM.ActiveTool.setProperty("PathCapEnds", checked)
+                    }
+                }
+            }
+
+            CheckBox {
+                id: insertPointsCheckbox
+                text: "Insert Points"
+                visible: UM.ActiveTool && UM.ActiveTool.properties.getValue("CutMode") === "path"
+                checked: UM.ActiveTool ? UM.ActiveTool.properties.getValue("PathInsertMode") : false
+                onClicked: {
+                    if (UM.ActiveTool) {
+                        UM.ActiveTool.setProperty("PathInsertMode", checked)
+                    }
+                }
+            }
+
+            CheckBox {
+                id: smallMarkersCheckbox
+                text: "Small Markers"
+                checked: UM.ActiveTool ? UM.ActiveTool.properties.getValue("PathSmallMarkers") : false
+                onClicked: {
+                    if (UM.ActiveTool) {
+                        UM.ActiveTool.setProperty("PathSmallMarkers", checked)
+                    }
+                }
+            }
+
+            Label {
+                width: parent.width
+                visible: UM.ActiveTool &&
+                         UM.ActiveTool.properties.getValue("CutMode") === "path" &&
+                         UM.ActiveTool.properties.getValue("PathInsertMode")
+                text: "Insert mode places new clicks between the nearest points."
+                font: UM.Theme.getFont("default_italic")
+                color: UM.Theme.getColor("text_inactive")
+                wrapMode: Text.WordWrap
+                renderType: Text.NativeRendering
+            }
+
+            Label {
+                width: parent.width
+                visible: UM.ActiveTool && UM.ActiveTool.properties.getValue("PathSmallMarkers")
+                text: "Smaller dots and a smaller grab radius help place points closer together."
+                font: UM.Theme.getFont("default_italic")
+                color: UM.Theme.getColor("text_inactive")
+                wrapMode: Text.WordWrap
+                renderType: Text.NativeRendering
+            }
+
+            Label {
+                visible: UM.ActiveTool &&
+                         UM.ActiveTool.properties.getValue("CutMode") === "path" &&
+                         UM.ActiveTool.properties.getValue("HasSelectedPathPoint")
+                text: "Selected: " + (UM.ActiveTool.properties.getValue("SelectedPathPointIndex") + 1)
+                font: UM.Theme.getFont("default")
+                color: UM.Theme.getColor("text")
+                renderType: Text.NativeRendering
+            }
+
             Row {
                 spacing: Math.round(UM.Theme.getSize("default_margin").width / 2)
 
@@ -184,6 +253,19 @@ Item {
                     onClicked: {
                         if (UM.ActiveTool) {
                             UM.ActiveTool.setProperty("ClearPathPoints", true)
+                        }
+                    }
+                }
+
+                Button {
+                    text: "Remove Selected"
+                    visible: UM.ActiveTool && UM.ActiveTool.properties.getValue("CutMode") === "path"
+                    width: 120
+                    height: UM.Theme.getSize("setting_control").height
+                    enabled: UM.ActiveTool && UM.ActiveTool.properties.getValue("HasSelectedPathPoint")
+                    onClicked: {
+                        if (UM.ActiveTool) {
+                            UM.ActiveTool.setProperty("RemoveSelectedPathPoint", true)
                         }
                     }
                 }
@@ -216,6 +298,254 @@ Item {
                 onClicked: {
                     if (UM.ActiveTool) {
                         UM.ActiveTool.setProperty("TriggerSuggestPath", true)
+                    }
+                }
+            }
+        }
+
+        // Path isolate controls
+        Column {
+            width: parent.width
+            spacing: Math.round(UM.Theme.getSize("default_margin").height / 2)
+            visible: UM.ActiveTool && UM.ActiveTool.properties.getValue("CutMode") === "path_isolate"
+
+            Label {
+                text: "Loops placed: " + (UM.ActiveTool ? UM.ActiveTool.properties.getValue("PathLoopCount") : 0)
+                font: UM.Theme.getFont("default")
+                color: UM.Theme.getColor("text")
+                renderType: Text.NativeRendering
+            }
+
+            Label {
+                text: "Points in current loop: " + (UM.ActiveTool ? UM.ActiveTool.properties.getValue("CurrentLoopPointCount") : 0)
+                font: UM.Theme.getFont("default")
+                color: UM.Theme.getColor("text")
+                renderType: Text.NativeRendering
+            }
+
+            Label {
+                width: parent.width
+                text: {
+                    if (!UM.ActiveTool) {
+                        return ""
+                    }
+                    if (UM.ActiveTool.properties.getValue("PathIsolateTargetPickActive")) {
+                        return "Click the region you want to isolate."
+                    }
+                    return "Click to place points for the current closed loop, then press Start New Loop."
+                }
+                font: UM.Theme.getFont("default_italic")
+                color: UM.Theme.getColor("text_inactive")
+                wrapMode: Text.WordWrap
+                renderType: Text.NativeRendering
+            }
+
+            Label {
+                visible: UM.ActiveTool && UM.ActiveTool.properties.getValue("HasSelectedPathPoint")
+                text: "Selected: " + (UM.ActiveTool.properties.getValue("SelectedPathPointIndex") + 1)
+                font: UM.Theme.getFont("default")
+                color: UM.Theme.getColor("text")
+                renderType: Text.NativeRendering
+            }
+
+            CheckBox {
+                id: isolateSmallMarkersCheckbox
+                text: "Small Markers"
+                checked: UM.ActiveTool ? UM.ActiveTool.properties.getValue("PathSmallMarkers") : false
+                onClicked: {
+                    if (UM.ActiveTool) {
+                        UM.ActiveTool.setProperty("PathSmallMarkers", checked)
+                    }
+                }
+            }
+
+            Label {
+                width: parent.width
+                visible: UM.ActiveTool && UM.ActiveTool.properties.getValue("PathSmallMarkers")
+                text: "Smaller dots and a smaller grab radius help place isolate-loop points closer together."
+                font: UM.Theme.getFont("default_italic")
+                color: UM.Theme.getColor("text_inactive")
+                wrapMode: Text.WordWrap
+                renderType: Text.NativeRendering
+            }
+
+            Row {
+                spacing: Math.round(UM.Theme.getSize("default_margin").width / 2)
+
+                Button {
+                    text: "Remove Selected"
+                    width: 120
+                    height: UM.Theme.getSize("setting_control").height
+                    enabled: UM.ActiveTool && UM.ActiveTool.properties.getValue("HasSelectedPathPoint")
+                    onClicked: {
+                        if (UM.ActiveTool) {
+                            UM.ActiveTool.setProperty("RemoveSelectedPathPoint", true)
+                        }
+                    }
+                }
+
+                Button {
+                    text: "Clear Current Loop"
+                    width: 120
+                    height: UM.Theme.getSize("setting_control").height
+                    enabled: UM.ActiveTool && UM.ActiveTool.properties.getValue("CurrentLoopPointCount") > 0
+                    onClicked: {
+                        if (UM.ActiveTool) {
+                            UM.ActiveTool.setProperty("TriggerClearCurrentPathLoop", true)
+                        }
+                    }
+                }
+            }
+
+            Row {
+                spacing: Math.round(UM.Theme.getSize("default_margin").width / 2)
+
+                Button {
+                    text: "Start New Loop"
+                    width: 110
+                    height: UM.Theme.getSize("setting_control").height
+                    enabled: UM.ActiveTool && UM.ActiveTool.properties.getValue("CurrentLoopPointCount") >= 3
+                    onClicked: {
+                        if (UM.ActiveTool) {
+                            UM.ActiveTool.setProperty("TriggerStartNewPathLoop", true)
+                        }
+                    }
+                }
+
+                Button {
+                    text: "Clear All Loops"
+                    width: 110
+                    height: UM.Theme.getSize("setting_control").height
+                    enabled: UM.ActiveTool && (
+                        UM.ActiveTool.properties.getValue("CurrentLoopPointCount") > 0 ||
+                        UM.ActiveTool.properties.getValue("PathLoopCount") > 0 ||
+                        UM.ActiveTool.properties.getValue("PathIsolateTargetPicked")
+                    )
+                    onClicked: {
+                        if (UM.ActiveTool) {
+                            UM.ActiveTool.setProperty("ClearPathPoints", true)
+                        }
+                    }
+                }
+            }
+
+            Button {
+                text: "Pick Target Region"
+                width: 140
+                height: UM.Theme.getSize("setting_control").height
+                enabled: UM.ActiveTool &&
+                         UM.ActiveTool.properties.getValue("PathLoopCount") >= 1 &&
+                         UM.ActiveTool.properties.getValue("CurrentLoopPointCount") === 0
+                onClicked: {
+                    if (UM.ActiveTool) {
+                        UM.ActiveTool.setProperty("TriggerPickPathIsolateTarget", true)
+                    }
+                }
+            }
+
+            Label {
+                text: {
+                    if (!UM.ActiveTool) {
+                        return ""
+                    }
+                    if (UM.ActiveTool.properties.getValue("PathIsolateTargetPickActive")) {
+                        return "Picking target..."
+                    }
+                    if (UM.ActiveTool.properties.getValue("PathIsolateTargetPicked")) {
+                        return "Target selected"
+                    }
+                    return "No target selected"
+                }
+                font: UM.Theme.getFont("default")
+                color: UM.Theme.getColor("text")
+                renderType: Text.NativeRendering
+            }
+
+            CheckBox {
+                id: isolateCleanupCheckBox
+                text: "Remove Tiny Fragments"
+                checked: UM.ActiveTool ? UM.ActiveTool.properties.getValue("PathIsolatePruneTinyFragments") : true
+                onClicked: {
+                    if (UM.ActiveTool) {
+                        UM.ActiveTool.setProperty("PathIsolatePruneTinyFragments", checked)
+                    }
+                }
+            }
+
+            Column {
+                width: parent.width
+                spacing: Math.round(UM.Theme.getSize("default_margin").height / 3)
+                visible: UM.ActiveTool && UM.ActiveTool.properties.getValue("PathIsolatePruneTinyFragments")
+
+                Label {
+                    width: parent.width
+                    text: "Drops disconnected pieces smaller than the threshold from each output."
+                    font: UM.Theme.getFont("default_italic")
+                    color: UM.Theme.getColor("text_inactive")
+                    wrapMode: Text.WordWrap
+                    renderType: Text.NativeRendering
+                }
+
+                Row {
+                    spacing: Math.round(UM.Theme.getSize("default_margin").width / 2)
+
+                    Label {
+                        height: UM.Theme.getSize("setting_control").height
+                        text: "Min faces:"
+                        font: UM.Theme.getFont("default")
+                        color: UM.Theme.getColor("text")
+                        verticalAlignment: Text.AlignVCenter
+                        renderType: Text.NativeRendering
+                        width: 70
+                    }
+
+                    Slider {
+                        id: isolateFragmentSlider
+                        width: 120
+                        from: 0
+                        to: 300
+                        stepSize: 10
+                        value: UM.ActiveTool ? UM.ActiveTool.properties.getValue("PathIsolateTinyFragmentFaceThreshold") : 80
+
+                        onValueChanged: {
+                            if (UM.ActiveTool) {
+                                UM.ActiveTool.setProperty("PathIsolateTinyFragmentFaceThreshold", Math.round(value))
+                            }
+                        }
+                    }
+
+                    Label {
+                        height: UM.Theme.getSize("setting_control").height
+                        text: Math.round(isolateFragmentSlider.value) + " faces"
+                        font: UM.Theme.getFont("default")
+                        color: UM.Theme.getColor("text")
+                        verticalAlignment: Text.AlignVCenter
+                        renderType: Text.NativeRendering
+                        width: 65
+                    }
+                }
+            }
+
+            Label {
+                width: parent.width
+                text: "Connectors are disabled in this mode for now."
+                font: UM.Theme.getFont("default_italic")
+                color: UM.Theme.getColor("text_inactive")
+                wrapMode: Text.WordWrap
+                renderType: Text.NativeRendering
+            }
+
+            Button {
+                text: "Isolate Region"
+                width: 120
+                height: UM.Theme.getSize("setting_control").height
+                enabled: UM.ActiveTool &&
+                         UM.ActiveTool.properties.getValue("PathLoopCount") >= 1 &&
+                         UM.ActiveTool.properties.getValue("CurrentLoopPointCount") === 0 &&
+                         UM.ActiveTool.properties.getValue("PathIsolateTargetPicked")
+                onClicked: {
+                    if (UM.ActiveTool) {
+                        UM.ActiveTool.setProperty("TriggerPathIsolate", true)
                     }
                 }
             }
@@ -452,6 +782,7 @@ Item {
         Column {
             width: parent.width
             spacing: Math.round(UM.Theme.getSize("default_margin").height / 2)
+            visible: !(UM.ActiveTool && UM.ActiveTool.properties.getValue("CutMode") === "path_isolate")
 
             // Connector Enable Toggle
             Row {

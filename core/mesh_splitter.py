@@ -52,6 +52,51 @@ def _merge_other_components(
             lower = trimesh.util.concatenate([lower, comp])
     return upper, lower
 
+
+def prune_small_components(
+    mesh: "trimesh.Trimesh",
+    min_faces: int,
+) -> Tuple["trimesh.Trimesh", int, int]:
+    """
+    Remove disconnected mesh components smaller than min_faces.
+
+    Returns:
+        (pruned_mesh, removed_component_count, kept_component_count)
+
+    Notes:
+    - Always keeps at least the largest component, even if every component is
+      below the threshold, so callers never end up with an empty mesh here.
+    """
+    if mesh is None or len(mesh.faces) == 0:
+        return mesh, 0, 0
+
+    min_faces = max(0, int(min_faces))
+    if min_faces <= 0:
+        return mesh, 0, 1
+
+    try:
+        components = list(mesh.split(only_watertight=False))
+    except Exception as e:
+        logger.debug("Component split failed during prune_small_components: %s", e)
+        return mesh, 0, 1
+
+    if len(components) <= 1:
+        return mesh, 0, len(components)
+
+    components = sorted(components, key=lambda comp: len(comp.faces), reverse=True)
+    kept = [comp for comp in components if len(comp.faces) >= min_faces]
+    if not kept:
+        kept = [components[0]]
+
+    removed_count = len(components) - len(kept)
+    kept_count = len(kept)
+    if removed_count <= 0:
+        return mesh, 0, kept_count
+
+    if len(kept) == 1:
+        return kept[0], removed_count, kept_count
+    return trimesh.util.concatenate(kept), removed_count, kept_count
+
 try:
     import trimesh
 except ImportError:
@@ -69,6 +114,8 @@ class SplitResult:
     """Result of a mesh split operation, with debug metadata."""
     upper: Optional["trimesh.Trimesh"] = None
     lower: Optional["trimesh.Trimesh"] = None
+    cap_faces_upper: Optional[list] = None
+    cap_faces_lower: Optional[list] = None
     capped: bool = False
     strategy_used: str = "none"
     strategies_attempted: list = field(default_factory=list)
@@ -271,7 +318,9 @@ def _triangulate_boundary_loop_2d(loop_2d: numpy.ndarray) -> Tuple[Optional[nump
     return loop_2d.astype(numpy.float64), faces
 
 
-def _cap_open_boundaries(mesh: "trimesh.Trimesh") -> Optional["trimesh.Trimesh"]:
+def _cap_open_boundaries(
+    mesh: "trimesh.Trimesh",
+) -> Tuple[Optional["trimesh.Trimesh"], Optional[list]]:
     """
     Cap all open boundary loops of a mesh by triangulating each loop.
     Works for non-planar loops by projecting to a best-fit plane.
@@ -280,15 +329,15 @@ def _cap_open_boundaries(mesh: "trimesh.Trimesh") -> Optional["trimesh.Trimesh"]
         outline = mesh.outline()
     except Exception as e:
         logger.debug("outline() failed while capping boundaries: %s", e)
-        return None
+        return None, None
 
     if outline is None or not hasattr(outline, "discrete"):
-        return None
+        return None, None
 
     cap_meshes = []
     loops = outline.discrete
     if loops is None or len(loops) == 0:
-        return None
+        return None, None
 
     for li, loop in enumerate(loops):
         loop_3d = _sanitize_boundary_loop(loop)
@@ -336,19 +385,31 @@ def _cap_open_boundaries(mesh: "trimesh.Trimesh") -> Optional["trimesh.Trimesh"]
         cap_meshes.append(cap)
 
     if not cap_meshes:
-        return None
+        return None, None
 
     combined = trimesh.util.concatenate([mesh] + cap_meshes)
+    base_faces = len(mesh.faces)
+    cap_face_ranges = []
+    running = base_faces
+    for cap in cap_meshes:
+        count = len(cap.faces)
+        cap_face_ranges.append((running, running + count))
+        running += count
     try:
         combined.merge_vertices(digits_vertex=7)
         combined.remove_unreferenced_vertices()
         combined.fix_normals()
     except Exception as e:
         logger.debug("Post-cap cleanup failed: %s", e)
-    return combined
+    cap_faces = []
+    for start, end in cap_face_ranges:
+        cap_faces.extend(range(start, end))
+    return combined, cap_faces
 
 
-def _attempt_watertight_repair(mesh: "trimesh.Trimesh") -> "trimesh.Trimesh":
+def _attempt_watertight_repair(
+    mesh: "trimesh.Trimesh",
+) -> Tuple["trimesh.Trimesh", Optional[list]]:
     """Try progressively stronger repairs to make a mesh watertight."""
     repaired = mesh.copy()
     try:
@@ -358,7 +419,7 @@ def _attempt_watertight_repair(mesh: "trimesh.Trimesh") -> "trimesh.Trimesh":
         pass
 
     if repaired.is_watertight:
-        return repaired
+        return repaired, None
 
     # Fast trivial-hole repair (triangles/quads only).
     try:
@@ -367,19 +428,19 @@ def _attempt_watertight_repair(mesh: "trimesh.Trimesh") -> "trimesh.Trimesh":
         logger.debug("fill_holes failed: %s", e)
 
     if repaired.is_watertight:
-        return repaired
+        return repaired, None
 
     # General boundary-loop capping for large path seams.
-    capped = _cap_open_boundaries(repaired)
+    capped, cap_faces = _cap_open_boundaries(repaired)
     if capped is None:
-        return repaired
+        return repaired, None
 
     try:
         if not capped.is_watertight:
             capped.fill_holes()
     except Exception:
         pass
-    return capped
+    return capped, cap_faces
 
 
 def slice_mesh_with_fallback(
@@ -744,10 +805,12 @@ def split_by_face_sets(
 
         # Attempt hole-filling for watertightness
         capped = False
+        cap_faces_upper = None
+        cap_faces_lower = None
         try:
             if attempt_hole_fill and (not upper.is_watertight or not lower.is_watertight):
-                upper_repaired = _attempt_watertight_repair(upper)
-                lower_repaired = _attempt_watertight_repair(lower)
+                upper_repaired, cap_faces_upper = _attempt_watertight_repair(upper)
+                lower_repaired, cap_faces_lower = _attempt_watertight_repair(lower)
                 upper = upper_repaired
                 lower = lower_repaired
                 capped = bool(upper.is_watertight and lower.is_watertight)
@@ -756,6 +819,8 @@ def split_by_face_sets(
 
         result.upper = upper
         result.lower = lower
+        result.cap_faces_upper = cap_faces_upper
+        result.cap_faces_lower = cap_faces_lower
         result.capped = capped
         result.strategy_used = strategy_name
     except Exception as e:

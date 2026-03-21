@@ -16,10 +16,11 @@ from core.connectors import (
     try_boolean_difference,
     add_connectors,
     add_connectors_at_position,
+    add_cap_native_connectors,
     ConnectorConfig,
     ConnectorResult,
 )
-from core.mesh_splitter import slice_mesh_with_fallback
+from core.mesh_splitter import slice_mesh_with_fallback, split_by_face_sets
 
 
 class TestGetMeshVolume:
@@ -328,6 +329,61 @@ class TestAddConnectorsAtPosition:
                 config=ConnectorConfig(),
             )
             assert isinstance(cr, ConnectorResult)
+
+
+class TestCapNativeConnectors:
+    """Tests for cap-native (non-boolean) connector deformation."""
+
+    def test_cap_native_on_partitioned_sphere(self, sphere_mesh):
+        centroids = sphere_mesh.triangles_center
+        set_a = numpy.where(centroids[:, 1] >= 0.0)[0].tolist()
+        set_b = numpy.where(centroids[:, 1] < 0.0)[0].tolist()
+
+        split = split_by_face_sets(
+            sphere_mesh,
+            set_a,
+            set_b,
+            strategy_name="sphere_split",
+            attempt_hole_fill=True,
+        )
+        assert split.success
+        assert split.capped
+        assert split.cap_faces_upper
+        assert split.cap_faces_lower
+        upper_before = numpy.asarray(split.upper.vertices, dtype=numpy.float64).copy()
+        lower_before = numpy.asarray(split.lower.vertices, dtype=numpy.float64).copy()
+
+        cr = add_cap_native_connectors(
+            split.upper,
+            split.lower,
+            connector_position=numpy.array([0.0, 0.0, 0.0]),
+            connector_normal=numpy.array([0.0, 1.0, 0.0]),
+            cap_faces_upper=split.cap_faces_upper,
+            cap_faces_lower=split.cap_faces_lower,
+            config=ConnectorConfig(diameter=3.0, height=2.0, clearance=0.15),
+        )
+        assert cr.connectors_added
+        assert cr.hole_engine == "cap_native"
+        assert cr.peg_on in ("upper", "lower")
+        assert cr.hole_on in ("upper", "lower")
+        assert cr.peg_on != cr.hole_on
+        upper_after = numpy.asarray(cr.upper.vertices, dtype=numpy.float64)
+        lower_after = numpy.asarray(cr.lower.vertices, dtype=numpy.float64)
+        upper_move = float(numpy.linalg.norm(upper_after - upper_before, axis=1).max())
+        lower_move = float(numpy.linalg.norm(lower_after - lower_before, axis=1).max())
+        assert upper_move > 0.02
+        assert lower_move > 0.02
+
+        # Shape guard: cap-native connector should have a broad top region
+        # (not a single-spike profile). Check moved vertex distribution on peg side.
+        if cr.peg_on == "upper":
+            peg_move = numpy.linalg.norm(upper_after - upper_before, axis=1)
+        else:
+            peg_move = numpy.linalg.norm(lower_after - lower_before, axis=1)
+        peg_max = float(peg_move.max())
+        assert peg_max > 0.02
+        near_peak = int(numpy.sum(peg_move >= peg_max * 0.85))
+        assert near_peak >= 6
 
 
 class TestCreatePegHoleArbitraryNormals:

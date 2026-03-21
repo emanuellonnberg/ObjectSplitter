@@ -90,6 +90,7 @@ from .core.plane_calculator import (
     find_valley_seam_partition,
     find_shortest_seam_partition,
     refine_partition_with_mincut,
+    snap_point_to_mesh_surface,
 )
 from .core.mesh_splitter import (
     slice_mesh_with_fallback,
@@ -97,11 +98,19 @@ from .core.mesh_splitter import (
     split_by_local_plane,
     local_plane_partition,
     split_by_face_sets,
+    prune_small_components,
 )
 from .core.connectors import (
     add_connectors,
     add_connectors_at_position,
+    add_cap_native_connectors,
+    find_connector_position,
     ConnectorConfig,
+)
+from .core.path_editing import (
+    append_waypoint,
+    insert_waypoint_nearest_segment,
+    remove_selected_waypoint,
 )
 
 
@@ -116,6 +125,7 @@ class ObjectSplitter(Tool):
     CUT_MODE_SHORTEST = "shortest"          # Shortest seam (plane search + refine)
     CUT_MODE_RADIAL = "radial"              # Radial geodesic cut (dual-Dijkstra)
     CUT_MODE_PATH = "path"                  # Multi-point geodesic path cut
+    CUT_MODE_PATH_ISOLATE = "path_isolate"  # Multi-loop isolation cut
     CUT_MODE_VALLEY = "valley"              # Geographic valley/groove detection
     CUT_MODE_VALLEY_SEAM = "valley_seam"    # Concavity-biased seam cut
 
@@ -148,6 +158,10 @@ class ObjectSplitter(Tool):
         prefs.addPreference("objectsplitter/valley_sdf_bias_enabled", False)
         prefs.addPreference("objectsplitter/multi_point_anchors_enabled", False)
         prefs.addPreference("objectsplitter/path_close_loop", True)
+        prefs.addPreference("objectsplitter/path_small_markers", False)
+        prefs.addPreference("objectsplitter/path_cap_ends", True)
+        prefs.addPreference("objectsplitter/path_isolate_prune_tiny_fragments", True)
+        prefs.addPreference("objectsplitter/path_isolate_tiny_fragment_face_threshold", 80)
         self._openscad_path = prefs.getValue("objectsplitter/openscad_path")
         valley_sdf_pref = prefs.getValue("objectsplitter/valley_sdf_bias_enabled")
         self._valley_sdf_bias_enabled = (
@@ -164,6 +178,26 @@ class ObjectSplitter(Tool):
             close_loop_pref if isinstance(close_loop_pref, bool)
             else str(close_loop_pref).strip().lower() in ("1", "true", "yes", "on")
         )
+        small_markers_pref = prefs.getValue("objectsplitter/path_small_markers")
+        self._path_small_markers = (
+            small_markers_pref if isinstance(small_markers_pref, bool)
+            else str(small_markers_pref).strip().lower() in ("1", "true", "yes", "on")
+        )
+        path_cap_pref = prefs.getValue("objectsplitter/path_cap_ends")
+        self._path_cap_ends = (
+            path_cap_pref if isinstance(path_cap_pref, bool)
+            else str(path_cap_pref).strip().lower() in ("1", "true", "yes", "on")
+        )
+        prune_fragments_pref = prefs.getValue("objectsplitter/path_isolate_prune_tiny_fragments")
+        self._path_isolate_prune_tiny_fragments = (
+            prune_fragments_pref if isinstance(prune_fragments_pref, bool)
+            else str(prune_fragments_pref).strip().lower() in ("1", "true", "yes", "on")
+        )
+        prune_threshold_pref = prefs.getValue("objectsplitter/path_isolate_tiny_fragment_face_threshold")
+        try:
+            self._path_isolate_tiny_fragment_face_threshold = max(0, int(prune_threshold_pref))
+        except (TypeError, ValueError):
+            self._path_isolate_tiny_fragment_face_threshold = 80
         # Search settings for smallest cut
         self._search_resolution = 18  # Number of angles to search
 
@@ -175,10 +209,18 @@ class ObjectSplitter(Tool):
         self._path_node = None  # The node being path-cut
         self._path_preview_nodes = []  # Marker nodes for each waypoint
         self._path_suggestion_nodes = []  # Marker nodes for suggested path
+        self._path_insert_mode = False
+        self._selected_path_waypoint_index = None
         # Whether to close the path loop. Default is on and persisted in prefs.
         # (Value already loaded above.)
         self._drag_waypoint_index = None
         self._drag_waypoint_node = None
+        self._path_isolate_loops = []  # Finalized closed waypoint loops
+        self._path_isolate_preview_nodes = []  # Preview markers for finalized loops
+        self._path_isolate_target_pick_active = False
+        self._path_isolate_target_point = None
+        self._path_isolate_target_face_id = None
+        self._path_isolate_target_preview_node = None
 
         # State
         self._selection_pass = None
@@ -207,9 +249,25 @@ class ObjectSplitter(Tool):
             "DebugCaptureEnabled",
             # Path mode
             "PathPointCount",
+            "PathLoopCount",
+            "CurrentLoopPointCount",
             "PathCloseLoop",
+            "PathCapEnds",
+            "PathSmallMarkers",
+            "PathInsertMode",
+            "HasSelectedPathPoint",
+            "SelectedPathPointIndex",
+            "PathIsolatePruneTinyFragments",
+            "PathIsolateTinyFragmentFaceThreshold",
+            "PathIsolateTargetPicked",
+            "PathIsolateTargetPickActive",
             "TriggerPathCut",
+            "TriggerPathIsolate",
             "TriggerSuggestPath",
+            "TriggerStartNewPathLoop",
+            "TriggerClearCurrentPathLoop",
+            "TriggerPickPathIsolateTarget",
+            "RemoveSelectedPathPoint",
             # Multi-point anchoring for valley/seam modes
             "MultiPointAnchorsEnabled",
             "TriggerAnchoredCut",
@@ -313,6 +371,7 @@ class ObjectSplitter(Tool):
             {"value": self.CUT_MODE_SHORTEST, "text": "Shortest seam (surface loop)"},
             {"value": self.CUT_MODE_RADIAL, "text": "Radial (geodesic)"},
             {"value": self.CUT_MODE_PATH, "text": "Path (multi-point)"},
+            {"value": self.CUT_MODE_PATH_ISOLATE, "text": "Path Isolate (multi-loop)"},
             {"value": self.CUT_MODE_VALLEY, "text": "Valley (geographic groove)"},
             {"value": self.CUT_MODE_VALLEY_SEAM, "text": "Valley Seam (concavity path)"},
         ]
@@ -429,6 +488,12 @@ class ObjectSplitter(Tool):
     def getPathPointCount(self) -> int:
         return len(self._path_waypoints)
 
+    def getPathLoopCount(self) -> int:
+        return len(self._path_isolate_loops)
+
+    def getCurrentLoopPointCount(self) -> int:
+        return len(self._path_waypoints)
+
     def getPathCloseLoop(self) -> bool:
         return self._path_close_loop
 
@@ -442,6 +507,82 @@ class ObjectSplitter(Tool):
             self._clearSuggestedPath()
             self.propertyChanged.emit()
 
+    def getPathCapEnds(self) -> bool:
+        return self._path_cap_ends
+
+    def setPathCapEnds(self, value: bool) -> None:
+        enabled = bool(value)
+        if enabled != self._path_cap_ends:
+            self._path_cap_ends = enabled
+            prefs = Application.getInstance().getPreferences()
+            prefs.setValue("objectsplitter/path_cap_ends", enabled)
+            Logger.log("i", "Path cut capping: %s", "on" if enabled else "off")
+            self.propertyChanged.emit()
+
+    def getPathSmallMarkers(self) -> bool:
+        return self._path_small_markers
+
+    def setPathSmallMarkers(self, value: bool) -> None:
+        enabled = bool(value)
+        if enabled != self._path_small_markers:
+            self._path_small_markers = enabled
+            prefs = Application.getInstance().getPreferences()
+            prefs.setValue("objectsplitter/path_small_markers", enabled)
+            self._rebuildPathWaypointMarkers()
+            self._rebuildPathIsolateLoopMarkers()
+            self._rebuildPathIsolateTargetMarker()
+            Logger.log("i", "Path markers: %s", "small" if enabled else "default")
+            self.propertyChanged.emit()
+
+    def getPathIsolatePruneTinyFragments(self) -> bool:
+        return self._path_isolate_prune_tiny_fragments
+
+    def setPathIsolatePruneTinyFragments(self, value: bool) -> None:
+        enabled = bool(value)
+        if enabled != self._path_isolate_prune_tiny_fragments:
+            self._path_isolate_prune_tiny_fragments = enabled
+            prefs = Application.getInstance().getPreferences()
+            prefs.setValue("objectsplitter/path_isolate_prune_tiny_fragments", enabled)
+            Logger.log("i", "Path isolate tiny-fragment cleanup: %s", "on" if enabled else "off")
+            self.propertyChanged.emit()
+
+    def getPathIsolateTinyFragmentFaceThreshold(self) -> int:
+        return int(self._path_isolate_tiny_fragment_face_threshold)
+
+    def setPathIsolateTinyFragmentFaceThreshold(self, value: int) -> None:
+        try:
+            threshold = max(0, int(value))
+        except (TypeError, ValueError):
+            threshold = 0
+        if threshold != self._path_isolate_tiny_fragment_face_threshold:
+            self._path_isolate_tiny_fragment_face_threshold = threshold
+            prefs = Application.getInstance().getPreferences()
+            prefs.setValue("objectsplitter/path_isolate_tiny_fragment_face_threshold", threshold)
+            Logger.log("i", "Path isolate tiny-fragment threshold: %d faces", threshold)
+            self.propertyChanged.emit()
+
+    def getPathInsertMode(self) -> bool:
+        return self._path_insert_mode
+
+    def setPathInsertMode(self, value: bool) -> None:
+        enabled = bool(value)
+        if enabled != self._path_insert_mode:
+            self._path_insert_mode = enabled
+            Logger.log("i", "Path insert mode: %s", "on" if enabled else "off")
+            self.propertyChanged.emit()
+
+    def getHasSelectedPathPoint(self) -> bool:
+        return (
+            self._isPathSelectionEnabled() and
+            self._selected_path_waypoint_index is not None and
+            0 <= self._selected_path_waypoint_index < len(self._path_waypoints)
+        )
+
+    def getSelectedPathPointIndex(self) -> int:
+        if not self.getHasSelectedPathPoint():
+            return -1
+        return int(self._selected_path_waypoint_index)
+
     def getTriggerPathCut(self) -> bool:
         return False  # Write-only property, always reads as False
 
@@ -450,6 +591,13 @@ class ObjectSplitter(Tool):
         if value:
             self._executePathCut()
 
+    def getTriggerPathIsolate(self) -> bool:
+        return False
+
+    def setTriggerPathIsolate(self, value: bool):
+        if value:
+            self._executePathIsolate()
+
     def getTriggerSuggestPath(self) -> bool:
         return False  # Write-only property
 
@@ -457,6 +605,47 @@ class ObjectSplitter(Tool):
         """Called from QML to compute and show a suggested geodesic path."""
         if value:
             self._suggestPathFromPoints()
+
+    def getRemoveSelectedPathPoint(self) -> bool:
+        return False  # Write-only property
+
+    def setRemoveSelectedPathPoint(self, value: bool):
+        if value:
+            self._removeSelectedPathWaypoint()
+
+    def getPathIsolateTargetPicked(self) -> bool:
+        return (
+            self._cut_mode == self.CUT_MODE_PATH_ISOLATE and
+            self._path_isolate_target_face_id is not None and
+            self._path_isolate_target_point is not None
+        )
+
+    def getPathIsolateTargetPickActive(self) -> bool:
+        return (
+            self._cut_mode == self.CUT_MODE_PATH_ISOLATE and
+            self._path_isolate_target_pick_active
+        )
+
+    def getTriggerStartNewPathLoop(self) -> bool:
+        return False
+
+    def setTriggerStartNewPathLoop(self, value: bool):
+        if value:
+            self._startNewPathLoop()
+
+    def getTriggerClearCurrentPathLoop(self) -> bool:
+        return False
+
+    def setTriggerClearCurrentPathLoop(self, value: bool):
+        if value:
+            self._clearCurrentPathLoop()
+
+    def getTriggerPickPathIsolateTarget(self) -> bool:
+        return False
+
+    def setTriggerPickPathIsolateTarget(self, value: bool):
+        if value:
+            self._armPathIsolateTargetPick()
 
     def getMultiPointAnchorsEnabled(self) -> bool:
         return self._multi_point_anchors_enabled
@@ -490,17 +679,17 @@ class ObjectSplitter(Tool):
         """Clear all path waypoints and remove preview markers."""
         self._path_waypoints.clear()
         self._path_node = None
+        self._selected_path_waypoint_index = None
         self._drag_waypoint_index = None
         self._drag_waypoint_node = None
+        self._path_isolate_loops.clear()
+        self._path_isolate_target_pick_active = False
+        self._path_isolate_target_point = None
+        self._path_isolate_target_face_id = None
         self._clearSuggestedPath()
-        for node in self._path_preview_nodes:
-            try:
-                scene = self._controller.getScene()
-                if node.getParent():
-                    node.setParent(None)
-            except Exception:
-                pass
-        self._path_preview_nodes.clear()
+        self._clearWaypointPreviewNodes()
+        self._clearPathIsolatePreviewNodes()
+        self._clearPathIsolateTargetPreview()
         self._removePreview()
         self.propertyChanged.emit()
 
@@ -514,44 +703,138 @@ class ObjectSplitter(Tool):
                 pass
         self._path_suggestion_nodes.clear()
 
+    def _clearWaypointPreviewNodes(self):
+        for node in self._path_preview_nodes:
+            try:
+                if node.getParent():
+                    node.setParent(None)
+            except Exception:
+                pass
+        self._path_preview_nodes.clear()
+
+    def _clearPathIsolatePreviewNodes(self):
+        for node in self._path_isolate_preview_nodes:
+            try:
+                if node.getParent():
+                    node.setParent(None)
+            except Exception:
+                pass
+        self._path_isolate_preview_nodes.clear()
+
+    def _clearPathIsolateTargetPreview(self):
+        if self._path_isolate_target_preview_node is None:
+            return
+        try:
+            if self._path_isolate_target_preview_node.getParent():
+                self._path_isolate_target_preview_node.setParent(None)
+        except Exception:
+            pass
+        self._path_isolate_target_preview_node = None
+
+    def _isPathSelectionEnabled(self) -> bool:
+        return self._cut_mode in (self.CUT_MODE_PATH, self.CUT_MODE_PATH_ISOLATE)
+
+    def _getWaypointModeLabel(self) -> str:
+        if self._cut_mode == self.CUT_MODE_PATH_ISOLATE:
+            return "Path isolate"
+        if self._cut_mode == self.CUT_MODE_PATH:
+            return "Path mode"
+        return "Point mode"
+
+    def _setSelectedPathWaypoint(self, index: Optional[int]) -> None:
+        if not self._isPathSelectionEnabled():
+            index = None
+        elif index is not None and (index < 0 or index >= len(self._path_waypoints)):
+            index = None
+
+        if index == self._selected_path_waypoint_index:
+            return
+
+        self._selected_path_waypoint_index = index
+        self._rebuildPathWaypointMarkers()
+        if index is None:
+            Logger.log("i", "%s: cleared point selection", self._getWaypointModeLabel())
+        else:
+            Logger.log("i", "%s: selected waypoint %d", self._getWaypointModeLabel(), index + 1)
+        self.propertyChanged.emit()
+
+    def _getWaypointMarkerColor(self, index: int) -> numpy.ndarray:
+        if self._isPathSelectionEnabled() and index == self._selected_path_waypoint_index:
+            return numpy.array([0.82, 0.18, 0.18, 1.0], dtype=numpy.float32)
+        return numpy.array([0.0, 0.0, 0.0, 1.0], dtype=numpy.float32)
+
+    def _rebuildPathWaypointMarkers(self):
+        self._clearWaypointPreviewNodes()
+        if self._path_node is None or not self._path_waypoints:
+            return
+        if not self._path_node.getMeshData():
+            return
+
+        dot_size = self._getWaypointDotSize(self._path_node)
+        scene_root = self._controller.getScene().getRoot()
+
+        for index, point in enumerate(self._path_waypoints):
+            marker_node = self._createPreviewNode()
+            vertices, indices = create_dot_mesh_data(
+                numpy.asarray(point, dtype=numpy.float64),
+                dot_size,
+            )
+            mesh_builder = MeshBuilder()
+            mesh_builder.setVertices(vertices)
+            mesh_builder.setIndices(indices)
+            n_verts = len(vertices)
+            color = self._getWaypointMarkerColor(index)
+            colors = numpy.tile(color, (n_verts, 1)).astype(numpy.float32)
+            mesh_builder.setColors(colors)
+            mesh_builder.calculateNormals()
+            marker_node.setMeshData(mesh_builder.build())
+            marker_node.setParent(scene_root)
+            self._path_preview_nodes.append(marker_node)
+
+    def _shouldInsertPathWaypoint(self) -> bool:
+        return (
+            self._cut_mode == self.CUT_MODE_PATH and
+            self._path_insert_mode and
+            len(self._path_waypoints) >= 2
+        )
+
     def _addPathWaypoint(self, position, picked_node):
         """Add a waypoint for path/anchor modes and show a visible dot marker."""
         pos_arr = numpy.array([position.x, position.y, position.z])
 
         # Ensure all waypoints are on the same node
         if self._path_node is not None and self._path_node != picked_node:
-            Logger.log("w", "Path mode: clicked a different object, clearing path")
+            Logger.log("w", "%s: clicked a different object, clearing point state", self._getWaypointModeLabel())
             self._clearPathWaypoints()
 
         self._path_node = picked_node
-        self._path_waypoints.append(pos_arr)
+        if self._cut_mode == self.CUT_MODE_PATH_ISOLATE and self._path_isolate_target_face_id is not None:
+            self._path_isolate_target_face_id = None
+            self._path_isolate_target_point = None
+            self._clearPathIsolateTargetPreview()
+            Logger.log("i", "Path isolate: cleared target selection because loop geometry changed")
+        if self._shouldInsertPathWaypoint():
+            self._path_waypoints, inserted_index = insert_waypoint_nearest_segment(
+                self._path_waypoints,
+                pos_arr,
+            )
+            Logger.log("i", "%s: inserted waypoint %d at %s", self._getWaypointModeLabel(), inserted_index + 1, pos_arr)
+        else:
+            self._path_waypoints, inserted_index = append_waypoint(self._path_waypoints, pos_arr)
+            Logger.log("i", "%s: appended waypoint %d at %s", self._getWaypointModeLabel(), inserted_index + 1, pos_arr)
+
+        if self._isPathSelectionEnabled():
+            self._selected_path_waypoint_index = inserted_index
+        else:
+            self._selected_path_waypoint_index = None
         self._clearSuggestedPath()  # Invalidate previous suggestion
-        Logger.log("i", "Path mode: added waypoint %d at %s",
-                   len(self._path_waypoints), pos_arr)
-
-        # Draw a dot marker at this point
-        if picked_node.getMeshData():
-            dot_size = self._getWaypointDotSize(picked_node)
-            marker_node = self._createPreviewNode()
-            vertices, indices = create_dot_mesh_data(pos_arr, dot_size)
-            mesh_builder = MeshBuilder()
-            mesh_builder.setVertices(vertices)
-            mesh_builder.setIndices(indices)
-            n_verts = len(vertices)
-            # Black dots for placed waypoints/anchors.
-            colors = numpy.array([[0.0, 0.0, 0.0, 1.0]] * n_verts, dtype=numpy.float32)
-            mesh_builder.setColors(colors)
-            mesh_builder.calculateNormals()
-            marker_node.setMeshData(mesh_builder.build())
-            scene_root = self._controller.getScene().getRoot()
-            marker_node.setParent(scene_root)
-            self._path_preview_nodes.append(marker_node)
-
+        self._rebuildPathWaypointMarkers()
         self.propertyChanged.emit()
 
     def _isPointPlacementMode(self) -> bool:
         return (
             self._cut_mode == self.CUT_MODE_PATH or
+            self._cut_mode == self.CUT_MODE_PATH_ISOLATE or
             (
                 self._multi_point_anchors_enabled and
                 self._cut_mode in (self.CUT_MODE_VALLEY, self.CUT_MODE_VALLEY_SEAM)
@@ -561,14 +844,16 @@ class ObjectSplitter(Tool):
     def _getWaypointDotSize(self, node) -> float:
         mesh_data = node.getMeshData()
         if mesh_data is None:
-            return 0.8
+            return 0.18 if self._path_small_markers else 0.8
         transformed = mesh_data.getTransformed(node.getWorldTransformation())
         verts = transformed.getVertices()
         if verts is None or len(verts) == 0:
-            return 0.8
+            return 0.18 if self._path_small_markers else 0.8
         mesh_size = verts.max(axis=0) - verts.min(axis=0)
         mesh_size_max = max(mesh_size[0], mesh_size[1], mesh_size[2])
-        return max(0.4, float(mesh_size_max) * 0.01)
+        scale = 0.0032 if self._path_small_markers else 0.01
+        minimum = 0.12 if self._path_small_markers else 0.4
+        return max(minimum, float(mesh_size_max) * scale)
 
     def _findNearbyWaypointIndex(self, position, picked_node) -> Optional[int]:
         if self._path_node is None or self._path_node != picked_node:
@@ -583,7 +868,9 @@ class ObjectSplitter(Tool):
 
         dists = numpy.linalg.norm(waypoints - pos_arr[None, :], axis=1)
         idx = int(numpy.argmin(dists))
-        pick_radius = max(0.9, self._getWaypointDotSize(picked_node) * 2.5)
+        min_pick_radius = 0.22 if self._path_small_markers else 0.9
+        radius_scale = 1.7 if self._path_small_markers else 2.5
+        pick_radius = max(min_pick_radius, self._getWaypointDotSize(picked_node) * radius_scale)
         if float(dists[idx]) <= pick_radius:
             return idx
         return None
@@ -605,7 +892,8 @@ class ObjectSplitter(Tool):
         mesh_builder.setVertices(vertices)
         mesh_builder.setIndices(indices)
         n_verts = len(vertices)
-        colors = numpy.array([[0.0, 0.0, 0.0, 1.0]] * n_verts, dtype=numpy.float32)
+        color = self._getWaypointMarkerColor(index)
+        colors = numpy.tile(color, (n_verts, 1)).astype(numpy.float32)
         mesh_builder.setColors(colors)
         mesh_builder.calculateNormals()
         marker_node.setMeshData(mesh_builder.build())
@@ -621,6 +909,158 @@ class ObjectSplitter(Tool):
         self._path_waypoints[index] = pos_arr
         self._clearSuggestedPath()
         self._updateWaypointMarker(index)
+
+    def _rebuildPathIsolateLoopMarkers(self):
+        self._clearPathIsolatePreviewNodes()
+        if self._path_node is None or not self._path_isolate_loops:
+            return
+        if not self._path_node.getMeshData():
+            return
+
+        dot_size = self._getWaypointDotSize(self._path_node) * 0.9
+        scene_root = self._controller.getScene().getRoot()
+        loop_color = numpy.array([0.08, 0.55, 0.18, 0.95], dtype=numpy.float32)
+
+        for loop in self._path_isolate_loops:
+            for point in loop:
+                marker_node = self._createPreviewNode()
+                vertices, indices = create_dot_mesh_data(
+                    numpy.asarray(point, dtype=numpy.float64),
+                    dot_size,
+                )
+                mesh_builder = MeshBuilder()
+                mesh_builder.setVertices(vertices)
+                mesh_builder.setIndices(indices)
+                colors = numpy.tile(loop_color, (len(vertices), 1)).astype(numpy.float32)
+                mesh_builder.setColors(colors)
+                mesh_builder.calculateNormals()
+                marker_node.setMeshData(mesh_builder.build())
+                marker_node.setParent(scene_root)
+                self._path_isolate_preview_nodes.append(marker_node)
+
+    def _rebuildPathIsolateTargetMarker(self):
+        self._clearPathIsolateTargetPreview()
+        if self._path_node is None or self._path_isolate_target_point is None:
+            return
+        dot_size = self._getWaypointDotSize(self._path_node) * 1.15
+        marker_node = self._createPreviewNode()
+        vertices, indices = create_dot_mesh_data(
+            numpy.asarray(self._path_isolate_target_point, dtype=numpy.float64),
+            dot_size,
+        )
+        mesh_builder = MeshBuilder()
+        mesh_builder.setVertices(vertices)
+        mesh_builder.setIndices(indices)
+        colors = numpy.tile(
+            numpy.array([0.95, 0.45, 0.05, 1.0], dtype=numpy.float32),
+            (len(vertices), 1),
+        ).astype(numpy.float32)
+        mesh_builder.setColors(colors)
+        mesh_builder.calculateNormals()
+        marker_node.setMeshData(mesh_builder.build())
+        scene_root = self._controller.getScene().getRoot()
+        marker_node.setParent(scene_root)
+        self._path_isolate_target_preview_node = marker_node
+
+    def _clearCurrentPathLoop(self):
+        self._path_waypoints.clear()
+        self._selected_path_waypoint_index = None
+        self._drag_waypoint_index = None
+        self._drag_waypoint_node = None
+        self._clearSuggestedPath()
+        self._clearWaypointPreviewNodes()
+        self.propertyChanged.emit()
+
+    def _startNewPathLoop(self):
+        if self._cut_mode != self.CUT_MODE_PATH_ISOLATE:
+            return
+        if len(self._path_waypoints) < 3:
+            Logger.log("w", "Path isolate: need at least 3 points before starting a new loop")
+            return
+
+        loop = [numpy.asarray(point, dtype=numpy.float64).copy() for point in self._path_waypoints]
+        if not numpy.allclose(loop[0], loop[-1]):
+            loop.append(loop[0].copy())
+        if self._path_isolate_target_face_id is not None:
+            self._path_isolate_target_face_id = None
+            self._path_isolate_target_point = None
+            self._clearPathIsolateTargetPreview()
+            Logger.log("i", "Path isolate: cleared target selection because loop set changed")
+        self._path_isolate_loops.append(loop)
+        Logger.log("i", "Path isolate: finalized loop %d with %d points", len(self._path_isolate_loops), len(loop) - 1)
+        self._clearCurrentPathLoop()
+        self._rebuildPathIsolateLoopMarkers()
+        self.propertyChanged.emit()
+
+    def _armPathIsolateTargetPick(self):
+        if self._cut_mode != self.CUT_MODE_PATH_ISOLATE:
+            return
+        if not self._path_isolate_loops:
+            Logger.log("w", "Path isolate: add at least one closed loop before picking a target")
+            return
+        if self._path_waypoints:
+            Logger.log("w", "Path isolate: finish or clear the current loop before picking a target")
+            return
+        self._path_isolate_target_pick_active = True
+        Logger.log("i", "Path isolate: click the region you want to extract")
+        self.propertyChanged.emit()
+
+    def _setPathIsolateTargetFromClick(self, picked_node, picked_position) -> None:
+        if self._cut_mode != self.CUT_MODE_PATH_ISOLATE:
+            return
+        if self._path_node is not None and self._path_node != picked_node:
+            Logger.log("w", "Path isolate: clicked a different object while picking target, clearing state")
+            self._clearPathWaypoints()
+            return
+        if self._path_node is None:
+            self._path_node = picked_node
+
+        extraction = self._extractTrimesh(picked_node)
+        if extraction is None:
+            self._path_isolate_target_pick_active = False
+            self.propertyChanged.emit()
+            return
+
+        tm, _, _ = extraction
+        point_arr = numpy.array([picked_position.x, picked_position.y, picked_position.z], dtype=numpy.float64)
+        snapped_point, face_id = snap_point_to_mesh_surface(tm, point_arr)
+        if face_id is None:
+            Logger.log("w", "Path isolate: could not determine a target face from that click")
+            self._path_isolate_target_pick_active = False
+            self.propertyChanged.emit()
+            return
+
+        self._path_isolate_target_point = numpy.asarray(snapped_point, dtype=numpy.float64)
+        self._path_isolate_target_face_id = int(face_id)
+        self._path_isolate_target_pick_active = False
+        self._rebuildPathIsolateTargetMarker()
+        Logger.log("i", "Path isolate: target selected on face %d at %s", int(face_id), self._path_isolate_target_point)
+        self.propertyChanged.emit()
+
+    def _removeSelectedPathWaypoint(self):
+        if not self.getHasSelectedPathPoint():
+            return
+        removed_index = int(self._selected_path_waypoint_index)
+        self._path_waypoints, self._selected_path_waypoint_index = remove_selected_waypoint(
+            self._path_waypoints,
+            removed_index,
+        )
+        self._clearSuggestedPath()
+        self._rebuildPathWaypointMarkers()
+        if self._selected_path_waypoint_index is None:
+            Logger.log("i", "%s: removed waypoint %d, selection cleared", self._getWaypointModeLabel(), removed_index + 1)
+        else:
+            Logger.log(
+                "i",
+                "%s: removed waypoint %d, selected waypoint %d",
+                self._getWaypointModeLabel(),
+                removed_index + 1,
+                self._selected_path_waypoint_index + 1,
+            )
+        if not self._path_waypoints:
+            if not self._path_isolate_loops:
+                self._path_node = None
+        self.propertyChanged.emit()
 
     def _dragWaypointToMouse(self, mouse_x: float, mouse_y: float):
         if self._drag_waypoint_index is None or self._drag_waypoint_node is None:
@@ -714,6 +1154,9 @@ class ObjectSplitter(Tool):
 
     def _executePathCut(self):
         """Execute the cut along the accumulated path waypoints."""
+        if self._cut_mode != self.CUT_MODE_PATH:
+            Logger.log("w", "Path cut trigger is only valid in path mode")
+            return
         if len(self._path_waypoints) < 2:
             Logger.log("w", "Path mode: need at least 2 points to cut")
             return
@@ -728,6 +1171,34 @@ class ObjectSplitter(Tool):
             waypoints.append(waypoints[0].copy())
         self._clearPathWaypoints()
         self._performPathCut(node, waypoints)
+
+    def _executePathIsolate(self):
+        """Execute the multi-loop region isolation split."""
+        if self._cut_mode != self.CUT_MODE_PATH_ISOLATE:
+            Logger.log("w", "Path isolate trigger is only valid in path isolate mode")
+            return
+        if not self._path_isolate_loops:
+            Logger.log("w", "Path isolate: add at least one closed loop before isolating")
+            return
+        if self._path_waypoints:
+            Logger.log("w", "Path isolate: finish or clear the current loop before isolating")
+            return
+        if self._path_node is None:
+            Logger.log("w", "Path isolate: no node selected")
+            return
+        if self._path_isolate_target_face_id is None or self._path_isolate_target_point is None:
+            Logger.log("w", "Path isolate: pick a target region before isolating")
+            return
+
+        node = self._path_node
+        loops = [
+            [numpy.asarray(point, dtype=numpy.float64).copy() for point in loop]
+            for loop in self._path_isolate_loops
+        ]
+        target_face_id = int(self._path_isolate_target_face_id)
+        target_point = numpy.asarray(self._path_isolate_target_point, dtype=numpy.float64).copy()
+        self._clearPathWaypoints()
+        self._performPathIsolate(node, loops, target_face_id, target_point)
 
     def _executeAnchoredCut(self):
         """Execute valley/valley-seam cut using 1+ placed anchor points."""
@@ -817,11 +1288,18 @@ class ObjectSplitter(Tool):
                 return
 
             if self._isPointPlacementMode():
+                if (
+                    self._cut_mode == self.CUT_MODE_PATH_ISOLATE and
+                    self._path_isolate_target_pick_active
+                ):
+                    self._setPathIsolateTargetFromClick(picked_node, picked_position)
+                    return
                 hit_idx = self._findNearbyWaypointIndex(picked_position, picked_node)
                 if hit_idx is not None:
+                    if self._isPathSelectionEnabled():
+                        self._setSelectedPathWaypoint(hit_idx)
                     self._drag_waypoint_index = hit_idx
                     self._drag_waypoint_node = picked_node
-                    self._movePathWaypoint(hit_idx, picked_position)
                     Logger.log("d", "Dragging point %d", hit_idx + 1)
                     return
                 self._addPathWaypoint(picked_position, picked_node)
@@ -884,7 +1362,7 @@ class ObjectSplitter(Tool):
 
         # Path and anchor-placement modes do not need a hover arrow/normal preview.
         # Hiding it avoids visual lag and click-position confusion.
-        if self._cut_mode == self.CUT_MODE_PATH:
+        if self._cut_mode in (self.CUT_MODE_PATH, self.CUT_MODE_PATH_ISOLATE):
             self._removePreview()
             self._hover_node = picked_node
             return
@@ -1485,17 +1963,52 @@ class ObjectSplitter(Tool):
             # Find geodesic path through all waypoints
             vertex_path = chain_paths(tm, waypoints)
             Logger.log("i", "Path cut: geodesic path has %d vertices", len(vertex_path))
+            is_closed_path = (
+                len(vertex_path) >= 4 and int(vertex_path[0]) == int(vertex_path[-1])
+            )
 
             self._updateProgress("Partitioning faces...", 50)
 
             # Partition faces along the path
             face_set_a, face_set_b = partition_faces_by_path(tm, vertex_path)
-            Logger.log("i", "Path cut: partition %d / %d faces",
-                       len(face_set_a), len(face_set_b))
+            smaller_faces = min(len(face_set_a), len(face_set_b))
+            total_faces = max(1, len(tm.faces))
+            partition_ratio = float(smaller_faces) / float(total_faces)
+            Logger.log(
+                "i",
+                "Path cut: partition %d / %d faces (smaller=%.4f%%, closed=%s)",
+                len(face_set_a),
+                len(face_set_b),
+                partition_ratio * 100.0,
+                str(is_closed_path),
+            )
 
             if not face_set_a or not face_set_b:
                 Logger.log("e", "Path cut: failed to create valid partition")
                 self._closeProgress()
+                return
+
+            # Guard against pathological ribbon/necklace partitions where the
+            # path only carves out a tiny strip of triangles instead of
+            # producing a meaningful separation.
+            min_partition_ratio = 0.0005  # 0.05% of faces
+            min_partition_faces = 200
+            if smaller_faces < max(min_partition_faces, int(total_faces * min_partition_ratio)):
+                Logger.log(
+                    "w",
+                    "Path cut aborted: pathological tiny partition (%d/%d faces = %.4f%%). "
+                    "This usually means the path formed a narrow ribbon on the surface rather "
+                    "than a true separating seam.",
+                    smaller_faces,
+                    total_faces,
+                    partition_ratio * 100.0,
+                )
+                self._logPathHalfDiagnostics("input", tm)
+                Logger.log(
+                    "w",
+                    "Path cut hint: try a larger/cleaner closed loop, or repair the mesh if it has "
+                    "non-manifold/self-touching regions.",
+                )
                 return
 
             # Split using face sets (same as shortest/radial modes)
@@ -1503,9 +2016,9 @@ class ObjectSplitter(Tool):
             split_result = split_by_face_sets(
                 tm, face_set_a, face_set_b,
                 strategy_name="path_cut",
-                # For path cuts, enabling connectors benefits from watertight
-                # halves, so try hole-filling when connectors are requested.
-                attempt_hole_fill=self._connector_enabled,
+                # Path capping is controlled independently from connector
+                # generation so users can request sealed ends without pegs/holes.
+                attempt_hole_fill=(self._connector_enabled or self._path_cap_ends),
             )
 
             Logger.log("i", "Path cut split result: %s", split_result.summary())
@@ -1517,6 +2030,13 @@ class ObjectSplitter(Tool):
 
             mesh_upper = split_result.upper
             mesh_lower = split_result.lower
+
+            if self._connector_enabled and (
+                not bool(mesh_upper.is_watertight) or
+                not bool(mesh_lower.is_watertight)
+            ):
+                self._logPathHalfDiagnostics("upper", mesh_upper)
+                self._logPathHalfDiagnostics("lower", mesh_lower)
 
             # Path-mode connectors (non-planar): place at seam midpoint and use
             # centroid-separation as an approximate connector direction.
@@ -1532,47 +2052,206 @@ class ObjectSplitter(Tool):
                         )
                         self._updateProgress("Adding connectors...", 80)
                         path_points = numpy.asarray(tm.vertices[vertex_path], dtype=numpy.float64)
-                        connector_pos = numpy.asarray(
-                            path_points[len(path_points) // 2], dtype=numpy.float64
-                        )
-
-                        normal_guess = numpy.asarray(
+                        base_normal = numpy.asarray(
                             mesh_upper.centroid - mesh_lower.centroid, dtype=numpy.float64
                         )
-                        if numpy.linalg.norm(normal_guess) < 1e-9:
-                            normal_guess = numpy.asarray(
+                        if numpy.linalg.norm(base_normal) < 1e-9:
+                            base_normal = numpy.asarray(
                                 path_points[-1] - path_points[0], dtype=numpy.float64
                             )
+                        if numpy.linalg.norm(base_normal) < 1e-9:
+                            base_normal = numpy.array([0.0, 1.0, 0.0], dtype=numpy.float64)
 
-                        config = ConnectorConfig(
-                            enabled=True,
-                            diameter=self._connector_diameter,
-                            height=self._connector_height,
-                            clearance=self._connector_clearance,
-                            sides=self._connector_sides,
-                        )
-                        connector_result = add_connectors_at_position(
-                            mesh_upper=mesh_upper,
-                            mesh_lower=mesh_lower,
-                            connector_position=connector_pos,
-                            connector_normal=normal_guess,
-                            config=config,
-                        )
-                        if connector_result.connectors_added:
-                            mesh_upper = connector_result.upper
-                            mesh_lower = connector_result.lower
-                            Logger.log(
-                                "i",
-                                "Path connectors added: peg on %s, hole on %s (engine: %s)",
-                                connector_result.peg_on,
-                                connector_result.hole_on,
-                                connector_result.hole_engine,
-                            )
+                        base_diameter = float(self._connector_diameter)
+                        base_height = float(self._connector_height)
+                        base_clearance = float(self._connector_clearance)
+                        # Retry with smaller connectors when geometry is too
+                        # thin/complex for the default size at a candidate point.
+                        size_scales = [1.0, 0.85, 0.7]
+                        if base_diameter <= 1.2 or base_height <= 1.0:
+                            size_scales = [1.0]
+
+                        # Try multiple candidate points across the seam instead of
+                        # only the exact midpoint. This improves robustness on
+                        # organic meshes where a single point may be too close to
+                        # thin features or rough triangles for boolean subtraction.
+                        n_path = len(path_points)
+                        if n_path <= 2:
+                            candidate_indices = [n_path // 2]
                         else:
+                            if len(tm.faces) > 200000:
+                                # Prefer geometric center first; fall back to side
+                                # positions only if center fails.
+                                fraction_seeds = [0.50, 0.33, 0.67]
+                            else:
+                                fraction_seeds = [0.50, 0.25, 0.75]
+                            candidate_indices = []
+                            for frac in fraction_seeds:
+                                idx = int(round((n_path - 1) * frac))
+                                idx = max(1, min(n_path - 2, idx))
+                                if idx not in candidate_indices:
+                                    candidate_indices.append(idx)
+                            if not candidate_indices:
+                                candidate_indices = [n_path // 2]
+
+                        attempt_failures = []
+                        connector_added = False
+                        total_attempts = 0
+
+                        for idx in candidate_indices:
+                            connector_pos = numpy.asarray(path_points[idx], dtype=numpy.float64)
+
+                            # Estimate a local seam tangent and remove tangent
+                            # component from base normal for a cleaner cut-through
+                            # direction at this candidate point.
+                            prev_idx = max(0, idx - 1)
+                            next_idx = min(n_path - 1, idx + 1)
+                            tangent = numpy.asarray(
+                                path_points[next_idx] - path_points[prev_idx],
+                                dtype=numpy.float64,
+                            )
+
+                            local_normal = numpy.asarray(base_normal, dtype=numpy.float64)
+                            tan_len = numpy.linalg.norm(tangent)
+                            if tan_len > 1e-9:
+                                tangent = tangent / tan_len
+                                projected = local_normal - numpy.dot(local_normal, tangent) * tangent
+                                if numpy.linalg.norm(projected) > 1e-9:
+                                    local_normal = projected
+
+                            normal_variants = [local_normal, -local_normal]
+                            for normal_variant in normal_variants:
+                                # Refine candidate position toward the local
+                                # cross-section center to avoid placing the hole
+                                # directly on a seam edge.
+                                refined_pos = connector_pos
+                                upper_pos = None
+                                lower_pos = None
+                                try:
+                                    upper_pos = find_connector_position(
+                                        mesh_upper, connector_pos, normal_variant
+                                    )
+                                except Exception:
+                                    pass
+                                try:
+                                    lower_pos = find_connector_position(
+                                        mesh_lower, connector_pos, normal_variant
+                                    )
+                                except Exception:
+                                    pass
+
+                                if upper_pos is not None and lower_pos is not None:
+                                    refined_pos = 0.5 * (
+                                        numpy.asarray(upper_pos, dtype=numpy.float64) +
+                                        numpy.asarray(lower_pos, dtype=numpy.float64)
+                                    )
+                                elif upper_pos is not None:
+                                    refined_pos = numpy.asarray(upper_pos, dtype=numpy.float64)
+                                elif lower_pos is not None:
+                                    refined_pos = numpy.asarray(lower_pos, dtype=numpy.float64)
+
+                                # Small lateral offsets move the tool away from
+                                # numerically unstable seam-edge placements.
+                                position_variants = [numpy.asarray(refined_pos, dtype=numpy.float64)]
+                                side_dir = numpy.cross(normal_variant, tangent)
+                                side_len = numpy.linalg.norm(side_dir)
+                                if side_len > 1e-9:
+                                    side_dir = side_dir / side_len
+                                    lateral = max(0.15, base_diameter * 0.15)
+                                    position_variants.append(
+                                        numpy.asarray(refined_pos, dtype=numpy.float64) + side_dir * lateral
+                                    )
+                                    position_variants.append(
+                                        numpy.asarray(refined_pos, dtype=numpy.float64) - side_dir * lateral
+                                    )
+
+                                for scale in size_scales:
+                                    for pos_variant in position_variants:
+                                        total_attempts += 1
+                                        config = ConnectorConfig(
+                                            enabled=True,
+                                            diameter=max(0.6, base_diameter * scale),
+                                            height=max(0.6, base_height * scale),
+                                            clearance=base_clearance,
+                                            sides=self._connector_sides,
+                                        )
+
+                                        # Preferred path: cap-native connector deformation
+                                        # on matched cap patches (no boolean subtraction).
+                                        if (
+                                            split_result.cap_faces_upper and
+                                            split_result.cap_faces_lower
+                                        ):
+                                            cap_native_result = add_cap_native_connectors(
+                                                mesh_upper=mesh_upper,
+                                                mesh_lower=mesh_lower,
+                                                connector_position=pos_variant,
+                                                connector_normal=normal_variant,
+                                                cap_faces_upper=split_result.cap_faces_upper,
+                                                cap_faces_lower=split_result.cap_faces_lower,
+                                                config=config,
+                                            )
+                                            if cap_native_result.connectors_added:
+                                                mesh_upper = cap_native_result.upper
+                                                mesh_lower = cap_native_result.lower
+                                                Logger.log(
+                                                    "i",
+                                                    "Path connectors added: peg on %s, hole on %s "
+                                                    "(engine: %s, attempts=%d, scale=%.2f)",
+                                                    cap_native_result.peg_on,
+                                                    cap_native_result.hole_on,
+                                                    cap_native_result.hole_engine,
+                                                    total_attempts,
+                                                    scale,
+                                                )
+                                                connector_added = True
+                                                break
+
+                                        connector_result = add_connectors_at_position(
+                                            mesh_upper=mesh_upper,
+                                            mesh_lower=mesh_lower,
+                                            connector_position=pos_variant,
+                                            connector_normal=normal_variant,
+                                            config=config,
+                                        )
+                                        if connector_result.connectors_added:
+                                            mesh_upper = connector_result.upper
+                                            mesh_lower = connector_result.lower
+                                            Logger.log(
+                                                "i",
+                                                "Path connectors added: peg on %s, hole on %s "
+                                                "(engine: %s, attempts=%d, scale=%.2f)",
+                                                connector_result.peg_on,
+                                                connector_result.hole_on,
+                                                connector_result.hole_engine,
+                                                total_attempts,
+                                                scale,
+                                            )
+                                            connector_added = True
+                                            break
+
+                                        attempt_failures.append(
+                                            f"idx={idx},s={scale:.2f}: {connector_result.skipped_reason}"
+                                        )
+
+                                    if connector_added:
+                                        break
+
+                                if connector_added:
+                                    break
+
+                            if connector_added:
+                                break
+
+                        if not connector_added:
+                            preview = "; ".join(attempt_failures[:4])
+                            if len(attempt_failures) > 4:
+                                preview += f"; ... ({len(attempt_failures)} attempts)"
                             Logger.log(
                                 "w",
-                                "Path connectors skipped: %s",
-                                connector_result.skipped_reason,
+                                "Path connectors skipped after %d attempts: %s",
+                                total_attempts,
+                                preview if preview else "no connector candidate succeeded",
                             )
                     except Exception as e:
                         Logger.log("w", "Path connectors error: %s", str(e))
@@ -1606,6 +2285,200 @@ class ObjectSplitter(Tool):
             Logger.log("e", traceback.format_exc())
         finally:
             self._closeProgress()
+
+    def _performPathIsolate(self, node, loops, target_face_id: int, target_point: numpy.ndarray):
+        """Execute a multi-loop region isolation cut."""
+        try:
+            self._showProgress("Object Splitter", "Computing isolated region...", 0, 100)
+
+            extraction = self._extractTrimesh(node)
+            if extraction is None:
+                Logger.log("e", "Path isolate: failed to extract mesh")
+                return
+            tm, _, _ = extraction
+
+            Logger.log(
+                "i",
+                "Path isolate: %d loops on mesh with %d verts, %d faces (target_face=%d)",
+                len(loops),
+                len(tm.vertices),
+                len(tm.faces),
+                int(target_face_id),
+            )
+
+            from .core.path_cutter import chain_paths, isolate_region_by_loops
+
+            loop_vertex_paths = []
+            self._updateProgress("Tracing geodesic loops...", 25)
+            for loop_index, loop_waypoints in enumerate(loops):
+                if len(loop_waypoints) < 4:
+                    raise ValueError(f"Loop {loop_index + 1} needs at least 3 points")
+                loop_points = [numpy.asarray(point, dtype=numpy.float64).copy() for point in loop_waypoints]
+                if not numpy.allclose(loop_points[0], loop_points[-1]):
+                    loop_points.append(loop_points[0].copy())
+                vertex_path = chain_paths(tm, loop_points)
+                if len(vertex_path) < 4 or int(vertex_path[0]) != int(vertex_path[-1]):
+                    raise ValueError(f"Loop {loop_index + 1} did not resolve to a closed geodesic seam")
+                loop_vertex_paths.append(vertex_path)
+                Logger.log("i", "Path isolate: loop %d traced with %d vertices", loop_index + 1, len(vertex_path))
+
+            self._updateProgress("Isolating target component...", 55)
+            extracted_faces, remainder_faces = isolate_region_by_loops(
+                tm,
+                loop_vertex_paths,
+                int(target_face_id),
+            )
+            Logger.log(
+                "i",
+                "Path isolate: extracted %d faces, remainder %d faces (target=%s)",
+                len(extracted_faces),
+                len(remainder_faces),
+                str(numpy.asarray(target_point, dtype=numpy.float64)),
+            )
+
+            self._updateProgress("Splitting mesh...", 75)
+            split_result = split_by_face_sets(
+                tm,
+                extracted_faces,
+                remainder_faces,
+                strategy_name="path_isolate",
+                attempt_hole_fill=True,
+            )
+            Logger.log("i", "Path isolate split result: %s", split_result.summary())
+            if not split_result.success:
+                Logger.log("e", "Path isolate failed: %s", split_result.error)
+                return
+
+            mesh_extracted = split_result.upper
+            mesh_remainder = split_result.lower
+
+            if self._path_isolate_prune_tiny_fragments:
+                threshold = int(self._path_isolate_tiny_fragment_face_threshold)
+                mesh_extracted, removed_extracted, kept_extracted = prune_small_components(
+                    mesh_extracted,
+                    min_faces=threshold,
+                )
+                mesh_remainder, removed_remainder, kept_remainder = prune_small_components(
+                    mesh_remainder,
+                    min_faces=threshold,
+                )
+                Logger.log(
+                    "i",
+                    "Path isolate cleanup: threshold=%d faces | extracted removed=%d kept=%d | remainder removed=%d kept=%d",
+                    threshold,
+                    removed_extracted,
+                    kept_extracted,
+                    removed_remainder,
+                    kept_remainder,
+                )
+
+            if self._connector_enabled:
+                Logger.log("i", "Path isolate: connectors are disabled in this mode")
+
+            self._updateProgress("Creating isolated objects...", 90)
+            node_extracted = self._createMeshNode(
+                mesh_extracted.vertices,
+                mesh_extracted.faces,
+                node.getName() + " (Isolated)",
+            )
+            node_remainder = self._createMeshNode(
+                mesh_remainder.vertices,
+                mesh_remainder.faces,
+                node.getName() + " (Remainder)",
+            )
+
+            op = GroupedOperation()
+            scene_root = self._controller.getScene().getRoot()
+            op.addOperation(AddSceneNodeOperation(node_extracted, scene_root))
+            op.addOperation(AddSceneNodeOperation(node_remainder, scene_root))
+            op.addOperation(RemoveSceneNodeOperation(node))
+            op.push()
+
+            CuraApplication.getInstance().getController().getScene().sceneChanged.emit(node_extracted)
+            self._updateProgress("Done!", 100)
+            Logger.log(
+                "i",
+                "Path isolate complete: created '%s' and '%s'",
+                node_extracted.getName(),
+                node_remainder.getName(),
+            )
+
+        except Exception as e:
+            Logger.log("e", "Error during path isolate: %s", str(e))
+            import traceback
+            Logger.log("e", traceback.format_exc())
+        finally:
+            self._closeProgress()
+
+    def _logPathHalfDiagnostics(self, label: str, mesh):
+        """Log watertight/boundary diagnostics for one path-cut half."""
+        try:
+            is_watertight = bool(mesh.is_watertight)
+        except Exception:
+            is_watertight = False
+
+        face_count = len(mesh.faces) if hasattr(mesh, "faces") else 0
+        vert_count = len(mesh.vertices) if hasattr(mesh, "vertices") else 0
+        try:
+            euler = int(mesh.euler_number)
+        except Exception:
+            euler = -999
+
+        boundary_edges = 0
+        boundary_vertices = 0
+        try:
+            inv = numpy.asarray(mesh.edges_unique_inverse, dtype=numpy.int64)
+            if len(inv) > 0:
+                edge_use = numpy.bincount(inv, minlength=len(mesh.edges_unique))
+                boundary_mask = edge_use == 1
+                boundary_edges = int(numpy.sum(boundary_mask))
+                if boundary_edges > 0:
+                    bidx = numpy.where(boundary_mask)[0]
+                    bedges = numpy.asarray(mesh.edges_unique[bidx], dtype=numpy.int64)
+                    boundary_vertices = int(len(numpy.unique(bedges.reshape(-1))))
+        except Exception:
+            pass
+
+        loop_lengths = []
+        loop_points = []
+        try:
+            outline = mesh.outline()
+            loops = outline.discrete if (outline is not None and hasattr(outline, "discrete")) else []
+            for loop in loops:
+                pts = numpy.asarray(loop, dtype=numpy.float64)
+                if pts.ndim != 2 or pts.shape[0] < 2:
+                    continue
+                seg_len = float(numpy.linalg.norm(numpy.diff(pts, axis=0), axis=1).sum())
+                if numpy.linalg.norm(pts[0] - pts[-1]) > 1e-8:
+                    seg_len += float(numpy.linalg.norm(pts[-1] - pts[0]))
+                loop_lengths.append(seg_len)
+                loop_points.append(int(len(pts)))
+        except Exception:
+            pass
+
+        Logger.log(
+            "i",
+            "Path %s diagnostics: watertight=%s, faces=%d, verts=%d, euler=%d, "
+            "boundary_edges=%d, boundary_vertices=%d, loops=%d",
+            label,
+            str(is_watertight),
+            face_count,
+            vert_count,
+            euler,
+            boundary_edges,
+            boundary_vertices,
+            len(loop_lengths),
+        )
+
+        if loop_lengths:
+            ranked = sorted(
+                zip(loop_lengths, loop_points),
+                key=lambda t: t[0],
+                reverse=True,
+            )
+            top = ranked[:4]
+            summary = ", ".join([f"{lp}pts/{ll:.2f}mm" for ll, lp in top])
+            Logger.log("i", "Path %s boundary loops (largest): %s", label, summary)
 
     def _createMeshNode(self, vertices: numpy.ndarray, faces: numpy.ndarray, name: str) -> CuraSceneNode:
         """Create a new CuraSceneNode from vertices and faces."""

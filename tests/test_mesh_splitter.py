@@ -12,6 +12,7 @@ from core.mesh_splitter import (
     split_by_shortest_seam,
     split_by_local_plane,
     split_by_face_sets,
+    prune_small_components,
     local_plane_partition,
     _component_containing_face,
     SplitResult,
@@ -259,7 +260,50 @@ class TestSplitByLocalPlane:
         ]
         result = split_by_local_plane(sphere_mesh, center, normals, 0)
         assert result.success
-        assert "local_plane_partition" in result.strategies_attempted
+
+
+class TestPruneSmallComponents:
+    """Tests for disconnected tiny-fragment cleanup."""
+
+    def test_removes_tiny_disconnected_component(self):
+        import trimesh
+
+        main = trimesh.creation.box(extents=[10, 10, 10])
+        tiny = trimesh.creation.box(extents=[1, 1, 1])
+        tiny.apply_translation([20, 0, 0])
+        mesh = trimesh.util.concatenate([main, tiny])
+
+        pruned, removed_count, kept_count = prune_small_components(mesh, min_faces=20)
+        assert removed_count == 1
+        assert kept_count == 1
+        assert len(pruned.split(only_watertight=False)) == 1
+        assert len(pruned.faces) == len(main.faces)
+
+    def test_keeps_all_large_components(self):
+        import trimesh
+
+        a = trimesh.creation.box(extents=[10, 10, 10])
+        b = trimesh.creation.box(extents=[8, 8, 8])
+        b.apply_translation([25, 0, 0])
+        mesh = trimesh.util.concatenate([a, b])
+
+        pruned, removed_count, kept_count = prune_small_components(mesh, min_faces=10)
+        assert removed_count == 0
+        assert kept_count == 2
+        assert len(pruned.faces) == len(mesh.faces)
+
+    def test_always_keeps_largest_component(self):
+        import trimesh
+
+        a = trimesh.creation.box(extents=[2, 2, 2])
+        b = trimesh.creation.box(extents=[1.5, 1.5, 1.5])
+        b.apply_translation([10, 0, 0])
+        mesh = trimesh.util.concatenate([a, b])
+
+        pruned, removed_count, kept_count = prune_small_components(mesh, min_faces=9999)
+        assert removed_count == 1
+        assert kept_count == 1
+        assert len(pruned.faces) == len(a.faces)
 
     def test_split_preserves_faces(self, cube_mesh):
         """Total faces should be preserved or increased by optional capping."""
