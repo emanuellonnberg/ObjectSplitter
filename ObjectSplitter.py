@@ -32,6 +32,7 @@ from cura.Scene.CuraSceneNode import CuraSceneNode
 from cura.PickingPass import PickingPass
 
 from UM.Operations.GroupedOperation import GroupedOperation
+from UM.Operations.Operation import Operation
 from UM.Operations.AddSceneNodeOperation import AddSceneNodeOperation
 from UM.Operations.RemoveSceneNodeOperation import RemoveSceneNodeOperation
 from cura.Operations.SetParentOperation import SetParentOperation
@@ -112,6 +113,44 @@ from .core.path_editing import (
     insert_waypoint_nearest_segment,
     remove_selected_waypoint,
 )
+
+
+class _PathStateOperation(Operation):
+    """Undoable operation for ObjectSplitter path-editing state only."""
+
+    def __init__(self, tool, undo_state=None, redo_state=None) -> None:
+        super().__init__()
+        self._tool = tool
+        self._undo_state = undo_state
+        self._redo_state = redo_state
+
+    def undo(self) -> None:
+        if self._tool is not None and self._undo_state is not None:
+            self._tool._restorePathToolState(self._undo_state)
+
+    def redo(self) -> None:
+        if self._tool is not None and self._redo_state is not None:
+            self._tool._restorePathToolState(self._redo_state)
+
+
+class _PathStateGroupedOperation(GroupedOperation):
+    """Grouped scene operation that also restores ObjectSplitter path state on undo/redo."""
+
+    def __init__(self, tool, undo_state=None, redo_state=None) -> None:
+        super().__init__()
+        self._tool = tool
+        self._undo_state = undo_state
+        self._redo_state = redo_state
+
+    def undo(self) -> None:
+        super().undo()
+        if self._tool is not None and self._undo_state is not None:
+            self._tool._restorePathToolState(self._undo_state)
+
+    def redo(self) -> None:
+        super().redo()
+        if self._tool is not None and self._redo_state is not None:
+            self._tool._restorePathToolState(self._redo_state)
 
 
 class ObjectSplitter(Tool):
@@ -215,6 +254,7 @@ class ObjectSplitter(Tool):
         # (Value already loaded above.)
         self._drag_waypoint_index = None
         self._drag_waypoint_node = None
+        self._drag_waypoint_undo_state = None
         self._path_isolate_loops = []  # Finalized closed waypoint loops
         self._path_isolate_preview_nodes = []  # Preview markers for finalized loops
         self._path_isolate_target_pick_active = False
@@ -638,7 +678,7 @@ class ObjectSplitter(Tool):
 
     def setTriggerClearCurrentPathLoop(self, value: bool):
         if value:
-            self._clearCurrentPathLoop()
+            self._clearCurrentPathLoopUndoable()
 
     def getTriggerPickPathIsolateTarget(self) -> bool:
         return False
@@ -673,7 +713,7 @@ class ObjectSplitter(Tool):
     def setClearPathPoints(self, value: bool):
         """Called from QML to clear any placed points."""
         if value:
-            self._clearPathWaypoints()
+            self._clearPathWaypointsUndoable()
 
     def _clearPathWaypoints(self):
         """Clear all path waypoints and remove preview markers."""
@@ -682,6 +722,7 @@ class ObjectSplitter(Tool):
         self._selected_path_waypoint_index = None
         self._drag_waypoint_index = None
         self._drag_waypoint_node = None
+        self._drag_waypoint_undo_state = None
         self._path_isolate_loops.clear()
         self._path_isolate_target_pick_active = False
         self._path_isolate_target_point = None
@@ -692,6 +733,22 @@ class ObjectSplitter(Tool):
         self._clearPathIsolateTargetPreview()
         self._removePreview()
         self.propertyChanged.emit()
+
+    def _clearPathWaypointsUndoable(self):
+        undo_state = self._capturePathToolState()
+        self._clearPathWaypoints()
+        redo_state = self._capturePathToolState()
+        self._pushPathStateUndoOperation(undo_state, redo_state)
+
+    def _pushPathStateUndoOperation(self, undo_state: Optional[dict], redo_state: Optional[dict]) -> None:
+        """Push a path-state-only operation onto Cura's undo stack."""
+        if undo_state is None or redo_state is None:
+            return
+        try:
+            op = _PathStateOperation(self, undo_state=undo_state, redo_state=redo_state)
+            op.push()
+        except Exception as e:
+            Logger.log("w", "Could not push path edit undo operation: %s", str(e))
 
     def _clearSuggestedPath(self):
         """Remove suggested path preview markers."""
@@ -728,8 +785,77 @@ class ObjectSplitter(Tool):
             if self._path_isolate_target_preview_node.getParent():
                 self._path_isolate_target_preview_node.setParent(None)
         except Exception:
-            pass
+                pass
         self._path_isolate_target_preview_node = None
+
+    def _capturePathToolState(self) -> dict:
+        """Capture the current path/path-isolate editing state for undo/redo restore."""
+        return {
+            "cut_mode": self._cut_mode,
+            "path_node": self._path_node,
+            "path_waypoints": [
+                numpy.asarray(point, dtype=numpy.float64).copy()
+                for point in self._path_waypoints
+            ],
+            "selected_path_waypoint_index": self._selected_path_waypoint_index,
+            "path_isolate_loops": [
+                [numpy.asarray(point, dtype=numpy.float64).copy() for point in loop]
+                for loop in self._path_isolate_loops
+            ],
+            "path_isolate_target_pick_active": bool(self._path_isolate_target_pick_active),
+            "path_isolate_target_point": (
+                None if self._path_isolate_target_point is None
+                else numpy.asarray(self._path_isolate_target_point, dtype=numpy.float64).copy()
+            ),
+            "path_isolate_target_face_id": self._path_isolate_target_face_id,
+        }
+
+    def _restorePathToolState(self, state: Optional[dict]) -> None:
+        """Restore previously captured path/path-isolate editing state."""
+        if state is None:
+            return
+
+        self._clearSuggestedPath()
+        self._clearWaypointPreviewNodes()
+        self._clearPathIsolatePreviewNodes()
+        self._clearPathIsolateTargetPreview()
+        self._removePreview()
+
+        self._cut_mode = state.get("cut_mode", self._cut_mode)
+        self._path_node = state.get("path_node")
+        self._path_waypoints = [
+            numpy.asarray(point, dtype=numpy.float64).copy()
+            for point in state.get("path_waypoints", [])
+        ]
+        self._selected_path_waypoint_index = state.get("selected_path_waypoint_index")
+        self._drag_waypoint_index = None
+        self._drag_waypoint_node = None
+        self._path_isolate_loops = [
+            [numpy.asarray(point, dtype=numpy.float64).copy() for point in loop]
+            for loop in state.get("path_isolate_loops", [])
+        ]
+        self._path_isolate_target_pick_active = bool(
+            state.get("path_isolate_target_pick_active", False)
+        )
+        target_point = state.get("path_isolate_target_point")
+        self._path_isolate_target_point = (
+            None if target_point is None
+            else numpy.asarray(target_point, dtype=numpy.float64).copy()
+        )
+        self._path_isolate_target_face_id = state.get("path_isolate_target_face_id")
+
+        self._rebuildPathWaypointMarkers()
+        self._rebuildPathIsolateLoopMarkers()
+        self._rebuildPathIsolateTargetMarker()
+        Logger.log(
+            "i",
+            "Restored path editing state: mode=%s, waypoints=%d, loops=%d, target=%s",
+            self._cut_mode,
+            len(self._path_waypoints),
+            len(self._path_isolate_loops),
+            "yes" if self._path_isolate_target_face_id is not None else "no",
+        )
+        self.propertyChanged.emit()
 
     def _isPathSelectionEnabled(self) -> bool:
         return self._cut_mode in (self.CUT_MODE_PATH, self.CUT_MODE_PATH_ISOLATE)
@@ -800,6 +926,7 @@ class ObjectSplitter(Tool):
 
     def _addPathWaypoint(self, position, picked_node):
         """Add a waypoint for path/anchor modes and show a visible dot marker."""
+        undo_state = self._capturePathToolState()
         pos_arr = numpy.array([position.x, position.y, position.z])
 
         # Ensure all waypoints are on the same node
@@ -830,6 +957,8 @@ class ObjectSplitter(Tool):
         self._clearSuggestedPath()  # Invalidate previous suggestion
         self._rebuildPathWaypointMarkers()
         self.propertyChanged.emit()
+        redo_state = self._capturePathToolState()
+        self._pushPathStateUndoOperation(undo_state, redo_state)
 
     def _isPointPlacementMode(self) -> bool:
         return (
@@ -967,9 +1096,16 @@ class ObjectSplitter(Tool):
         self._selected_path_waypoint_index = None
         self._drag_waypoint_index = None
         self._drag_waypoint_node = None
+        self._drag_waypoint_undo_state = None
         self._clearSuggestedPath()
         self._clearWaypointPreviewNodes()
         self.propertyChanged.emit()
+
+    def _clearCurrentPathLoopUndoable(self):
+        undo_state = self._capturePathToolState()
+        self._clearCurrentPathLoop()
+        redo_state = self._capturePathToolState()
+        self._pushPathStateUndoOperation(undo_state, redo_state)
 
     def _startNewPathLoop(self):
         if self._cut_mode != self.CUT_MODE_PATH_ISOLATE:
@@ -978,6 +1114,7 @@ class ObjectSplitter(Tool):
             Logger.log("w", "Path isolate: need at least 3 points before starting a new loop")
             return
 
+        undo_state = self._capturePathToolState()
         loop = [numpy.asarray(point, dtype=numpy.float64).copy() for point in self._path_waypoints]
         if not numpy.allclose(loop[0], loop[-1]):
             loop.append(loop[0].copy())
@@ -991,6 +1128,8 @@ class ObjectSplitter(Tool):
         self._clearCurrentPathLoop()
         self._rebuildPathIsolateLoopMarkers()
         self.propertyChanged.emit()
+        redo_state = self._capturePathToolState()
+        self._pushPathStateUndoOperation(undo_state, redo_state)
 
     def _armPathIsolateTargetPick(self):
         if self._cut_mode != self.CUT_MODE_PATH_ISOLATE:
@@ -1001,16 +1140,22 @@ class ObjectSplitter(Tool):
         if self._path_waypoints:
             Logger.log("w", "Path isolate: finish or clear the current loop before picking a target")
             return
+        undo_state = self._capturePathToolState()
         self._path_isolate_target_pick_active = True
         Logger.log("i", "Path isolate: click the region you want to extract")
         self.propertyChanged.emit()
+        redo_state = self._capturePathToolState()
+        self._pushPathStateUndoOperation(undo_state, redo_state)
 
     def _setPathIsolateTargetFromClick(self, picked_node, picked_position) -> None:
         if self._cut_mode != self.CUT_MODE_PATH_ISOLATE:
             return
+        undo_state = self._capturePathToolState()
         if self._path_node is not None and self._path_node != picked_node:
             Logger.log("w", "Path isolate: clicked a different object while picking target, clearing state")
             self._clearPathWaypoints()
+            redo_state = self._capturePathToolState()
+            self._pushPathStateUndoOperation(undo_state, redo_state)
             return
         if self._path_node is None:
             self._path_node = picked_node
@@ -1019,6 +1164,8 @@ class ObjectSplitter(Tool):
         if extraction is None:
             self._path_isolate_target_pick_active = False
             self.propertyChanged.emit()
+            redo_state = self._capturePathToolState()
+            self._pushPathStateUndoOperation(undo_state, redo_state)
             return
 
         tm, _, _ = extraction
@@ -1028,6 +1175,8 @@ class ObjectSplitter(Tool):
             Logger.log("w", "Path isolate: could not determine a target face from that click")
             self._path_isolate_target_pick_active = False
             self.propertyChanged.emit()
+            redo_state = self._capturePathToolState()
+            self._pushPathStateUndoOperation(undo_state, redo_state)
             return
 
         self._path_isolate_target_point = numpy.asarray(snapped_point, dtype=numpy.float64)
@@ -1036,10 +1185,13 @@ class ObjectSplitter(Tool):
         self._rebuildPathIsolateTargetMarker()
         Logger.log("i", "Path isolate: target selected on face %d at %s", int(face_id), self._path_isolate_target_point)
         self.propertyChanged.emit()
+        redo_state = self._capturePathToolState()
+        self._pushPathStateUndoOperation(undo_state, redo_state)
 
     def _removeSelectedPathWaypoint(self):
         if not self.getHasSelectedPathPoint():
             return
+        undo_state = self._capturePathToolState()
         removed_index = int(self._selected_path_waypoint_index)
         self._path_waypoints, self._selected_path_waypoint_index = remove_selected_waypoint(
             self._path_waypoints,
@@ -1061,6 +1213,8 @@ class ObjectSplitter(Tool):
             if not self._path_isolate_loops:
                 self._path_node = None
         self.propertyChanged.emit()
+        redo_state = self._capturePathToolState()
+        self._pushPathStateUndoOperation(undo_state, redo_state)
 
     def _dragWaypointToMouse(self, mouse_x: float, mouse_y: float):
         if self._drag_waypoint_index is None or self._drag_waypoint_node is None:
@@ -1082,6 +1236,17 @@ class ObjectSplitter(Tool):
         if picked_position is None:
             return
         self._movePathWaypoint(self._drag_waypoint_index, picked_position)
+
+    def _finishWaypointDrag(self):
+        if self._drag_waypoint_index is None:
+            return
+        undo_state = self._drag_waypoint_undo_state
+        self._drag_waypoint_index = None
+        self._drag_waypoint_node = None
+        self._drag_waypoint_undo_state = None
+        if undo_state is not None:
+            redo_state = self._capturePathToolState()
+            self._pushPathStateUndoOperation(undo_state, redo_state)
 
     def _suggestPathFromPoints(self):
         """Compute a geodesic path suggestion from placed points and show dotted preview."""
@@ -1165,12 +1330,14 @@ class ObjectSplitter(Tool):
             return
 
         node = self._path_node
+        undo_state = self._capturePathToolState()
         waypoints = list(self._path_waypoints)  # Copy before clearing
         # Optionally close the loop
         if self._path_close_loop and len(waypoints) >= 3:
             waypoints.append(waypoints[0].copy())
         self._clearPathWaypoints()
-        self._performPathCut(node, waypoints)
+        redo_state = self._capturePathToolState()
+        self._performPathCut(node, waypoints, undo_state=undo_state, redo_state=redo_state)
 
     def _executePathIsolate(self):
         """Execute the multi-loop region isolation split."""
@@ -1191,6 +1358,7 @@ class ObjectSplitter(Tool):
             return
 
         node = self._path_node
+        undo_state = self._capturePathToolState()
         loops = [
             [numpy.asarray(point, dtype=numpy.float64).copy() for point in loop]
             for loop in self._path_isolate_loops
@@ -1198,7 +1366,15 @@ class ObjectSplitter(Tool):
         target_face_id = int(self._path_isolate_target_face_id)
         target_point = numpy.asarray(self._path_isolate_target_point, dtype=numpy.float64).copy()
         self._clearPathWaypoints()
-        self._performPathIsolate(node, loops, target_face_id, target_point)
+        redo_state = self._capturePathToolState()
+        self._performPathIsolate(
+            node,
+            loops,
+            target_face_id,
+            target_point,
+            undo_state=undo_state,
+            redo_state=redo_state,
+        )
 
     def _executeAnchoredCut(self):
         """Execute valley/valley-seam cut using 1+ placed anchor points."""
@@ -1229,16 +1405,14 @@ class ObjectSplitter(Tool):
                 if MouseEvent.LeftButton in buttons:
                     self._dragWaypointToMouse(event.x, event.y)
                     return
-                self._drag_waypoint_index = None
-                self._drag_waypoint_node = None
+                self._finishWaypointDrag()
 
             if self._show_preview:
                 self._updatePreview(event.x, event.y)
             return
 
         if event.type == Event.MouseReleaseEvent and self._drag_waypoint_index is not None:
-            self._drag_waypoint_index = None
-            self._drag_waypoint_node = None
+            self._finishWaypointDrag()
             return
 
         # (Right-click no longer triggers path cut — use the Cut button instead)
@@ -1300,6 +1474,7 @@ class ObjectSplitter(Tool):
                         self._setSelectedPathWaypoint(hit_idx)
                     self._drag_waypoint_index = hit_idx
                     self._drag_waypoint_node = picked_node
+                    self._drag_waypoint_undo_state = self._capturePathToolState()
                     Logger.log("d", "Dragging point %d", hit_idx + 1)
                     return
                 self._addPathWaypoint(picked_position, picked_node)
@@ -1931,7 +2106,7 @@ class ObjectSplitter(Tool):
             Logger.log("e", "Error during cut operation: %s", str(e))
         finally:
             self._closeProgress()
-    def _performPathCut(self, node, waypoints):
+    def _performPathCut(self, node, waypoints, undo_state=None, redo_state=None):
         """Execute a path-based cut using multiple waypoints."""
         try:
             self._showProgress("Object Splitter", "Computing path cut...", 0, 100)
@@ -2266,7 +2441,7 @@ class ObjectSplitter(Tool):
                 mesh_lower.vertices, mesh_lower.faces,
                 node.getName() + " (B)")
 
-            op = GroupedOperation()
+            op = _PathStateGroupedOperation(self, undo_state=undo_state, redo_state=redo_state)
             scene_root = self._controller.getScene().getRoot()
             op.addOperation(AddSceneNodeOperation(node_upper, scene_root))
             op.addOperation(AddSceneNodeOperation(node_lower, scene_root))
@@ -2286,7 +2461,15 @@ class ObjectSplitter(Tool):
         finally:
             self._closeProgress()
 
-    def _performPathIsolate(self, node, loops, target_face_id: int, target_point: numpy.ndarray):
+    def _performPathIsolate(
+        self,
+        node,
+        loops,
+        target_face_id: int,
+        target_point: numpy.ndarray,
+        undo_state=None,
+        redo_state=None,
+    ):
         """Execute a multi-loop region isolation cut."""
         try:
             self._showProgress("Object Splitter", "Computing isolated region...", 0, 100)
@@ -2387,7 +2570,7 @@ class ObjectSplitter(Tool):
                 node.getName() + " (Remainder)",
             )
 
-            op = GroupedOperation()
+            op = _PathStateGroupedOperation(self, undo_state=undo_state, redo_state=redo_state)
             scene_root = self._controller.getScene().getRoot()
             op.addOperation(AddSceneNodeOperation(node_extracted, scene_root))
             op.addOperation(AddSceneNodeOperation(node_remainder, scene_root))

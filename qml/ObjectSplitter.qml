@@ -234,6 +234,16 @@ Item {
             }
 
             Label {
+                width: parent.width
+                visible: UM.ActiveTool && UM.ActiveTool.properties.getValue("CutMode") === "path"
+                text: "Undo steps through point edits. After a path cut, Undo restores the original object and path points."
+                font: UM.Theme.getFont("default_italic")
+                color: UM.Theme.getColor("text_inactive")
+                wrapMode: Text.WordWrap
+                renderType: Text.NativeRendering
+            }
+
+            Label {
                 visible: UM.ActiveTool &&
                          UM.ActiveTool.properties.getValue("CutMode") === "path" &&
                          UM.ActiveTool.properties.getValue("HasSelectedPathPoint")
@@ -363,6 +373,15 @@ Item {
                 width: parent.width
                 visible: UM.ActiveTool && UM.ActiveTool.properties.getValue("PathSmallMarkers")
                 text: "Smaller dots and a smaller grab radius help place isolate-loop points closer together."
+                font: UM.Theme.getFont("default_italic")
+                color: UM.Theme.getColor("text_inactive")
+                wrapMode: Text.WordWrap
+                renderType: Text.NativeRendering
+            }
+
+            Label {
+                width: parent.width
+                text: "Undo steps through loop edits. After isolate, Undo restores the original object, loops, and target."
                 font: UM.Theme.getFont("default_italic")
                 color: UM.Theme.getColor("text_inactive")
                 wrapMode: Text.WordWrap
