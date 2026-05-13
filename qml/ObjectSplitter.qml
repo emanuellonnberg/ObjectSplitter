@@ -211,6 +211,41 @@ Item {
                 }
             }
 
+            Row {
+                spacing: Math.round(UM.Theme.getSize("default_margin").width / 2)
+
+                Label {
+                    height: UM.Theme.getSize("setting_control").height
+                    text: "Marker Color:"
+                    font: UM.Theme.getFont("default")
+                    color: UM.Theme.getColor("text")
+                    verticalAlignment: Text.AlignVCenter
+                    renderType: Text.NativeRendering
+                    width: 90
+                }
+
+                ComboBox {
+                    id: pathMarkerColorComboBox
+                    width: 140
+                    height: UM.Theme.getSize("setting_control").height
+                    property var colorNames: ["cyan", "yellow", "white", "black", "magenta", "green"]
+                    model: ["Cyan", "Yellow", "White", "Black", "Magenta", "Green"]
+                    currentIndex: {
+                        if (UM.ActiveTool) {
+                            var c = UM.ActiveTool.properties.getValue("PathMarkerColor")
+                            var idx = colorNames.indexOf(c)
+                            return idx >= 0 ? idx : 0
+                        }
+                        return 0
+                    }
+                    onActivated: {
+                        if (UM.ActiveTool) {
+                            UM.ActiveTool.setProperty("PathMarkerColor", colorNames[index])
+                        }
+                    }
+                }
+            }
+
             Label {
                 width: parent.width
                 visible: UM.ActiveTool &&
@@ -365,6 +400,41 @@ Item {
                 onClicked: {
                     if (UM.ActiveTool) {
                         UM.ActiveTool.setProperty("PathSmallMarkers", checked)
+                    }
+                }
+            }
+
+            Row {
+                spacing: Math.round(UM.Theme.getSize("default_margin").width / 2)
+
+                Label {
+                    height: UM.Theme.getSize("setting_control").height
+                    text: "Marker Color:"
+                    font: UM.Theme.getFont("default")
+                    color: UM.Theme.getColor("text")
+                    verticalAlignment: Text.AlignVCenter
+                    renderType: Text.NativeRendering
+                    width: 90
+                }
+
+                ComboBox {
+                    id: isolatePathMarkerColorComboBox
+                    width: 140
+                    height: UM.Theme.getSize("setting_control").height
+                    property var colorNames: ["cyan", "yellow", "white", "black", "magenta", "green"]
+                    model: ["Cyan", "Yellow", "White", "Black", "Magenta", "Green"]
+                    currentIndex: {
+                        if (UM.ActiveTool) {
+                            var c = UM.ActiveTool.properties.getValue("PathMarkerColor")
+                            var idx = colorNames.indexOf(c)
+                            return idx >= 0 ? idx : 0
+                        }
+                        return 0
+                    }
+                    onActivated: {
+                        if (UM.ActiveTool) {
+                            UM.ActiveTool.setProperty("PathMarkerColor", colorNames[index])
+                        }
                     }
                 }
             }

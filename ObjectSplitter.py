@@ -26,6 +26,7 @@ from UM.Mesh.MeshBuilder import MeshBuilder
 from UM.Scene.Selection import Selection
 from UM.Scene.SceneNode import SceneNode
 from UM.View.GL.OpenGL import OpenGL
+from UM.Resources import Resources
 
 from cura.CuraApplication import CuraApplication
 from cura.Scene.CuraSceneNode import CuraSceneNode
@@ -153,6 +154,54 @@ class _PathStateGroupedOperation(GroupedOperation):
             self._tool._restorePathToolState(self._redo_state)
 
 
+class _ColoredMarkerNode(SceneNode):
+    """Scene node rendered with a uniform RGBA color via Uranium's color.shader.
+
+    The default Cura mesh renderer ignores per-vertex colors and paints all
+    model nodes with the theme model color (yellow on the build plate). This
+    node overrides render() to queue itself with color.shader and a u_color
+    uniform so we get the requested marker color.
+    """
+
+    _shader_cache = None
+
+    def __init__(self, rgba):
+        super().__init__()
+        self.setName("ObjectSplitter_Marker")
+        self.setSelectable(False)
+        self.setCalculateBoundingBox(False)
+        self._rgba = numpy.asarray(rgba, dtype=numpy.float32).reshape(4)
+
+    def setColor(self, rgba) -> None:
+        self._rgba = numpy.asarray(rgba, dtype=numpy.float32).reshape(4)
+
+    def render(self, renderer) -> bool:
+        if _ColoredMarkerNode._shader_cache is None:
+            try:
+                shader = OpenGL.getInstance().createShaderProgram(
+                    Resources.getPath(Resources.Shaders, "color.shader")
+                )
+                # color.shader does not declare a binding for u_color; register
+                # one so RenderBatch.addItem(uniforms={"u_color": ...}) actually
+                # forwards the value via ShaderProgram.updateBindings().
+                shader.addBinding("u_color", "u_color")
+                _ColoredMarkerNode._shader_cache = shader
+            except Exception as exc:
+                Logger.log("w", "ObjectSplitter: failed to load color.shader: %s", exc)
+                _ColoredMarkerNode._shader_cache = False
+        shader = _ColoredMarkerNode._shader_cache
+        if not shader or self.getMeshData() is None:
+            return False
+        rgba_list = [float(c) for c in self._rgba]
+        renderer.queueNode(
+            self,
+            shader=shader,
+            transparent=(rgba_list[3] < 1.0),
+            uniforms={"u_color": rgba_list},
+        )
+        return True
+
+
 class ObjectSplitter(Tool):
     """Tool for splitting 3D objects into multiple parts by cutting along planes."""
 
@@ -198,6 +247,7 @@ class ObjectSplitter(Tool):
         prefs.addPreference("objectsplitter/multi_point_anchors_enabled", False)
         prefs.addPreference("objectsplitter/path_close_loop", True)
         prefs.addPreference("objectsplitter/path_small_markers", False)
+        prefs.addPreference("objectsplitter/path_marker_color", "cyan")
         prefs.addPreference("objectsplitter/path_cap_ends", True)
         prefs.addPreference("objectsplitter/path_isolate_prune_tiny_fragments", True)
         prefs.addPreference("objectsplitter/path_isolate_tiny_fragment_face_threshold", 80)
@@ -221,6 +271,12 @@ class ObjectSplitter(Tool):
         self._path_small_markers = (
             small_markers_pref if isinstance(small_markers_pref, bool)
             else str(small_markers_pref).strip().lower() in ("1", "true", "yes", "on")
+        )
+        marker_color_pref = str(prefs.getValue("objectsplitter/path_marker_color") or "cyan").strip().lower()
+        self._path_marker_color = (
+            marker_color_pref
+            if marker_color_pref in ("cyan", "yellow", "white", "black", "magenta", "green")
+            else "cyan"
         )
         path_cap_pref = prefs.getValue("objectsplitter/path_cap_ends")
         self._path_cap_ends = (
@@ -294,6 +350,7 @@ class ObjectSplitter(Tool):
             "PathCloseLoop",
             "PathCapEnds",
             "PathSmallMarkers",
+            "PathMarkerColor",
             "PathInsertMode",
             "HasSelectedPathPoint",
             "SelectedPathPointIndex",
@@ -572,6 +629,21 @@ class ObjectSplitter(Tool):
             self._rebuildPathIsolateLoopMarkers()
             self._rebuildPathIsolateTargetMarker()
             Logger.log("i", "Path markers: %s", "small" if enabled else "default")
+            self.propertyChanged.emit()
+
+    def getPathMarkerColor(self) -> str:
+        return self._path_marker_color
+
+    def setPathMarkerColor(self, value: str) -> None:
+        color_name = str(value or "cyan").strip().lower()
+        if color_name not in ("cyan", "yellow", "white", "black", "magenta", "green"):
+            color_name = "cyan"
+        if color_name != self._path_marker_color:
+            self._path_marker_color = color_name
+            prefs = Application.getInstance().getPreferences()
+            prefs.setValue("objectsplitter/path_marker_color", color_name)
+            self._rebuildPathWaypointMarkers()
+            Logger.log("i", "Path marker color: %s", color_name)
             self.propertyChanged.emit()
 
     def getPathIsolatePruneTinyFragments(self) -> bool:
@@ -887,7 +959,15 @@ class ObjectSplitter(Tool):
     def _getWaypointMarkerColor(self, index: int) -> numpy.ndarray:
         if self._isPathSelectionEnabled() and index == self._selected_path_waypoint_index:
             return numpy.array([0.82, 0.18, 0.18, 1.0], dtype=numpy.float32)
-        return numpy.array([0.0, 0.0, 0.0, 1.0], dtype=numpy.float32)
+        colors = {
+            "cyan": numpy.array([0.0, 0.9, 1.0, 1.0], dtype=numpy.float32),
+            "yellow": numpy.array([1.0, 0.88, 0.0, 1.0], dtype=numpy.float32),
+            "white": numpy.array([1.0, 1.0, 1.0, 1.0], dtype=numpy.float32),
+            "black": numpy.array([0.0, 0.0, 0.0, 1.0], dtype=numpy.float32),
+            "magenta": numpy.array([1.0, 0.0, 0.85, 1.0], dtype=numpy.float32),
+            "green": numpy.array([0.0, 0.95, 0.25, 1.0], dtype=numpy.float32),
+        }
+        return colors.get(self._path_marker_color, colors["cyan"])
 
     def _rebuildPathWaypointMarkers(self):
         self._clearWaypointPreviewNodes()
@@ -900,7 +980,8 @@ class ObjectSplitter(Tool):
         scene_root = self._controller.getScene().getRoot()
 
         for index, point in enumerate(self._path_waypoints):
-            marker_node = self._createPreviewNode()
+            color = self._getWaypointMarkerColor(index)
+            marker_node = self._createColoredMarkerNode(color)
             vertices, indices = create_dot_mesh_data(
                 numpy.asarray(point, dtype=numpy.float64),
                 dot_size,
@@ -908,10 +989,6 @@ class ObjectSplitter(Tool):
             mesh_builder = MeshBuilder()
             mesh_builder.setVertices(vertices)
             mesh_builder.setIndices(indices)
-            n_verts = len(vertices)
-            color = self._getWaypointMarkerColor(index)
-            colors = numpy.tile(color, (n_verts, 1)).astype(numpy.float32)
-            mesh_builder.setColors(colors)
             mesh_builder.calculateNormals()
             marker_node.setMeshData(mesh_builder.build())
             marker_node.setParent(scene_root)
@@ -1020,12 +1097,11 @@ class ObjectSplitter(Tool):
         mesh_builder = MeshBuilder()
         mesh_builder.setVertices(vertices)
         mesh_builder.setIndices(indices)
-        n_verts = len(vertices)
-        color = self._getWaypointMarkerColor(index)
-        colors = numpy.tile(color, (n_verts, 1)).astype(numpy.float32)
-        mesh_builder.setColors(colors)
         mesh_builder.calculateNormals()
         marker_node.setMeshData(mesh_builder.build())
+        color = self._getWaypointMarkerColor(index)
+        if isinstance(marker_node, _ColoredMarkerNode):
+            marker_node.setColor(color)
 
         scene_root = self._controller.getScene().getRoot()
         if marker_node.getParent() != scene_root:
@@ -1052,7 +1128,7 @@ class ObjectSplitter(Tool):
 
         for loop in self._path_isolate_loops:
             for point in loop:
-                marker_node = self._createPreviewNode()
+                marker_node = self._createColoredMarkerNode(loop_color)
                 vertices, indices = create_dot_mesh_data(
                     numpy.asarray(point, dtype=numpy.float64),
                     dot_size,
@@ -1060,8 +1136,6 @@ class ObjectSplitter(Tool):
                 mesh_builder = MeshBuilder()
                 mesh_builder.setVertices(vertices)
                 mesh_builder.setIndices(indices)
-                colors = numpy.tile(loop_color, (len(vertices), 1)).astype(numpy.float32)
-                mesh_builder.setColors(colors)
                 mesh_builder.calculateNormals()
                 marker_node.setMeshData(mesh_builder.build())
                 marker_node.setParent(scene_root)
@@ -1072,7 +1146,8 @@ class ObjectSplitter(Tool):
         if self._path_node is None or self._path_isolate_target_point is None:
             return
         dot_size = self._getWaypointDotSize(self._path_node) * 1.15
-        marker_node = self._createPreviewNode()
+        target_color = numpy.array([0.95, 0.45, 0.05, 1.0], dtype=numpy.float32)
+        marker_node = self._createColoredMarkerNode(target_color)
         vertices, indices = create_dot_mesh_data(
             numpy.asarray(self._path_isolate_target_point, dtype=numpy.float64),
             dot_size,
@@ -1080,11 +1155,6 @@ class ObjectSplitter(Tool):
         mesh_builder = MeshBuilder()
         mesh_builder.setVertices(vertices)
         mesh_builder.setIndices(indices)
-        colors = numpy.tile(
-            numpy.array([0.95, 0.45, 0.05, 1.0], dtype=numpy.float32),
-            (len(vertices), 1),
-        ).astype(numpy.float32)
-        mesh_builder.setColors(colors)
         mesh_builder.calculateNormals()
         marker_node.setMeshData(mesh_builder.build())
         scene_root = self._controller.getScene().getRoot()
@@ -1301,16 +1371,13 @@ class ObjectSplitter(Tool):
         if len(sampled) == 0 or not numpy.allclose(sampled[-1], path_points[-1]):
             sampled = numpy.vstack([sampled, path_points[-1]])
 
+        suggest_color = numpy.array([0.05, 0.45, 1.0, 0.95], dtype=numpy.float32)
         for pt in sampled:
-            marker_node = self._createPreviewNode()
+            marker_node = self._createColoredMarkerNode(suggest_color)
             vertices, indices = create_dot_mesh_data(pt, dot_size)
             mesh_builder = MeshBuilder()
             mesh_builder.setVertices(vertices)
             mesh_builder.setIndices(indices)
-            n_verts = len(vertices)
-            # Blue dotted line for suggested path.
-            colors = numpy.array([[0.05, 0.45, 1.0, 0.95]] * n_verts, dtype=numpy.float32)
-            mesh_builder.setColors(colors)
             mesh_builder.calculateNormals()
             marker_node.setMeshData(mesh_builder.build())
             scene_root = self._controller.getScene().getRoot()
@@ -1666,6 +1733,14 @@ class ObjectSplitter(Tool):
         node.setSelectable(False)
         node.setCalculateBoundingBox(False)
         return node
+
+    def _createColoredMarkerNode(self, rgba) -> SceneNode:
+        """Create a marker scene node rendered with the given RGBA color.
+
+        Uses color.shader so the marker shows its true color instead of the
+        Cura model theme color.
+        """
+        return _ColoredMarkerNode(rgba)
 
     def _removePreview(self):
         """Remove the preview plane from the scene."""
@@ -2108,6 +2183,7 @@ class ObjectSplitter(Tool):
             self._closeProgress()
     def _performPathCut(self, node, waypoints, undo_state=None, redo_state=None):
         """Execute a path-based cut using multiple waypoints."""
+        completed = False
         try:
             self._showProgress("Object Splitter", "Computing path cut...", 0, 100)
 
@@ -2447,6 +2523,7 @@ class ObjectSplitter(Tool):
             op.addOperation(AddSceneNodeOperation(node_lower, scene_root))
             op.addOperation(RemoveSceneNodeOperation(node))
             op.push()
+            completed = True
 
             CuraApplication.getInstance().getController().getScene().sceneChanged.emit(node_upper)
 
@@ -2459,6 +2536,9 @@ class ObjectSplitter(Tool):
             import traceback
             Logger.log("e", traceback.format_exc())
         finally:
+            if not completed and undo_state is not None:
+                Logger.log("i", "Path cut did not complete; restoring path editing state")
+                self._restorePathToolState(undo_state)
             self._closeProgress()
 
     def _performPathIsolate(
@@ -2471,6 +2551,7 @@ class ObjectSplitter(Tool):
         redo_state=None,
     ):
         """Execute a multi-loop region isolation cut."""
+        completed = False
         try:
             self._showProgress("Object Splitter", "Computing isolated region...", 0, 100)
 
@@ -2576,6 +2657,7 @@ class ObjectSplitter(Tool):
             op.addOperation(AddSceneNodeOperation(node_remainder, scene_root))
             op.addOperation(RemoveSceneNodeOperation(node))
             op.push()
+            completed = True
 
             CuraApplication.getInstance().getController().getScene().sceneChanged.emit(node_extracted)
             self._updateProgress("Done!", 100)
@@ -2591,6 +2673,9 @@ class ObjectSplitter(Tool):
             import traceback
             Logger.log("e", traceback.format_exc())
         finally:
+            if not completed and undo_state is not None:
+                Logger.log("i", "Path isolate did not complete; restoring path editing state")
+                self._restorePathToolState(undo_state)
             self._closeProgress()
 
     def _logPathHalfDiagnostics(self, label: str, mesh):
