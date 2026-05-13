@@ -205,6 +205,60 @@ def chain_paths(
 
 
 # ---------------------------------------------------------------------------
+# Helpers shared by partition and isolate
+# ---------------------------------------------------------------------------
+
+def _encode_undirected_edges(edges: numpy.ndarray, key_base: int) -> numpy.ndarray:
+    """Pack undirected (N,2) vertex-index edges into unique int64 keys."""
+    e = numpy.asarray(edges, dtype=numpy.int64)
+    a = numpy.minimum(e[:, 0], e[:, 1])
+    b = numpy.maximum(e[:, 0], e[:, 1])
+    return a * int(key_base) + b
+
+
+def _build_face_adj_csr(
+    mesh: "trimesh.Trimesh",
+    seam_edge_keys: Optional[numpy.ndarray],
+) -> Tuple[scipy.sparse.csr_matrix, numpy.ndarray, numpy.ndarray, int]:
+    """Build a face-adjacency CSR using trimesh's face_adjacency, with the
+    given seam edges removed.
+
+    Returns:
+        (csr, seam_face_pairs, seam_edge_pairs, key_base)
+        - csr: sparse face-adjacency, n_faces x n_faces, unweighted (data=1)
+        - seam_face_pairs: (S, 2) pairs of face indices straddling each seam edge
+        - seam_edge_pairs: (S, 2) corresponding vertex-pair edges
+        - key_base: encoding multiplier used so callers can build matching keys
+    """
+    fa = numpy.asarray(mesh.face_adjacency, dtype=numpy.int64)
+    fae = numpy.asarray(mesh.face_adjacency_edges, dtype=numpy.int64)
+    n_faces = len(mesh.faces)
+    n_verts = len(mesh.vertices)
+    key_base = max(n_verts + 1, 2)
+
+    if seam_edge_keys is not None and len(seam_edge_keys) > 0:
+        encoded_fae = _encode_undirected_edges(fae, key_base)
+        seam_mask = numpy.isin(encoded_fae, seam_edge_keys)
+    else:
+        seam_mask = numpy.zeros(len(fa), dtype=bool)
+
+    non_seam = fa[~seam_mask]
+    if len(non_seam):
+        rows = numpy.concatenate([non_seam[:, 0], non_seam[:, 1]])
+        cols = numpy.concatenate([non_seam[:, 1], non_seam[:, 0]])
+        data = numpy.ones(len(rows), dtype=numpy.int8)
+    else:
+        rows = numpy.empty(0, dtype=numpy.int64)
+        cols = numpy.empty(0, dtype=numpy.int64)
+        data = numpy.empty(0, dtype=numpy.int8)
+    csr = scipy.sparse.csr_matrix(
+        (data, (rows, cols)),
+        shape=(n_faces, n_faces),
+    )
+    return csr, fa[seam_mask], fae[seam_mask], key_base
+
+
+# ---------------------------------------------------------------------------
 # Partition faces by cutting path
 # ---------------------------------------------------------------------------
 
@@ -218,128 +272,97 @@ def partition_faces_by_path(
 
     Strategy:
     1. Identify all edges along the path.
-    2. Identify faces that are adjacent to the path (boundary faces).
+    2. Build a face-adjacency graph with those edges removed (scipy sparse).
     3. For each boundary face, determine which side of the path it's on
-       using the face's position relative to the path direction.
-    4. Flood-fill from each side to assign all remaining faces.
-
-    Args:
-        mesh: The trimesh object.
-        vertex_path: Ordered list of vertex indices forming the cutting path.
-
-    Returns:
-        (set_a, set_b): Two lists of face indices forming the partition.
+       using a local edge frame.
+    4. Multi-source Dijkstra on the face graph (C-backed via scipy) flood-
+       fills the remaining faces by nearest seeded side.
     """
     if len(vertex_path) < 2:
         raise ValueError("Path must have at least 2 vertices")
 
     n_faces = len(mesh.faces)
-    faces = numpy.asarray(mesh.faces, dtype=numpy.int64)
 
-    # 1. Build set of path edges (as frozensets for undirected lookup)
+    # 1. Collect path edges.
     oriented_path_edges = []
-    path_edges = set()
+    seam_edge_pairs_list = []
     for i in range(len(vertex_path) - 1):
         u = int(vertex_path[i])
         v = int(vertex_path[i + 1])
         if u == v:
             continue
         oriented_path_edges.append((u, v))
-        path_edges.add(frozenset((u, v)))
+        seam_edge_pairs_list.append((min(u, v), max(u, v)))
+    seam_edge_pairs_list = list(set(seam_edge_pairs_list))  # de-dup
     oriented_edge_lookup = set(oriented_path_edges)
-    path_vertex_set = set(vertex_path)
+    path_vertex_set = set(int(v) for v in vertex_path)
     is_closed_loop = (
         len(vertex_path) >= 4 and int(vertex_path[0]) == int(vertex_path[-1])
     )
 
-    logger.info("Path has %d edges, %d unique vertices",
-                len(path_edges), len(path_vertex_set))
+    vertices = numpy.asarray(mesh.vertices, dtype=numpy.float64)
+    centroids = numpy.asarray(mesh.triangles_center, dtype=numpy.float64)
+    face_normals = numpy.asarray(mesh.face_normals, dtype=numpy.float64)
+    n_verts = len(vertices)
+    key_base = max(n_verts + 1, 2)
 
-    # 2. Build face adjacency (shared-edge) and identify faces touching path
-    #    For each edge of each face, check if it's a path edge
-    face_adj = [[] for _ in range(n_faces)]
-    face_path_edges = {}  # face_idx → list of path edges it contains
+    if seam_edge_pairs_list:
+        seam_edge_pairs = numpy.asarray(seam_edge_pairs_list, dtype=numpy.int64)
+        seam_edge_keys = _encode_undirected_edges(seam_edge_pairs, key_base)
+    else:
+        seam_edge_pairs = numpy.empty((0, 2), dtype=numpy.int64)
+        seam_edge_keys = numpy.empty(0, dtype=numpy.int64)
 
-    # Build edge-to-face map
-    edge_to_faces = {}
-    for fi in range(n_faces):
-        f = faces[fi]
-        for j in range(3):
-            edge = frozenset((int(f[j]), int(f[(j + 1) % 3])))
-            if edge not in edge_to_faces:
-                edge_to_faces[edge] = []
-            edge_to_faces[edge].append(fi)
+    logger.info(
+        "Path has %d unique edges, %d unique vertices",
+        len(seam_edge_pairs),
+        len(path_vertex_set),
+    )
 
-    # Build adjacency and identify boundary faces
-    for edge, face_list in edge_to_faces.items():
-        is_path_edge = edge in path_edges
-        for i in range(len(face_list)):
-            for j in range(i + 1, len(face_list)):
-                fi, fj = face_list[i], face_list[j]
-                if is_path_edge:
-                    # These faces are on opposite sides of the path — don't connect
-                    if fi not in face_path_edges:
-                        face_path_edges[fi] = []
-                    face_path_edges[fi].append(edge)
-                    if fj not in face_path_edges:
-                        face_path_edges[fj] = []
-                    face_path_edges[fj].append(edge)
-                else:
-                    # Normal adjacency
-                    face_adj[fi].append(fj)
-                    face_adj[fj].append(fi)
+    # 2. Face adjacency CSR (scipy) minus seam edges.
+    face_adj_csr, seam_face_pairs, seam_edge_pairs_kept, _ = _build_face_adj_csr(
+        mesh, seam_edge_keys
+    )
+    seam_faces_array = numpy.unique(seam_face_pairs.ravel()) if len(seam_face_pairs) else numpy.empty(0, dtype=numpy.int64)
+    seam_faces_set = set(int(f) for f in seam_faces_array)
 
-    # Closed loops are better handled topologically than by local side
-    # heuristics: remove the seam edges and use the resulting face components.
-    if is_closed_loop and face_path_edges:
-        component_index, components = _connected_face_components(face_adj)
-        seam_faces = [int(face_index) for face_index in face_path_edges.keys()]
-        seam_component_ids = sorted({
-            int(component_index[face_index])
-            for face_index in seam_faces
-            if int(component_index[face_index]) >= 0
-        })
+    # Closed loops handled topologically via connected components.
+    if is_closed_loop and len(seam_faces_array):
+        n_components, labels = scipy.sparse.csgraph.connected_components(
+            face_adj_csr, directed=False, return_labels=True
+        )
+        seam_component_ids = sorted(set(int(labels[f]) for f in seam_faces_array))
 
         if len(seam_component_ids) >= 2:
             component_sizes = {
-                component_id: len(components[component_id])
-                for component_id in seam_component_ids
+                cid: int(numpy.sum(labels == cid))
+                for cid in seam_component_ids
             }
-            chosen_component_id = min(seam_component_ids, key=lambda cid: component_sizes[cid])
-            set_a = sorted(int(face_index) for face_index in components[chosen_component_id])
-            set_a_set = set(set_a)
-            set_b = [face_index for face_index in range(n_faces) if face_index not in set_a_set]
+            chosen_component_id = min(
+                seam_component_ids, key=lambda cid: component_sizes[cid]
+            )
+            set_a = numpy.where(labels == chosen_component_id)[0].tolist()
+            set_b = numpy.where(labels != chosen_component_id)[0].tolist()
             if len(set_a) > len(set_b):
                 set_a, set_b = set_b, set_a
             logger.info(
                 "Path partition: using closed-loop topological components (seam_faces=%d, seam_components=%s) -> %d / %d faces",
-                len(seam_faces),
+                len(seam_faces_array),
                 [component_sizes[cid] for cid in seam_component_ids],
                 len(set_a),
                 len(set_b),
             )
-            return set_a, set_b
+            return sorted(int(f) for f in set_a), [int(f) for f in set_b]
 
-    # 3. Assign initial sides for boundary faces.
-    #    Seed incident faces on opposite sides of each path edge using a local
-    #    edge frame. This is more stable on curved/non-linear paths than a
-    #    single global tangent test.
-    face_side = numpy.full(n_faces, -1, dtype=numpy.int32)  # -1 = unassigned
-    vertices = numpy.asarray(mesh.vertices, dtype=numpy.float64)
-    centroids = mesh.triangles_center
-    face_normals = numpy.asarray(mesh.face_normals, dtype=numpy.float64)
+    # 3. Seed boundary faces using the local edge frame for each seam edge.
+    face_side = numpy.full(n_faces, -1, dtype=numpy.int32)
     seed_votes = defaultdict(list)
 
-    for edge in path_edges:
-        incident = edge_to_faces.get(edge, [])
-        if len(incident) < 2:
-            continue
-
-        fi = int(incident[0])
-        fj = int(incident[1])
-        u, v = tuple(edge)
-        u = int(u)
-        v = int(v)
+    for row_index in range(len(seam_face_pairs)):
+        fi = int(seam_face_pairs[row_index, 0])
+        fj = int(seam_face_pairs[row_index, 1])
+        u = int(seam_edge_pairs_kept[row_index, 0])
+        v = int(seam_edge_pairs_kept[row_index, 1])
         if (v, u) in oriented_edge_lookup and (u, v) not in oriented_edge_lookup:
             u, v = v, u
 
@@ -450,73 +473,67 @@ def partition_faces_by_path(
     )
 
     if needs_global_seed or is_closed_loop:
-        for fi in face_path_edges:
+        for fi in seam_faces_set:
             if face_side[fi] >= 0 and not needs_global_seed:
                 continue
             face_side[fi] = _local_side_hint(fi)
 
-    seed_0 = numpy.where(face_side == 0)[0].tolist()
-    seed_1 = numpy.where(face_side == 1)[0].tolist()
-    if not seed_0 or not seed_1:
+    seed_0 = numpy.where(face_side == 0)[0]
+    seed_1 = numpy.where(face_side == 1)[0]
+    if seed_0.size == 0 or seed_1.size == 0:
         logger.warning(
             "Path partition: local seam seeding was one-sided (side0=%d, side1=%d); "
             "falling back to local path-side hints",
-            len(seed_0),
-            len(seed_1),
+            seed_0.size,
+            seed_1.size,
         )
         for fi in range(n_faces):
             face_side[fi] = _local_side_hint(fi)
-        seed_0 = numpy.where(face_side == 0)[0].tolist()
-        seed_1 = numpy.where(face_side == 1)[0].tolist()
-        if not seed_0 or not seed_1:
+        seed_0 = numpy.where(face_side == 0)[0]
+        seed_1 = numpy.where(face_side == 1)[0]
+        if seed_0.size == 0 or seed_1.size == 0:
             raise ValueError("Path partition could not determine both sides of the seam")
 
-    def _multi_source_face_distance(seed_faces: List[int]) -> numpy.ndarray:
-        dist = numpy.full(n_faces, -1, dtype=numpy.int32)
-        queue = deque()
-        for seed in seed_faces:
-            seed = int(seed)
-            if dist[seed] == 0:
-                continue
-            dist[seed] = 0
-            queue.append(seed)
+    # 4. Multi-source BFS via scipy on the face adjacency CSR. With
+    #    min_only=True and unweighted=True we get the BFS distance from each
+    #    face to its nearest seed in one C call per side.
+    dist_0 = scipy.sparse.csgraph.dijkstra(
+        face_adj_csr,
+        directed=False,
+        indices=seed_0.astype(numpy.int64),
+        unweighted=True,
+        min_only=True,
+    )
+    dist_1 = scipy.sparse.csgraph.dijkstra(
+        face_adj_csr,
+        directed=False,
+        indices=seed_1.astype(numpy.int64),
+        unweighted=True,
+        min_only=True,
+    )
 
-        while queue:
-            cur = queue.popleft()
-            next_dist = int(dist[cur]) + 1
-            for nb in face_adj[cur]:
-                if dist[nb] >= 0:
-                    continue
-                dist[nb] = next_dist
-                queue.append(nb)
-        return dist
+    unassigned = face_side == -1
+    d0u = dist_0[unassigned]
+    d1u = dist_1[unassigned]
+    both_inf = numpy.isinf(d0u) & numpy.isinf(d1u)
+    d0u_finite = numpy.where(numpy.isinf(d0u), numpy.inf, d0u)
+    d1u_finite = numpy.where(numpy.isinf(d1u), numpy.inf, d1u)
+    choose_0 = d0u_finite < d1u_finite
+    ties = (d0u_finite == d1u_finite) & ~both_inf
+    new_side = numpy.where(choose_0, 0, 1).astype(numpy.int32)
+    new_side[both_inf] = -1
 
-    # 4. Assign all faces by nearest seeded side in face-adjacency distance.
-    dist_0 = _multi_source_face_distance(seed_0)
-    dist_1 = _multi_source_face_distance(seed_1)
-    tie_count = 0
-    for fi in range(n_faces):
-        if face_side[fi] >= 0:
-            continue
+    unassigned_indices = numpy.where(unassigned)[0]
+    face_side[unassigned_indices] = new_side
+    tie_count = int(numpy.count_nonzero(ties))
+    if tie_count:
+        # Rare. Fall back to local hint only for tied faces.
+        tied_face_indices = unassigned_indices[ties]
+        for fi in tied_face_indices:
+            face_side[int(fi)] = _local_side_hint(int(fi))
 
-        d0 = int(dist_0[fi])
-        d1 = int(dist_1[fi])
-        if d0 < 0 and d1 < 0:
-            continue
-        if d0 < 0:
-            face_side[fi] = 1
-        elif d1 < 0:
-            face_side[fi] = 0
-        elif d0 < d1:
-            face_side[fi] = 0
-        elif d1 < d0:
-            face_side[fi] = 1
-        else:
-            face_side[fi] = _local_side_hint(fi)
-            tie_count += 1
-
-    # 5. Assign any remaining unassigned faces to the currently larger partition
-    #    (these are disconnected components with no seeded boundary contact).
+    # 5. Assign any remaining unassigned faces (disconnected components with
+    #    no seeded boundary contact) to the currently larger partition.
     count_0 = int(numpy.sum(face_side == 0))
     count_1 = int(numpy.sum(face_side == 1))
     default_side = 0 if count_0 >= count_1 else 1
@@ -524,8 +541,8 @@ def partition_faces_by_path(
 
     logger.info(
         "Path partition seeds: side0=%d side1=%d local_seed_faces=%d ties=%d closed=%s",
-        len(seed_0),
-        len(seed_1),
+        seed_0.size,
+        seed_1.size,
         len(seed_votes),
         tie_count,
         str(is_closed_loop),
@@ -534,69 +551,11 @@ def partition_faces_by_path(
     set_a = numpy.where(face_side == 0)[0].tolist()
     set_b = numpy.where(face_side == 1)[0].tolist()
 
-    # Ensure set_a is the smaller partition
     if len(set_a) > len(set_b):
         set_a, set_b = set_b, set_a
 
     logger.info("Path partition: %d / %d faces", len(set_a), len(set_b))
     return set_a, set_b
-
-
-def _build_face_graph_without_seams(
-    mesh: "trimesh.Trimesh",
-    seam_edges: Set[frozenset],
-) -> Tuple[Dict[frozenset, List[int]], List[List[int]], Dict[int, Set[frozenset]]]:
-    """Build edge-to-face and face adjacency while treating seam edges as barriers."""
-    faces = numpy.asarray(mesh.faces, dtype=numpy.int64)
-    n_faces = len(faces)
-    edge_to_faces: Dict[frozenset, List[int]] = {}
-    face_adj = [[] for _ in range(n_faces)]
-    face_seam_edges: Dict[int, Set[frozenset]] = defaultdict(set)
-
-    for face_index, face in enumerate(faces):
-        for offset in range(3):
-            edge = frozenset((int(face[offset]), int(face[(offset + 1) % 3])))
-            edge_to_faces.setdefault(edge, []).append(face_index)
-
-    for edge, face_list in edge_to_faces.items():
-        if edge in seam_edges:
-            for face_index in face_list:
-                face_seam_edges[int(face_index)].add(edge)
-            continue
-
-        for i in range(len(face_list)):
-            for j in range(i + 1, len(face_list)):
-                fi = int(face_list[i])
-                fj = int(face_list[j])
-                face_adj[fi].append(fj)
-                face_adj[fj].append(fi)
-
-    return edge_to_faces, face_adj, face_seam_edges
-
-
-def _connected_face_components(face_adj: List[List[int]]) -> Tuple[numpy.ndarray, List[List[int]]]:
-    """Compute connected components of the face graph."""
-    n_faces = len(face_adj)
-    component_index = numpy.full(n_faces, -1, dtype=numpy.int32)
-    components: List[List[int]] = []
-
-    for seed in range(n_faces):
-        if component_index[seed] >= 0:
-            continue
-        queue = deque([seed])
-        component_index[seed] = len(components)
-        component_faces = []
-        while queue:
-            current = queue.popleft()
-            component_faces.append(int(current))
-            for neighbor in face_adj[current]:
-                if component_index[neighbor] >= 0:
-                    continue
-                component_index[neighbor] = len(components)
-                queue.append(neighbor)
-        components.append(component_faces)
-
-    return component_index, components
 
 
 def isolate_region_by_loops(
@@ -620,7 +579,7 @@ def isolate_region_by_loops(
     if target_face_id is None or int(target_face_id) < 0 or int(target_face_id) >= n_faces:
         raise ValueError("Target face is invalid")
 
-    seam_edges: Set[frozenset] = set()
+    seam_edge_pairs_set: Set[Tuple[int, int]] = set()
     for loop_index, vertex_path in enumerate(loop_vertex_paths):
         if len(vertex_path) < 4:
             raise ValueError(f"Loop {loop_index + 1} needs at least 3 points")
@@ -635,30 +594,41 @@ def isolate_region_by_loops(
             v = int(end)
             if u == v:
                 continue
-            seam_edges.add(frozenset((u, v)))
+            seam_edge_pairs_set.add((min(u, v), max(u, v)))
             loop_edges += 1
         if loop_edges < 3:
             raise ValueError(f"Loop {loop_index + 1} did not resolve to a usable seam")
 
-    if not seam_edges:
+    if not seam_edge_pairs_set:
         raise ValueError("Loop seams were empty")
 
-    edge_to_faces, face_adj, face_seam_edges = _build_face_graph_without_seams(mesh, seam_edges)
-    seam_faces = {int(face_index) for face_index, edges in face_seam_edges.items() if edges}
-    if int(target_face_id) in seam_faces:
+    n_verts = len(mesh.vertices)
+    key_base = max(n_verts + 1, 2)
+    seam_edge_pairs = numpy.asarray(sorted(seam_edge_pairs_set), dtype=numpy.int64)
+    seam_edge_keys = _encode_undirected_edges(seam_edge_pairs, key_base)
+
+    face_adj_csr, seam_face_pairs, _, _ = _build_face_adj_csr(mesh, seam_edge_keys)
+    seam_faces_array = (
+        numpy.unique(seam_face_pairs.ravel())
+        if len(seam_face_pairs)
+        else numpy.empty(0, dtype=numpy.int64)
+    )
+    if int(target_face_id) in {int(f) for f in seam_faces_array}:
         raise ValueError("Target face lies on a seam; pick a face inside the desired region")
 
-    component_index, components = _connected_face_components(face_adj)
-    if len(components) < 2:
+    n_components, labels = scipy.sparse.csgraph.connected_components(
+        face_adj_csr, directed=False, return_labels=True
+    )
+    if n_components < 2:
         raise ValueError("Closed loop set does not separate the mesh into multiple regions")
 
-    target_component = int(component_index[int(target_face_id)])
-    if target_component < 0 or target_component >= len(components):
+    target_component = int(labels[int(target_face_id)])
+    if target_component < 0 or target_component >= n_components:
         raise ValueError("Could not determine the target component")
 
-    extracted_faces = sorted(int(face_index) for face_index in components[target_component])
-    extracted_face_set = set(extracted_faces)
-    remainder_faces = [face_index for face_index in range(n_faces) if face_index not in extracted_face_set]
+    extracted_mask = labels == target_component
+    extracted_faces = numpy.where(extracted_mask)[0].tolist()
+    remainder_faces = numpy.where(~extracted_mask)[0].tolist()
 
     if not extracted_faces or not remainder_faces:
         raise ValueError("Loop isolation produced a degenerate partition")
@@ -666,11 +636,11 @@ def isolate_region_by_loops(
     logger.info(
         "Path isolate: loops=%d seam_edges=%d seam_faces=%d components=%d extracted=%d remainder=%d",
         len(loop_vertex_paths),
-        len(seam_edges),
-        len(seam_faces),
-        len(components),
+        len(seam_edge_pairs),
+        len(seam_faces_array),
+        n_components,
         len(extracted_faces),
         len(remainder_faces),
     )
 
-    return extracted_faces, remainder_faces
+    return [int(f) for f in extracted_faces], [int(f) for f in remainder_faces]
