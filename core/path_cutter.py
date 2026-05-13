@@ -10,12 +10,14 @@ The full path defines a cutting seam, and faces are flood-filled on each side
 to create the partition.
 """
 
-import heapq
 import logging
 from collections import deque, defaultdict
 from typing import Dict, List, Set, Tuple, Optional
 
 import numpy
+import scipy.sparse
+import scipy.sparse.csgraph
+from scipy.spatial import cKDTree
 
 try:
     import trimesh
@@ -23,6 +25,67 @@ except ImportError:
     trimesh = None
 
 logger = logging.getLogger("objectsplitter.path_cutter")
+
+
+# ---------------------------------------------------------------------------
+# Mesh graph cache
+# ---------------------------------------------------------------------------
+
+class _MeshGraph:
+    """Precomputed mesh graph state shared across a chain_paths call.
+
+    Building the sparse CSR adjacency, KD-tree, and component labels once is
+    the difference between a fast scipy path and a slow per-segment rebuild
+    in pure Python.
+    """
+
+    __slots__ = ("vertices", "csr", "kdtree", "component_labels", "n_components")
+
+    def __init__(self, mesh: "trimesh.Trimesh"):
+        vertices = numpy.asarray(mesh.vertices, dtype=numpy.float64)
+        edges = numpy.asarray(mesh.edges_unique, dtype=numpy.int64)
+        n_verts = len(vertices)
+
+        edge_lengths = numpy.linalg.norm(
+            vertices[edges[:, 0]] - vertices[edges[:, 1]], axis=1
+        )
+        rows = numpy.concatenate([edges[:, 0], edges[:, 1]])
+        cols = numpy.concatenate([edges[:, 1], edges[:, 0]])
+        data = numpy.concatenate([edge_lengths, edge_lengths])
+        csr = scipy.sparse.csr_matrix(
+            (data, (rows, cols)), shape=(n_verts, n_verts)
+        )
+
+        n_components, labels = scipy.sparse.csgraph.connected_components(
+            csr, directed=False, return_labels=True
+        )
+
+        self.vertices = vertices
+        self.csr = csr
+        self.kdtree = cKDTree(vertices)
+        self.component_labels = labels
+        self.n_components = n_components
+
+
+def _dijkstra_path(graph: _MeshGraph, start: int, end: int) -> List[int]:
+    """Single-source Dijkstra (scipy/C) with predecessor reconstruction."""
+    dist, prev = scipy.sparse.csgraph.dijkstra(
+        graph.csr,
+        directed=False,
+        indices=int(start),
+        return_predecessors=True,
+    )
+    if numpy.isinf(dist[end]):
+        raise ValueError(f"No path between vertex {start} and {end}")
+    path: List[int] = []
+    v = int(end)
+    while v >= 0:
+        path.append(v)
+        if v == int(start):
+            break
+        v = int(prev[v])
+    path.reverse()
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -35,8 +98,8 @@ def find_geodesic_path(
     end_vertex: int,
 ) -> List[int]:
     """
-    Find the shortest geodesic path between two vertices using Dijkstra's
-    algorithm on the mesh edge graph.
+    Find the shortest geodesic path between two vertices using scipy's
+    sparse-graph Dijkstra on the mesh edge graph.
 
     Edge weights are Euclidean distances between connected vertices.
 
@@ -51,53 +114,8 @@ def find_geodesic_path(
     Raises:
         ValueError: If no path exists between the vertices.
     """
-    n_verts = len(mesh.vertices)
-    vertices = numpy.asarray(mesh.vertices, dtype=numpy.float64)
-
-    # Build adjacency list from mesh edges
-    edges = mesh.edges_unique
-    edge_lengths = numpy.linalg.norm(
-        vertices[edges[:, 0]] - vertices[edges[:, 1]], axis=1
-    )
-
-    adj = [[] for _ in range(n_verts)]
-    for i, (v0, v1) in enumerate(edges):
-        w = float(edge_lengths[i])
-        adj[v0].append((v1, w))
-        adj[v1].append((v0, w))
-
-    # Dijkstra
-    dist = numpy.full(n_verts, numpy.inf)
-    dist[start_vertex] = 0.0
-    prev = numpy.full(n_verts, -1, dtype=numpy.int64)
-    heap = [(0.0, start_vertex)]
-
-    while heap:
-        d, u = heapq.heappop(heap)
-        if d > dist[u]:
-            continue
-        if u == end_vertex:
-            break
-        for v, w in adj[u]:
-            nd = d + w
-            if nd < dist[v]:
-                dist[v] = nd
-                prev[v] = u
-                heapq.heappush(heap, (nd, v))
-
-    if numpy.isinf(dist[end_vertex]):
-        raise ValueError(
-            f"No path between vertex {start_vertex} and {end_vertex}"
-        )
-
-    # Reconstruct path
-    path = []
-    v = end_vertex
-    while v != -1:
-        path.append(v)
-        v = int(prev[v])
-    path.reverse()
-    return path
+    graph = _MeshGraph(mesh)
+    return _dijkstra_path(graph, int(start_vertex), int(end_vertex))
 
 
 def snap_to_nearest_vertex(
@@ -106,8 +124,9 @@ def snap_to_nearest_vertex(
 ) -> int:
     """Find the mesh vertex closest to a 3D point."""
     vertices = numpy.asarray(mesh.vertices, dtype=numpy.float64)
-    dists = numpy.linalg.norm(vertices - point, axis=1)
-    return int(numpy.argmin(dists))
+    tree = cKDTree(vertices)
+    _, idx = tree.query(numpy.asarray(point, dtype=numpy.float64))
+    return int(idx)
 
 
 # ---------------------------------------------------------------------------
@@ -133,66 +152,50 @@ def chain_paths(
     if len(waypoints) < 2:
         raise ValueError("Need at least 2 waypoints")
 
-    vertices = numpy.asarray(mesh.vertices, dtype=numpy.float64)
-    n_verts = len(vertices)
+    graph = _MeshGraph(mesh)
+    points = numpy.asarray(waypoints, dtype=numpy.float64).reshape(-1, 3)
 
-    # Snap all waypoints to nearest vertices
-    vert_indices = [snap_to_nearest_vertex(mesh, wp) for wp in waypoints]
+    # Bulk-snap waypoints to nearest vertices via KD-tree.
+    _, snapped = graph.kdtree.query(points)
+    vert_indices: List[int] = [int(v) for v in snapped]
 
-    # --- Connected-component check ---
-    # Build adjacency for component labelling
-    edges = mesh.edges_unique
-    comp_label = numpy.full(n_verts, -1, dtype=numpy.int64)
-    adj_quick = [[] for _ in range(n_verts)]
-    for v0, v1 in edges:
-        adj_quick[v0].append(v1)
-        adj_quick[v1].append(v0)
-
-    comp_id = 0
-    for seed in range(n_verts):
-        if comp_label[seed] >= 0:
-            continue
-        queue = deque([seed])
-        comp_label[seed] = comp_id
-        while queue:
-            u = queue.popleft()
-            for nb in adj_quick[u]:
-                if comp_label[nb] < 0:
-                    comp_label[nb] = comp_id
-                    queue.append(nb)
-        comp_id += 1
-
-    # Determine the target component (component of the first waypoint)
-    target_comp = int(comp_label[vert_indices[0]])
-    target_mask = comp_label == target_comp
+    target_comp = int(graph.component_labels[vert_indices[0]])
+    target_mask = graph.component_labels == target_comp
     target_verts_idx = numpy.where(target_mask)[0]
 
-    logger.info("Mesh has %d connected components; target component %d has %d vertices",
-                comp_id, target_comp, len(target_verts_idx))
+    logger.info(
+        "Mesh has %d connected components; target component %d has %d vertices",
+        graph.n_components, target_comp, len(target_verts_idx),
+    )
 
-    # Re-snap any waypoints that landed on a different component
-    for i in range(len(vert_indices)):
-        if int(comp_label[vert_indices[i]]) != target_comp:
-            # Find nearest vertex on the target component
-            dists = numpy.linalg.norm(
-                vertices[target_verts_idx] - waypoints[i], axis=1
-            )
-            best_local = int(numpy.argmin(dists))
-            old_v = vert_indices[i]
-            vert_indices[i] = int(target_verts_idx[best_local])
-            logger.info("Waypoint %d re-snapped: vertex %d (comp %d) → %d (comp %d)",
-                        i, old_v, int(comp_label[old_v]),
-                        vert_indices[i], target_comp)
+    # Re-snap any waypoints that landed on a different component.
+    if len(target_verts_idx) < len(graph.component_labels):
+        target_tree = cKDTree(graph.vertices[target_verts_idx])
+        for i in range(len(vert_indices)):
+            if int(graph.component_labels[vert_indices[i]]) != target_comp:
+                _, local_idx = target_tree.query(points[i])
+                old_v = vert_indices[i]
+                vert_indices[i] = int(target_verts_idx[int(local_idx)])
+                logger.info(
+                    "Waypoint %d re-snapped: vertex %d (comp %d) -> %d (comp %d)",
+                    i,
+                    old_v,
+                    int(graph.component_labels[old_v]),
+                    vert_indices[i],
+                    target_comp,
+                )
 
-    logger.info("Path waypoints: %d points → vertex indices %s",
-                len(waypoints), vert_indices)
+    logger.info(
+        "Path waypoints: %d points -> vertex indices %s",
+        len(waypoints),
+        vert_indices,
+    )
 
-    # Build chained path
-    full_path = []
+    # Build chained path using the cached graph.
+    full_path: List[int] = []
     for i in range(len(vert_indices) - 1):
-        segment = find_geodesic_path(mesh, vert_indices[i], vert_indices[i + 1])
+        segment = _dijkstra_path(graph, vert_indices[i], vert_indices[i + 1])
         if full_path and segment:
-            # Remove duplicate junction vertex
             full_path.extend(segment[1:])
         else:
             full_path.extend(segment)
