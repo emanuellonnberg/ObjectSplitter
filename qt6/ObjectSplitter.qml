@@ -84,17 +84,17 @@ Item {
                 id: cutModeComboBox
                 width: 170
                 height: UM.Theme.getSize("setting_control").height
-                model: ["Horizontal", "Vertical", "Smallest Section", "Shortest Seam", "Radial (geodesic)", "Path (multi-point)", "Path Isolate (multi-loop)", "Valley (groove)", "Valley Seam (concavity)"]
+                model: ["Multi-point", "Isolate region", "Horizontal", "Vertical", "Smallest Section", "Shortest Seam", "Radial (geodesic)", "Valley (groove)", "Valley Seam (concavity)"]
                 currentIndex: {
                     if (UM.ActiveTool) {
                         var mode = UM.ActiveTool.properties.getValue("CutMode")
-                        if (mode === "horizontal") return 0
-                        if (mode === "vertical") return 1
-                        if (mode === "smallest") return 2
-                        if (mode === "shortest") return 3
-                        if (mode === "radial") return 4
-                        if (mode === "path") return 5
-                        if (mode === "path_isolate") return 6
+                        if (mode === "path") return 0
+                        if (mode === "path_isolate") return 1
+                        if (mode === "horizontal") return 2
+                        if (mode === "vertical") return 3
+                        if (mode === "smallest") return 4
+                        if (mode === "shortest") return 5
+                        if (mode === "radial") return 6
                         if (mode === "valley") return 7
                         if (mode === "valley_seam") return 8
                     }
@@ -102,7 +102,7 @@ Item {
                 }
                 onActivated: {
                     if (UM.ActiveTool) {
-                        var modeMap = ["horizontal", "vertical", "smallest", "shortest", "radial", "path", "path_isolate", "valley", "valley_seam"]
+                        var modeMap = ["path", "path_isolate", "horizontal", "vertical", "smallest", "shortest", "radial", "valley", "valley_seam"]
                         UM.ActiveTool.setProperty("CutMode", modeMap[currentIndex])
                     }
                 }
