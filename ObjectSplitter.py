@@ -192,12 +192,11 @@ class _ColoredMarkerNode(SceneNode):
         shader = _ColoredMarkerNode._shader_cache
         if not shader or self.getMeshData() is None:
             return False
-        rgba_list = [float(c) for c in self._rgba]
         renderer.queueNode(
             self,
             shader=shader,
-            transparent=(rgba_list[3] < 1.0),
-            uniforms={"u_color": rgba_list},
+            transparent=(float(self._rgba[3]) < 1.0),
+            uniforms={"u_color": self._rgba},
         )
         return True
 
@@ -956,18 +955,20 @@ class ObjectSplitter(Tool):
             Logger.log("i", "%s: selected waypoint %d", self._getWaypointModeLabel(), index + 1)
         self.propertyChanged.emit()
 
+    _SELECTED_MARKER_COLOR = numpy.array([0.82, 0.18, 0.18, 1.0], dtype=numpy.float32)
+    _MARKER_COLORS = {
+        "cyan": numpy.array([0.0, 0.9, 1.0, 1.0], dtype=numpy.float32),
+        "yellow": numpy.array([1.0, 0.88, 0.0, 1.0], dtype=numpy.float32),
+        "white": numpy.array([1.0, 1.0, 1.0, 1.0], dtype=numpy.float32),
+        "black": numpy.array([0.0, 0.0, 0.0, 1.0], dtype=numpy.float32),
+        "magenta": numpy.array([1.0, 0.0, 0.85, 1.0], dtype=numpy.float32),
+        "green": numpy.array([0.0, 0.95, 0.25, 1.0], dtype=numpy.float32),
+    }
+
     def _getWaypointMarkerColor(self, index: int) -> numpy.ndarray:
         if self._isPathSelectionEnabled() and index == self._selected_path_waypoint_index:
-            return numpy.array([0.82, 0.18, 0.18, 1.0], dtype=numpy.float32)
-        colors = {
-            "cyan": numpy.array([0.0, 0.9, 1.0, 1.0], dtype=numpy.float32),
-            "yellow": numpy.array([1.0, 0.88, 0.0, 1.0], dtype=numpy.float32),
-            "white": numpy.array([1.0, 1.0, 1.0, 1.0], dtype=numpy.float32),
-            "black": numpy.array([0.0, 0.0, 0.0, 1.0], dtype=numpy.float32),
-            "magenta": numpy.array([1.0, 0.0, 0.85, 1.0], dtype=numpy.float32),
-            "green": numpy.array([0.0, 0.95, 0.25, 1.0], dtype=numpy.float32),
-        }
-        return colors.get(self._path_marker_color, colors["cyan"])
+            return self._SELECTED_MARKER_COLOR
+        return self._MARKER_COLORS.get(self._path_marker_color, self._MARKER_COLORS["cyan"])
 
     def _rebuildPathWaypointMarkers(self):
         self._clearWaypointPreviewNodes()
