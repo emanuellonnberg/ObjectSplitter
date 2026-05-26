@@ -1354,7 +1354,7 @@ class ObjectSplitter(Tool):
             path_points_list = []
             total = len(loop_sequences)
             for i, sequence in enumerate(loop_sequences):
-                progress = int(20 + 60 * (i / max(total, 1)))
+                progress = int(20 + 60 * (i / max(total - 1, 1)))
                 self._updateProgress(
                     "Tracing geodesic path %d/%d..." % (i + 1, total),
                     progress,
@@ -1426,16 +1426,12 @@ class ObjectSplitter(Tool):
         self._clearSuggestedPath()
         if not path_points_list:
             return
-        all_points = numpy.concatenate(
-            [p for p in path_points_list if p is not None and len(p) > 0],
-            axis=0,
-        )
-        if len(all_points) == 0:
+        valid_paths = [p for p in path_points_list if p is not None and len(p) > 0]
+        if not valid_paths:
             return
+        all_points = numpy.concatenate(valid_paths, axis=0)
         dot_size = self._suggestedPathDotSize(all_points)
-        for path_points in path_points_list:
-            if path_points is None or len(path_points) == 0:
-                continue
+        for path_points in valid_paths:
             self._appendSuggestedPathDots(path_points, dot_size)
 
     def _suggestedPathDotSize(self, path_points: numpy.ndarray) -> float:

@@ -523,7 +523,7 @@ Item {
 
                 Button {
                     text: "Pick Target Region"
-                    width: 140
+                    width: 125
                     height: UM.Theme.getSize("setting_control").height
                     enabled: UM.ActiveTool &&
                              UM.ActiveTool.properties.getValue("PathLoopCount") >= 1 &&
@@ -537,7 +537,7 @@ Item {
 
                 Button {
                     text: "Preview Loops"
-                    width: 120
+                    width: 115
                     height: UM.Theme.getSize("setting_control").height
                     enabled: UM.ActiveTool && (
                         UM.ActiveTool.properties.getValue("PathLoopCount") >= 1 ||
