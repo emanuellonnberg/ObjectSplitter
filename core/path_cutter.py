@@ -157,7 +157,7 @@ def chain_paths(
 
     # Bulk-snap waypoints to nearest vertices via KD-tree.
     _, snapped = graph.kdtree.query(points)
-    vert_indices: List[int] = [int(v) for v in snapped]
+    vert_indices: List[int] = snapped.tolist()
 
     target_comp = int(graph.component_labels[vert_indices[0]])
     target_mask = graph.component_labels == target_comp
@@ -352,7 +352,7 @@ def partition_faces_by_path(
                 len(set_a),
                 len(set_b),
             )
-            return sorted(int(f) for f in set_a), [int(f) for f in set_b]
+            return set_a, set_b
 
     # 3. Seed boundary faces using the local edge frame for each seam edge.
     face_side = numpy.full(n_faces, -1, dtype=numpy.int32)
@@ -643,4 +643,4 @@ def isolate_region_by_loops(
         len(remainder_faces),
     )
 
-    return [int(f) for f in extracted_faces], [int(f) for f in remainder_faces]
+    return extracted_faces, remainder_faces
