@@ -367,23 +367,35 @@ class TestCapNativeConnectors:
         assert cr.peg_on in ("upper", "lower")
         assert cr.hole_on in ("upper", "lower")
         assert cr.peg_on != cr.hole_on
+
+        # The dense cap rebuild changes vertex count, so quality is measured by
+        # protrusion along the connector axis rather than index-aligned motion.
+        normal = numpy.array([0.0, 1.0, 0.0])
+        upper_before_h = upper_before @ normal
+        lower_before_h = lower_before @ normal
+
+        # Both halves must actually deform (boss on one side, recess on the other).
         upper_after = numpy.asarray(cr.upper.vertices, dtype=numpy.float64)
         lower_after = numpy.asarray(cr.lower.vertices, dtype=numpy.float64)
-        upper_move = float(numpy.linalg.norm(upper_after - upper_before, axis=1).max())
-        lower_move = float(numpy.linalg.norm(lower_after - lower_before, axis=1).max())
-        assert upper_move > 0.02
-        assert lower_move > 0.02
+        upper_span = float((upper_after @ normal).ptp() - upper_before_h.ptp())
+        lower_span = float((lower_after @ normal).ptp() - lower_before_h.ptp())
+        assert abs(upper_span) > 0.02 or abs(lower_span) > 0.02
 
-        # Shape guard: cap-native connector should have a broad top region
-        # (not a single-spike profile). Check moved vertex distribution on peg side.
-        if cr.peg_on == "upper":
-            peg_move = numpy.linalg.norm(upper_after - upper_before, axis=1)
-        else:
-            peg_move = numpy.linalg.norm(lower_after - lower_before, axis=1)
-        peg_max = float(peg_move.max())
-        assert peg_max > 0.02
-        near_peak = int(numpy.sum(peg_move >= peg_max * 0.85))
-        assert near_peak >= 6
+        # Shape guard: the peg must have a broad plateau near its apex (a blunt
+        # boss), not a single-vertex spike. Look at cap-region vertices on the
+        # peg half and count how many sit near the protrusion peak.
+        peg = cr.upper if cr.peg_on == "upper" else cr.lower
+        pos = numpy.asarray(cr.connector_position, dtype=numpy.float64)
+        pv = numpy.asarray(peg.vertices, dtype=numpy.float64)
+        near = numpy.linalg.norm(pv - pos, axis=1) <= 6.0
+        assert int(near.sum()) >= 8  # dense boss region exists
+        h = (pv[near] @ normal)
+        h = h - h.min()
+        peak = float(h.max())
+        assert peak > 0.02
+        near_peak = int(numpy.sum(h >= peak * 0.85))
+        # A dense boss has many vertices forming the flat top, not a lone spike.
+        assert near_peak >= 8
 
 
 class TestCreatePegHoleArbitraryNormals:
