@@ -1956,6 +1956,27 @@ class ObjectSplitter(Tool):
             Logger.log("i", "Path cut: %d waypoints on mesh with %d verts, %d faces",
                        len(waypoints), len(tm.vertices), len(tm.faces))
 
+            # Optionally capture inputs for later offline replay / profiling.
+            if self._capture_dir:
+                try:
+                    from .core.debug_capture import capture_operation
+                    capture_path = capture_operation(
+                        mesh=tm,
+                        cut_mode=self._cut_mode,
+                        click_position=numpy.asarray(waypoints[0], dtype=numpy.float64),
+                        waypoints=waypoints,
+                        path_close_loop=self._path_close_loop,
+                        path_cap_ends=self._path_cap_ends,
+                        connector_enabled=self._connector_enabled,
+                        connector_diameter=self._connector_diameter,
+                        connector_height=self._connector_height,
+                        connector_clearance=self._connector_clearance,
+                        capture_dir=self._capture_dir,
+                    )
+                    Logger.log("i", "Debug capture (path) written to: %s", capture_path)
+                except Exception as e:
+                    Logger.log("w", "Debug capture (path) failed: %s", str(e))
+
             self._updateProgress("Computing geodesic path...", 20)
 
             from .core.path_cutter import chain_paths, partition_faces_by_path
