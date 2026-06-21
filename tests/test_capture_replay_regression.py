@@ -86,3 +86,52 @@ def test_replay_shortest_capture_preserves_face_partition():
 
     total_faces = len(split.upper.faces) + len(split.lower.faces)
     assert total_faces == len(mesh.faces)
+
+
+def test_path_capture_replay_roundtrip(tmp_path):
+    """
+    Capture a path (multi-point) operation synthetically and replay it.
+
+    This is the capture format the path/multi-point mode uses for offline
+    profiling; verify the roundtrip works end to end without a pre-existing
+    fixture.
+    """
+    import numpy
+    import trimesh
+    from core.debug_capture import capture_operation
+
+    mesh = trimesh.creation.icosphere(subdivisions=3, radius=10.0)
+
+    # A closed loop of waypoints around the equator (what multi-point produces
+    # with "close loop" enabled).
+    thetas = numpy.linspace(0, 2 * numpy.pi, 6, endpoint=False)
+    waypoints = [
+        numpy.array([10.0 * numpy.cos(t), 10.0 * numpy.sin(t), 0.0])
+        for t in thetas
+    ]
+    waypoints.append(waypoints[0].copy())  # close the loop
+
+    capture_dir = capture_operation(
+        mesh=mesh,
+        cut_mode="path",
+        click_position=waypoints[0],
+        waypoints=waypoints,
+        path_close_loop=True,
+        path_cap_ends=True,
+        connector_enabled=False,
+        connector_diameter=4.0,
+        connector_height=3.0,
+        connector_clearance=0.2,
+        capture_dir=str(tmp_path),
+    )
+
+    mesh_loaded, params = load_captured_operation(capture_dir)
+    assert params.cut_mode == "path"
+    assert params.waypoints is not None
+    assert len(params.waypoints) == len(waypoints)
+
+    result = replay_operation(capture_dir)
+    split = result["split_result"]
+    assert split.success
+    assert len(split.upper.faces) > 0
+    assert len(split.lower.faces) > 0
