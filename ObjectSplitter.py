@@ -192,11 +192,18 @@ class _ColoredMarkerNode(SceneNode):
         shader = _ColoredMarkerNode._shader_cache
         if not shader or self.getMeshData() is None:
             return False
+        # u_color MUST be a plain Python list of 4 floats. Cura's
+        # ShaderProgram._setUniformValueDirect dispatches on `type(value) is
+        # list` to build a QVector4D; a numpy.ndarray fails that strict check
+        # and is passed straight to Qt's setUniformValue, which raises
+        # "TypeError: arguments did not match any overloaded call" and crashes
+        # the render loop. Do not "optimise" this to pass self._rgba directly.
+        rgba = [float(c) for c in self._rgba]
         renderer.queueNode(
             self,
             shader=shader,
-            transparent=(float(self._rgba[3]) < 1.0),
-            uniforms={"u_color": self._rgba},
+            transparent=(rgba[3] < 1.0),
+            uniforms={"u_color": rgba},
         )
         return True
 
