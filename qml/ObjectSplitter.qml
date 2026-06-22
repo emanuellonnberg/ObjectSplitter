@@ -312,6 +312,7 @@ Item {
                 renderType: Text.NativeRendering
             }
 
+            // Point edit actions
             RowLayout {
                 width: parent.width
                 spacing: Math.round(UM.Theme.getSize("default_margin").width / 2)
@@ -340,35 +341,38 @@ Item {
                         }
                     }
                 }
-
-                Button {
-                    text: (UM.ActiveTool && UM.ActiveTool.properties.getValue("CutMode") === "path") ? "Cut Along Path" : "Cut Using Points"
-                    Layout.fillWidth: true
-                    Layout.preferredHeight: UM.Theme.getSize("setting_control").height
-                    enabled: UM.ActiveTool && (
-                        (UM.ActiveTool.properties.getValue("CutMode") === "path" && UM.ActiveTool.properties.getValue("PathPointCount") >= 2) ||
-                        (UM.ActiveTool.properties.getValue("CutMode") !== "path" && UM.ActiveTool.properties.getValue("PathPointCount") >= 1)
-                    )
-                    onClicked: {
-                        if (UM.ActiveTool) {
-                            if (UM.ActiveTool.properties.getValue("CutMode") === "path") {
-                                UM.ActiveTool.setProperty("TriggerPathCut", true)
-                            } else {
-                                UM.ActiveTool.setProperty("TriggerAnchoredCut", true)
-                            }
-                        }
-                    }
-                }
             }
 
+            // Preview the exact geodesic seam the cut will follow (same path
+            // computation as the cut itself, drawn as dots).
             Button {
-                text: "Suggest Path"
-                width: 120
+                text: "Preview Path"
+                width: parent.width
                 height: UM.Theme.getSize("setting_control").height
                 enabled: UM.ActiveTool && UM.ActiveTool.properties.getValue("PathPointCount") >= 2
                 onClicked: {
                     if (UM.ActiveTool) {
                         UM.ActiveTool.setProperty("TriggerSuggestPath", true)
+                    }
+                }
+            }
+
+            // Primary action
+            Button {
+                text: (UM.ActiveTool && UM.ActiveTool.properties.getValue("CutMode") === "path") ? "Cut Along Path" : "Cut Using Points"
+                width: parent.width
+                height: UM.Theme.getSize("setting_control").height
+                enabled: UM.ActiveTool && (
+                    (UM.ActiveTool.properties.getValue("CutMode") === "path" && UM.ActiveTool.properties.getValue("PathPointCount") >= 2) ||
+                    (UM.ActiveTool.properties.getValue("CutMode") !== "path" && UM.ActiveTool.properties.getValue("PathPointCount") >= 1)
+                )
+                onClicked: {
+                    if (UM.ActiveTool) {
+                        if (UM.ActiveTool.properties.getValue("CutMode") === "path") {
+                            UM.ActiveTool.setProperty("TriggerPathCut", true)
+                        } else {
+                            UM.ActiveTool.setProperty("TriggerAnchoredCut", true)
+                        }
                     }
                 }
             }
