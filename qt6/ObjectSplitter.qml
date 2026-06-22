@@ -85,26 +85,59 @@ Item {
                 id: cutModeComboBox
                 width: 170
                 height: UM.Theme.getSize("setting_control").height
-                model: ["Multi-point", "Isolate region", "Horizontal", "Vertical", "Smallest Section", "Shortest Seam", "Radial (geodesic)", "Valley (groove)", "Valley Seam (concavity)"]
+                property var modeValues: ["path", "path_isolate", "horizontal", "vertical"]
+                model: ["Multi-point", "Isolate region", "Horizontal", "Vertical"]
                 currentIndex: {
                     if (UM.ActiveTool) {
-                        var mode = UM.ActiveTool.properties.getValue("CutMode")
-                        if (mode === "path") return 0
-                        if (mode === "path_isolate") return 1
-                        if (mode === "horizontal") return 2
-                        if (mode === "vertical") return 3
-                        if (mode === "smallest") return 4
-                        if (mode === "shortest") return 5
-                        if (mode === "radial") return 6
-                        if (mode === "valley") return 7
-                        if (mode === "valley_seam") return 8
+                        var idx = modeValues.indexOf(UM.ActiveTool.properties.getValue("CutMode"))
+                        return idx >= 0 ? idx : 0
                     }
                     return 0
                 }
                 onActivated: {
                     if (UM.ActiveTool) {
-                        var modeMap = ["path", "path_isolate", "horizontal", "vertical", "smallest", "shortest", "radial", "valley", "valley_seam"]
-                        UM.ActiveTool.setProperty("CutMode", modeMap[currentIndex])
+                        UM.ActiveTool.setProperty("CutMode", modeValues[currentIndex])
+                    }
+                }
+            }
+        }
+
+        // Secondary ("other") cut modes, tucked behind a disclosure.
+        Column {
+            id: otherModesSection
+            width: parent.width
+            spacing: Math.round(UM.Theme.getSize("default_margin").height / 4)
+            property var secondaryValues: ["smallest", "shortest", "radial", "valley", "valley_seam"]
+            property bool expandedState: UM.ActiveTool
+                ? otherModesSection.secondaryValues.indexOf(UM.ActiveTool.properties.getValue("CutMode")) >= 0
+                : false
+
+            Row {  // collapsible header
+                spacing: Math.round(UM.Theme.getSize("default_margin").width / 4)
+                Label {
+                    text: (otherModesSection.expandedState ? "▾  " : "▸  ") + "Other modes"
+                    font: UM.Theme.getFont("default")
+                    color: UM.Theme.getColor("text_inactive")
+                    renderType: Text.NativeRendering
+                }
+                MouseArea { anchors.fill: parent; onClicked: otherModesSection.expandedState = !otherModesSection.expandedState }
+            }
+
+            ComboBox {
+                visible: otherModesSection.expandedState
+                width: 170
+                height: UM.Theme.getSize("setting_control").height
+                model: ["Smallest Section", "Shortest Seam", "Radial (geodesic)", "Valley (groove)", "Valley Seam (concavity)"]
+                currentIndex: {
+                    if (UM.ActiveTool) {
+                        var idx = otherModesSection.secondaryValues.indexOf(UM.ActiveTool.properties.getValue("CutMode"))
+                        return idx >= 0 ? idx : 0
+                    }
+                    return 0
+                }
+                onActivated: {
+                    if (UM.ActiveTool) {
+                        UM.ActiveTool.setProperty("CutMode", otherModesSection.secondaryValues[currentIndex])
                     }
                 }
             }
