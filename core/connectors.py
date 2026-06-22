@@ -203,6 +203,30 @@ def create_hole_mesh(
     return hole
 
 
+_BOOLEAN_AVAILABLE: Optional[bool] = None
+
+
+def boolean_engine_available() -> bool:
+    """Whether any trimesh boolean engine actually works in this environment.
+
+    Probed once with a tiny difference and cached. When no engine is present
+    (e.g. manifold3d/blender not installed), every boolean connector attempt
+    is doomed and slow, so callers should skip the boolean path entirely
+    instead of retrying it dozens of times.
+    """
+    global _BOOLEAN_AVAILABLE
+    if _BOOLEAN_AVAILABLE is None:
+        try:
+            a = trimesh.creation.box(extents=(2.0, 2.0, 2.0))
+            b = trimesh.creation.box(extents=(1.0, 1.0, 3.0))
+            result = trimesh.boolean.difference([a, b])
+            _BOOLEAN_AVAILABLE = result is not None and len(result.vertices) > 0
+        except Exception as e:
+            logger.info("No boolean engine available (%s); boolean connectors disabled", e)
+            _BOOLEAN_AVAILABLE = False
+    return bool(_BOOLEAN_AVAILABLE)
+
+
 def try_boolean_difference(
     mesh: "trimesh.Trimesh",
     tool: "trimesh.Trimesh"
