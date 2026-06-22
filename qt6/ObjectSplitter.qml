@@ -3,6 +3,7 @@
 
 import QtQuick 2.15
 import QtQuick.Controls 2.15
+import QtQuick.Layouts 1.15
 
 import UM 1.5 as UM
 import Cura 1.0 as Cura
@@ -84,26 +85,32 @@ Item {
                 id: cutModeComboBox
                 width: 170
                 height: UM.Theme.getSize("setting_control").height
-                model: ["Multi-point", "Isolate region", "Horizontal", "Vertical", "Smallest Section", "Shortest Seam", "Radial (geodesic)", "Valley (groove)", "Valley Seam (concavity)"]
+                // Experimental (secondary) modes only appear in this dropdown
+                // when the "Show experimental cut modes" toggle (near Debug) is
+                // on. Auto-on when an experimental mode is already active.
+                property var primaryValues: ["path", "path_isolate", "horizontal", "vertical"]
+                property var experimentalValues: ["smallest", "shortest", "radial", "valley", "valley_seam"]
+                // manualShowExperimental is the user's toggle; showExperimental
+                // derives from it OR an experimental mode being active, so the
+                // checkbox assignment never breaks this binding.
+                property bool manualShowExperimental: false
+                property bool showExperimental: manualShowExperimental || (UM.ActiveTool
+                    ? experimentalValues.indexOf(UM.ActiveTool.properties.getValue("CutMode")) >= 0
+                    : false)
+                property var modeValues: showExperimental ? primaryValues.concat(experimentalValues) : primaryValues
+                model: showExperimental
+                    ? ["Multi-point", "Isolate region", "Horizontal", "Vertical", "Smallest Section", "Shortest Seam", "Radial (geodesic)", "Valley (groove)", "Valley Seam (concavity)"]
+                    : ["Multi-point", "Isolate region", "Horizontal", "Vertical"]
                 currentIndex: {
                     if (UM.ActiveTool) {
-                        var mode = UM.ActiveTool.properties.getValue("CutMode")
-                        if (mode === "path") return 0
-                        if (mode === "path_isolate") return 1
-                        if (mode === "horizontal") return 2
-                        if (mode === "vertical") return 3
-                        if (mode === "smallest") return 4
-                        if (mode === "shortest") return 5
-                        if (mode === "radial") return 6
-                        if (mode === "valley") return 7
-                        if (mode === "valley_seam") return 8
+                        var idx = modeValues.indexOf(UM.ActiveTool.properties.getValue("CutMode"))
+                        return idx >= 0 ? idx : 0
                     }
                     return 0
                 }
                 onActivated: {
                     if (UM.ActiveTool) {
-                        var modeMap = ["path", "path_isolate", "horizontal", "vertical", "smallest", "shortest", "radial", "valley", "valley_seam"]
-                        UM.ActiveTool.setProperty("CutMode", modeMap[currentIndex])
+                        UM.ActiveTool.setProperty("CutMode", modeValues[currentIndex])
                     }
                 }
             }
@@ -154,10 +161,11 @@ Item {
             }
 
             Label {
+                // Only for anchored (valley) modes; in path mode this would
+                // duplicate the cut-mode description shown under the combo.
                 width: parent.width
-                text: (UM.ActiveTool && UM.ActiveTool.properties.getValue("CutMode") === "path")
-                      ? "Click to place path points, then Cut Along Path."
-                      : "Click to place anchor points, then Cut Using Points."
+                visible: UM.ActiveTool && UM.ActiveTool.properties.getValue("CutMode") !== "path"
+                text: "Click to place anchor points, then Cut Using Points."
                 font: UM.Theme.getFont("default_italic")
                 color: UM.Theme.getColor("text_inactive")
                 wrapMode: Text.WordWrap
@@ -169,6 +177,9 @@ Item {
                 text: "Close loop"
                 visible: UM.ActiveTool && UM.ActiveTool.properties.getValue("CutMode") === "path"
                 checked: UM.ActiveTool ? UM.ActiveTool.properties.getValue("PathCloseLoop") : false
+                hoverEnabled: true
+                ToolTip.visible: hovered
+                ToolTip.text: "Close the path into a loop so the cut separates an enclosed region."
                 onClicked: {
                     if (UM.ActiveTool) {
                         UM.ActiveTool.setProperty("PathCloseLoop", checked)
@@ -181,6 +192,9 @@ Item {
                 text: "Cap Path Cut"
                 visible: UM.ActiveTool && UM.ActiveTool.properties.getValue("CutMode") === "path"
                 checked: UM.ActiveTool ? UM.ActiveTool.properties.getValue("PathCapEnds") : true
+                hoverEnabled: true
+                ToolTip.visible: hovered
+                ToolTip.text: "Seal the cut faces so each half is closed, independent of connectors."
                 onClicked: {
                     if (UM.ActiveTool) {
                         UM.ActiveTool.setProperty("PathCapEnds", checked)
@@ -193,6 +207,9 @@ Item {
                 text: "Insert Points"
                 visible: UM.ActiveTool && UM.ActiveTool.properties.getValue("CutMode") === "path"
                 checked: UM.ActiveTool ? UM.ActiveTool.properties.getValue("PathInsertMode") : false
+                hoverEnabled: true
+                ToolTip.visible: hovered
+                ToolTip.text: "New clicks are inserted between the nearest existing points instead of appended to the end."
                 onClicked: {
                     if (UM.ActiveTool) {
                         UM.ActiveTool.setProperty("PathInsertMode", checked)
@@ -200,82 +217,74 @@ Item {
                 }
             }
 
-            CheckBox {
-                id: smallMarkersCheckbox
-                text: "Small Markers"
-                checked: UM.ActiveTool ? UM.ActiveTool.properties.getValue("PathSmallMarkers") : false
-                onClicked: {
-                    if (UM.ActiveTool) {
-                        UM.ActiveTool.setProperty("PathSmallMarkers", checked)
-                    }
-                }
-            }
+            Column {
+                id: pathDisplaySection
+                property bool expandedState: false
+                width: parent.width
+                spacing: Math.round(UM.Theme.getSize("default_margin").height / 2)
 
-            Row {
-                spacing: Math.round(UM.Theme.getSize("default_margin").width / 2)
-
-                Label {
-                    height: UM.Theme.getSize("setting_control").height
-                    text: "Marker Color:"
-                    font: UM.Theme.getFont("default")
+                Label {  // collapsible header
+                    text: (pathDisplaySection.expandedState ? "▾  " : "▸  ") + "Display"
+                    font: UM.Theme.getFont("default_bold")
                     color: UM.Theme.getColor("text")
-                    verticalAlignment: Text.AlignVCenter
                     renderType: Text.NativeRendering
-                    width: 90
+                    MouseArea { anchors.fill: parent; onClicked: pathDisplaySection.expandedState = !pathDisplaySection.expandedState }
                 }
 
-                ComboBox {
-                    id: pathMarkerColorComboBox
-                    width: 140
-                    height: UM.Theme.getSize("setting_control").height
-                    property var colorNames: ["cyan", "yellow", "white", "black", "magenta", "green"]
-                    model: ["Cyan", "Yellow", "White", "Black", "Magenta", "Green"]
-                    currentIndex: {
-                        if (UM.ActiveTool) {
-                            var c = UM.ActiveTool.properties.getValue("PathMarkerColor")
-                            var idx = colorNames.indexOf(c)
-                            return idx >= 0 ? idx : 0
+                Column {  // collapsible body
+                    visible: pathDisplaySection.expandedState
+                    width: parent.width
+                    spacing: Math.round(UM.Theme.getSize("default_margin").height / 2)
+
+                    CheckBox {
+                        id: smallMarkersCheckbox
+                        text: "Small Markers"
+                        checked: UM.ActiveTool ? UM.ActiveTool.properties.getValue("PathSmallMarkers") : false
+                        hoverEnabled: true
+                        ToolTip.visible: hovered
+                        ToolTip.text: "Smaller dots and a smaller grab radius help place points closer together."
+                        onClicked: {
+                            if (UM.ActiveTool) {
+                                UM.ActiveTool.setProperty("PathSmallMarkers", checked)
+                            }
                         }
-                        return 0
                     }
-                    onActivated: {
-                        if (UM.ActiveTool) {
-                            UM.ActiveTool.setProperty("PathMarkerColor", colorNames[index])
+
+                    Row {
+                        spacing: Math.round(UM.Theme.getSize("default_margin").width / 2)
+
+                        Label {
+                            height: UM.Theme.getSize("setting_control").height
+                            text: "Marker Color:"
+                            font: UM.Theme.getFont("default")
+                            color: UM.Theme.getColor("text")
+                            verticalAlignment: Text.AlignVCenter
+                            renderType: Text.NativeRendering
+                            width: 90
+                        }
+
+                        ComboBox {
+                            id: pathMarkerColorComboBox
+                            width: 140
+                            height: UM.Theme.getSize("setting_control").height
+                            property var colorNames: ["cyan", "yellow", "white", "black", "magenta", "green"]
+                            model: ["Cyan", "Yellow", "White", "Black", "Magenta", "Green"]
+                            currentIndex: {
+                                if (UM.ActiveTool) {
+                                    var c = UM.ActiveTool.properties.getValue("PathMarkerColor")
+                                    var idx = colorNames.indexOf(c)
+                                    return idx >= 0 ? idx : 0
+                                }
+                                return 0
+                            }
+                            onActivated: {
+                                if (UM.ActiveTool) {
+                                    UM.ActiveTool.setProperty("PathMarkerColor", colorNames[index])
+                                }
+                            }
                         }
                     }
                 }
-            }
-
-            Label {
-                width: parent.width
-                visible: UM.ActiveTool &&
-                         UM.ActiveTool.properties.getValue("CutMode") === "path" &&
-                         UM.ActiveTool.properties.getValue("PathInsertMode")
-                text: "Insert mode places new clicks between the nearest points."
-                font: UM.Theme.getFont("default_italic")
-                color: UM.Theme.getColor("text_inactive")
-                wrapMode: Text.WordWrap
-                renderType: Text.NativeRendering
-            }
-
-            Label {
-                width: parent.width
-                visible: UM.ActiveTool && UM.ActiveTool.properties.getValue("PathSmallMarkers")
-                text: "Smaller dots and a smaller grab radius help place points closer together."
-                font: UM.Theme.getFont("default_italic")
-                color: UM.Theme.getColor("text_inactive")
-                wrapMode: Text.WordWrap
-                renderType: Text.NativeRendering
-            }
-
-            Label {
-                width: parent.width
-                visible: UM.ActiveTool && UM.ActiveTool.properties.getValue("CutMode") === "path"
-                text: "Undo steps through point edits. After a path cut, Undo restores the original object and path points."
-                font: UM.Theme.getFont("default_italic")
-                color: UM.Theme.getColor("text_inactive")
-                wrapMode: Text.WordWrap
-                renderType: Text.NativeRendering
             }
 
             Label {
@@ -288,13 +297,15 @@ Item {
                 renderType: Text.NativeRendering
             }
 
-            Row {
+            // Point edit actions
+            RowLayout {
+                width: parent.width
                 spacing: Math.round(UM.Theme.getSize("default_margin").width / 2)
 
                 Button {
                     text: "Clear Points"
-                    width: 85
-                    height: UM.Theme.getSize("setting_control").height
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: UM.Theme.getSize("setting_control").height
                     onClicked: {
                         if (UM.ActiveTool) {
                             UM.ActiveTool.setProperty("ClearPathPoints", true)
@@ -305,8 +316,9 @@ Item {
                 Button {
                     text: "Remove Selected"
                     visible: UM.ActiveTool && UM.ActiveTool.properties.getValue("CutMode") === "path"
-                    width: 120
-                    height: UM.Theme.getSize("setting_control").height
+                    Layout.fillWidth: true
+                    Layout.preferredWidth: visible ? implicitWidth : 0
+                    Layout.preferredHeight: UM.Theme.getSize("setting_control").height
                     enabled: UM.ActiveTool && UM.ActiveTool.properties.getValue("HasSelectedPathPoint")
                     onClicked: {
                         if (UM.ActiveTool) {
@@ -314,35 +326,38 @@ Item {
                         }
                     }
                 }
-
-                Button {
-                    text: (UM.ActiveTool && UM.ActiveTool.properties.getValue("CutMode") === "path") ? "Cut Along Path" : "Cut Using Points"
-                    width: 100
-                    height: UM.Theme.getSize("setting_control").height
-                    enabled: UM.ActiveTool && (
-                        (UM.ActiveTool.properties.getValue("CutMode") === "path" && UM.ActiveTool.properties.getValue("PathPointCount") >= 2) ||
-                        (UM.ActiveTool.properties.getValue("CutMode") !== "path" && UM.ActiveTool.properties.getValue("PathPointCount") >= 1)
-                    )
-                    onClicked: {
-                        if (UM.ActiveTool) {
-                            if (UM.ActiveTool.properties.getValue("CutMode") === "path") {
-                                UM.ActiveTool.setProperty("TriggerPathCut", true)
-                            } else {
-                                UM.ActiveTool.setProperty("TriggerAnchoredCut", true)
-                            }
-                        }
-                    }
-                }
             }
 
+            // Preview the exact geodesic seam the cut will follow (same path
+            // computation as the cut itself, drawn as dots).
             Button {
-                text: "Suggest Path"
-                width: 120
+                text: "Preview Path"
+                width: parent.width
                 height: UM.Theme.getSize("setting_control").height
                 enabled: UM.ActiveTool && UM.ActiveTool.properties.getValue("PathPointCount") >= 2
                 onClicked: {
                     if (UM.ActiveTool) {
                         UM.ActiveTool.setProperty("TriggerSuggestPath", true)
+                    }
+                }
+            }
+
+            // Primary action
+            Button {
+                text: (UM.ActiveTool && UM.ActiveTool.properties.getValue("CutMode") === "path") ? "Cut Along Path" : "Cut Using Points"
+                width: parent.width
+                height: UM.Theme.getSize("setting_control").height
+                enabled: UM.ActiveTool && (
+                    (UM.ActiveTool.properties.getValue("CutMode") === "path" && UM.ActiveTool.properties.getValue("PathPointCount") >= 2) ||
+                    (UM.ActiveTool.properties.getValue("CutMode") !== "path" && UM.ActiveTool.properties.getValue("PathPointCount") >= 1)
+                )
+                onClicked: {
+                    if (UM.ActiveTool) {
+                        if (UM.ActiveTool.properties.getValue("CutMode") === "path") {
+                            UM.ActiveTool.setProperty("TriggerPathCut", true)
+                        } else {
+                            UM.ActiveTool.setProperty("TriggerAnchoredCut", true)
+                        }
                     }
                 }
             }
@@ -393,69 +408,74 @@ Item {
                 renderType: Text.NativeRendering
             }
 
-            CheckBox {
-                id: isolateSmallMarkersCheckbox
-                text: "Small Markers"
-                checked: UM.ActiveTool ? UM.ActiveTool.properties.getValue("PathSmallMarkers") : false
-                onClicked: {
-                    if (UM.ActiveTool) {
-                        UM.ActiveTool.setProperty("PathSmallMarkers", checked)
-                    }
-                }
-            }
+            Column {
+                id: isolateDisplaySection
+                property bool expandedState: false
+                width: parent.width
+                spacing: Math.round(UM.Theme.getSize("default_margin").height / 2)
 
-            Row {
-                spacing: Math.round(UM.Theme.getSize("default_margin").width / 2)
-
-                Label {
-                    height: UM.Theme.getSize("setting_control").height
-                    text: "Marker Color:"
-                    font: UM.Theme.getFont("default")
+                Label {  // collapsible header
+                    text: (isolateDisplaySection.expandedState ? "▾  " : "▸  ") + "Display"
+                    font: UM.Theme.getFont("default_bold")
                     color: UM.Theme.getColor("text")
-                    verticalAlignment: Text.AlignVCenter
                     renderType: Text.NativeRendering
-                    width: 90
+                    MouseArea { anchors.fill: parent; onClicked: isolateDisplaySection.expandedState = !isolateDisplaySection.expandedState }
                 }
 
-                ComboBox {
-                    id: isolatePathMarkerColorComboBox
-                    width: 140
-                    height: UM.Theme.getSize("setting_control").height
-                    property var colorNames: ["cyan", "yellow", "white", "black", "magenta", "green"]
-                    model: ["Cyan", "Yellow", "White", "Black", "Magenta", "Green"]
-                    currentIndex: {
-                        if (UM.ActiveTool) {
-                            var c = UM.ActiveTool.properties.getValue("PathMarkerColor")
-                            var idx = colorNames.indexOf(c)
-                            return idx >= 0 ? idx : 0
+                Column {  // collapsible body
+                    visible: isolateDisplaySection.expandedState
+                    width: parent.width
+                    spacing: Math.round(UM.Theme.getSize("default_margin").height / 2)
+
+                    CheckBox {
+                        id: isolateSmallMarkersCheckbox
+                        text: "Small Markers"
+                        checked: UM.ActiveTool ? UM.ActiveTool.properties.getValue("PathSmallMarkers") : false
+                        hoverEnabled: true
+                        ToolTip.visible: hovered
+                        ToolTip.text: "Smaller dots and a smaller grab radius help place isolate-loop points closer together."
+                        onClicked: {
+                            if (UM.ActiveTool) {
+                                UM.ActiveTool.setProperty("PathSmallMarkers", checked)
+                            }
                         }
-                        return 0
                     }
-                    onActivated: {
-                        if (UM.ActiveTool) {
-                            UM.ActiveTool.setProperty("PathMarkerColor", colorNames[index])
+
+                    Row {
+                        spacing: Math.round(UM.Theme.getSize("default_margin").width / 2)
+
+                        Label {
+                            height: UM.Theme.getSize("setting_control").height
+                            text: "Marker Color:"
+                            font: UM.Theme.getFont("default")
+                            color: UM.Theme.getColor("text")
+                            verticalAlignment: Text.AlignVCenter
+                            renderType: Text.NativeRendering
+                            width: 90
+                        }
+
+                        ComboBox {
+                            id: isolatePathMarkerColorComboBox
+                            width: 140
+                            height: UM.Theme.getSize("setting_control").height
+                            property var colorNames: ["cyan", "yellow", "white", "black", "magenta", "green"]
+                            model: ["Cyan", "Yellow", "White", "Black", "Magenta", "Green"]
+                            currentIndex: {
+                                if (UM.ActiveTool) {
+                                    var c = UM.ActiveTool.properties.getValue("PathMarkerColor")
+                                    var idx = colorNames.indexOf(c)
+                                    return idx >= 0 ? idx : 0
+                                }
+                                return 0
+                            }
+                            onActivated: {
+                                if (UM.ActiveTool) {
+                                    UM.ActiveTool.setProperty("PathMarkerColor", colorNames[index])
+                                }
+                            }
                         }
                     }
                 }
-            }
-
-            Label {
-                width: parent.width
-                visible: UM.ActiveTool && UM.ActiveTool.properties.getValue("PathSmallMarkers")
-                text: "Smaller dots and a smaller grab radius help place isolate-loop points closer together."
-                font: UM.Theme.getFont("default_italic")
-                color: UM.Theme.getColor("text_inactive")
-                wrapMode: Text.WordWrap
-                renderType: Text.NativeRendering
-            }
-
-            Label {
-                width: parent.width
-                text: "Undo steps through loop edits. After isolate, Undo restores the original object, loops, and target."
-                font: UM.Theme.getFont("default_italic")
-                color: UM.Theme.getColor("text_inactive")
-                wrapMode: Text.WordWrap
-                renderType: Text.NativeRendering
             }
 
             Row {
@@ -573,6 +593,9 @@ Item {
                 id: isolateCleanupCheckBox
                 text: "Remove Tiny Fragments"
                 checked: UM.ActiveTool ? UM.ActiveTool.properties.getValue("PathIsolatePruneTinyFragments") : true
+                hoverEnabled: true
+                ToolTip.visible: hovered
+                ToolTip.text: "Drops disconnected pieces smaller than the threshold from each output."
                 onClicked: {
                     if (UM.ActiveTool) {
                         UM.ActiveTool.setProperty("PathIsolatePruneTinyFragments", checked)
@@ -585,31 +608,23 @@ Item {
                 spacing: Math.round(UM.Theme.getSize("default_margin").height / 3)
                 visible: UM.ActiveTool && UM.ActiveTool.properties.getValue("PathIsolatePruneTinyFragments")
 
-                Label {
+                RowLayout {
                     width: parent.width
-                    text: "Drops disconnected pieces smaller than the threshold from each output."
-                    font: UM.Theme.getFont("default_italic")
-                    color: UM.Theme.getColor("text_inactive")
-                    wrapMode: Text.WordWrap
-                    renderType: Text.NativeRendering
-                }
-
-                Row {
                     spacing: Math.round(UM.Theme.getSize("default_margin").width / 2)
 
                     Label {
-                        height: UM.Theme.getSize("setting_control").height
+                        Layout.preferredWidth: 70
+                        Layout.preferredHeight: UM.Theme.getSize("setting_control").height
                         text: "Min faces:"
                         font: UM.Theme.getFont("default")
                         color: UM.Theme.getColor("text")
                         verticalAlignment: Text.AlignVCenter
                         renderType: Text.NativeRendering
-                        width: 70
                     }
 
                     Slider {
                         id: isolateFragmentSlider
-                        width: 120
+                        Layout.fillWidth: true
                         from: 0
                         to: 300
                         stepSize: 10
@@ -623,13 +638,13 @@ Item {
                     }
 
                     Label {
-                        height: UM.Theme.getSize("setting_control").height
+                        Layout.preferredWidth: 65
+                        Layout.preferredHeight: UM.Theme.getSize("setting_control").height
                         text: Math.round(isolateFragmentSlider.value) + " faces"
                         font: UM.Theme.getFont("default")
                         color: UM.Theme.getColor("text")
                         verticalAlignment: Text.AlignVCenter
                         renderType: Text.NativeRendering
-                        width: 65
                     }
                 }
             }
@@ -693,11 +708,12 @@ Item {
             }
         }
 
-        // Separator
+        // Separator (only when a mode-specific parameter section follows)
         Rectangle {
             width: parent.width
             height: 1
             color: UM.Theme.getColor("lining")
+            visible: UM.ActiveTool && ["horizontal", "smallest", "valley", "valley_seam"].indexOf(UM.ActiveTool.properties.getValue("CutMode")) >= 0
         }
 
         // Cut Height (for horizontal mode)
@@ -766,6 +782,9 @@ Item {
                     to: 36
                     value: UM.ActiveTool ? UM.ActiveTool.properties.getValue("SearchResolution") : 18
                     stepSize: 1
+                    hoverEnabled: true
+                    ToolTip.visible: hovered
+                    ToolTip.text: "Higher = more accurate but slower."
 
                     onValueChanged: {
                         if (UM.ActiveTool) {
@@ -783,14 +802,6 @@ Item {
                     renderType: Text.NativeRendering
                     width: 30
                 }
-            }
-
-            Label {
-                width: parent.width
-                text: "Higher = more accurate but slower"
-                font: UM.Theme.getFont("default_italic")
-                color: UM.Theme.getColor("text_inactive")
-                renderType: Text.NativeRendering
             }
         }
 
@@ -888,9 +899,24 @@ Item {
 
         // Connector Section
         Column {
+            id: connectorsSection
+            property bool expandedState: false
             width: parent.width
             spacing: Math.round(UM.Theme.getSize("default_margin").height / 2)
             visible: !(UM.ActiveTool && UM.ActiveTool.properties.getValue("CutMode") === "path_isolate")
+
+            Label {  // collapsible header
+                text: (connectorsSection.expandedState ? "▾  " : "▸  ") + "Connectors"
+                font: UM.Theme.getFont("default_bold")
+                color: UM.Theme.getColor("text")
+                renderType: Text.NativeRendering
+                MouseArea { anchors.fill: parent; onClicked: connectorsSection.expandedState = !connectorsSection.expandedState }
+            }
+
+            Column {  // collapsible body
+                visible: connectorsSection.expandedState
+                width: parent.width
+                spacing: Math.round(UM.Theme.getSize("default_margin").height / 2)
 
             // Connector Enable Toggle
             Row {
@@ -939,22 +965,23 @@ Item {
                 visible: connectorCheckBox.checked
 
                 // Diameter
-                Row {
+                RowLayout {
+                    width: parent.width
                     spacing: Math.round(UM.Theme.getSize("default_margin").width / 2)
 
                     Label {
-                        height: UM.Theme.getSize("setting_control").height
+                        Layout.preferredWidth: 70
+                        Layout.preferredHeight: UM.Theme.getSize("setting_control").height
                         text: catalog.i18nc("@label", "Diameter:")
                         font: UM.Theme.getFont("default")
                         color: UM.Theme.getColor("text")
                         verticalAlignment: Text.AlignVCenter
                         renderType: Text.NativeRendering
-                        width: 70
                     }
 
                     Slider {
                         id: diameterSlider
-                        width: 120
+                        Layout.fillWidth: true
                         from: 2
                         to: 10
                         value: UM.ActiveTool ? UM.ActiveTool.properties.getValue("ConnectorDiameter") : 4
@@ -968,33 +995,34 @@ Item {
                     }
 
                     Label {
-                        height: UM.Theme.getSize("setting_control").height
+                        Layout.preferredWidth: 50
+                        Layout.preferredHeight: UM.Theme.getSize("setting_control").height
                         text: diameterSlider.value.toFixed(1) + " mm"
                         font: UM.Theme.getFont("default")
                         color: UM.Theme.getColor("text")
                         verticalAlignment: Text.AlignVCenter
                         renderType: Text.NativeRendering
-                        width: 50
                     }
                 }
 
                 // Height
-                Row {
+                RowLayout {
+                    width: parent.width
                     spacing: Math.round(UM.Theme.getSize("default_margin").width / 2)
 
                     Label {
-                        height: UM.Theme.getSize("setting_control").height
+                        Layout.preferredWidth: 70
+                        Layout.preferredHeight: UM.Theme.getSize("setting_control").height
                         text: catalog.i18nc("@label", "Height:")
                         font: UM.Theme.getFont("default")
                         color: UM.Theme.getColor("text")
                         verticalAlignment: Text.AlignVCenter
                         renderType: Text.NativeRendering
-                        width: 70
                     }
 
                     Slider {
                         id: heightConnectorSlider
-                        width: 120
+                        Layout.fillWidth: true
                         from: 1
                         to: 8
                         value: UM.ActiveTool ? UM.ActiveTool.properties.getValue("ConnectorHeight") : 3
@@ -1008,33 +1036,34 @@ Item {
                     }
 
                     Label {
-                        height: UM.Theme.getSize("setting_control").height
+                        Layout.preferredWidth: 50
+                        Layout.preferredHeight: UM.Theme.getSize("setting_control").height
                         text: heightConnectorSlider.value.toFixed(1) + " mm"
                         font: UM.Theme.getFont("default")
                         color: UM.Theme.getColor("text")
                         verticalAlignment: Text.AlignVCenter
                         renderType: Text.NativeRendering
-                        width: 50
                     }
                 }
 
                 // Clearance
-                Row {
+                RowLayout {
+                    width: parent.width
                     spacing: Math.round(UM.Theme.getSize("default_margin").width / 2)
 
                     Label {
-                        height: UM.Theme.getSize("setting_control").height
+                        Layout.preferredWidth: 70
+                        Layout.preferredHeight: UM.Theme.getSize("setting_control").height
                         text: catalog.i18nc("@label", "Clearance:")
                         font: UM.Theme.getFont("default")
                         color: UM.Theme.getColor("text")
                         verticalAlignment: Text.AlignVCenter
                         renderType: Text.NativeRendering
-                        width: 70
                     }
 
                     Slider {
                         id: clearanceSlider
-                        width: 120
+                        Layout.fillWidth: true
                         from: 0.1
                         to: 0.5
                         value: UM.ActiveTool ? UM.ActiveTool.properties.getValue("ConnectorClearance") : 0.2
@@ -1048,16 +1077,17 @@ Item {
                     }
 
                     Label {
-                        height: UM.Theme.getSize("setting_control").height
+                        Layout.preferredWidth: 50
+                        Layout.preferredHeight: UM.Theme.getSize("setting_control").height
                         text: clearanceSlider.value.toFixed(2) + " mm"
                         font: UM.Theme.getFont("default")
                         color: UM.Theme.getColor("text")
                         verticalAlignment: Text.AlignVCenter
                         renderType: Text.NativeRendering
-                        width: 50
                     }
                 }
             }
+            }  // end collapsible body
         }
 
         // Separator
@@ -1069,8 +1099,23 @@ Item {
 
         // Debug Capture Toggle
         Column {
+            id: debugSection
+            property bool expandedState: false
             width: parent.width
             spacing: Math.round(UM.Theme.getSize("default_margin").height / 2)
+
+            Label {  // collapsible header
+                text: (debugSection.expandedState ? "▾  " : "▸  ") + "Debug"
+                font: UM.Theme.getFont("default_bold")
+                color: UM.Theme.getColor("text")
+                renderType: Text.NativeRendering
+                MouseArea { anchors.fill: parent; onClicked: debugSection.expandedState = !debugSection.expandedState }
+            }
+
+            Column {  // collapsible body
+                visible: debugSection.expandedState
+                width: parent.width
+                spacing: Math.round(UM.Theme.getSize("default_margin").height / 2)
 
             Row {
                 spacing: Math.round(UM.Theme.getSize("default_margin").width / 2)
@@ -1110,6 +1155,22 @@ Item {
                 wrapMode: Text.WordWrap
                 renderType: Text.NativeRendering
             }
+
+            CheckBox {
+                id: showExperimentalCheckBox
+                text: "Show experimental cut modes"
+                checked: cutModeComboBox.showExperimental
+                onToggled: {
+                    cutModeComboBox.manualShowExperimental = checked
+                    // Turning it off while an experimental mode is active would
+                    // leave the combo and CutMode out of sync; snap to Multi-point.
+                    if (!checked && UM.ActiveTool &&
+                        cutModeComboBox.experimentalValues.indexOf(UM.ActiveTool.properties.getValue("CutMode")) >= 0) {
+                        UM.ActiveTool.setProperty("CutMode", "path")
+                    }
+                }
+            }
+            }  // end collapsible body
         }
 
         // Separator
