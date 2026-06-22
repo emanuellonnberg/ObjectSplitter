@@ -366,6 +366,24 @@ def _fit_cap_plane(points: numpy.ndarray):
     return origin, u, v, normal
 
 
+def _cap_plane_normal(
+    mesh: "trimesh.Trimesh",
+    cap_faces: list,
+) -> Optional[numpy.ndarray]:
+    """Unit normal of the best-fit plane through a cap's vertices."""
+    vids = _cap_vertex_indices(mesh, cap_faces)
+    if vids is None or len(vids) < 3:
+        return None
+    basis = _fit_cap_plane(numpy.asarray(mesh.vertices[vids], dtype=numpy.float64))
+    if basis is None:
+        return None
+    normal = numpy.asarray(basis[3], dtype=numpy.float64)
+    n = numpy.linalg.norm(normal)
+    if n < 1e-9:
+        return None
+    return normal / n
+
+
 def _deform_cap_patch_dense(
     mesh: "trimesh.Trimesh",
     cap_faces: list,
@@ -871,6 +889,21 @@ def add_cap_native_connectors(
         pos = upper_snap
     elif lower_snap is not None:
         pos = lower_snap
+
+    # The connector must push perpendicular to the cut surface ("straight in"),
+    # not along the caller's rough normal. On organic closed-loop carves the
+    # passed normal (e.g. a centroid difference) can be 60-90 deg off the cut
+    # plane, which drives the peg sideways under the surface. Use the cap's
+    # best-fit plane normal as the true axis, keeping the caller's normal only
+    # to choose the sign (which side is "out"). Both halves share this single
+    # world axis so the peg and hole stay aligned.
+    cap_axis = _cap_plane_normal(mesh_upper, cap_faces_upper)
+    if cap_axis is None:
+        cap_axis = _cap_plane_normal(mesh_lower, cap_faces_lower)
+    if cap_axis is not None:
+        if float(numpy.dot(cap_axis, normal)) < 0.0:
+            cap_axis = -cap_axis
+        normal = cap_axis
 
     upper_role, _ = determine_peg_side(mesh_upper, mesh_lower)
     # connector_normal is interpreted as lower->upper.
