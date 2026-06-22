@@ -546,8 +546,9 @@ def _deform_cap_patch_dense(
     # Wall = original mesh minus old cap faces; weld the rebuilt cap on.
     all_mesh_faces = numpy.asarray(mesh.faces, dtype=numpy.int64)
     drop = numpy.zeros(len(all_mesh_faces), dtype=bool)
-    valid_cap = [int(f) for f in cap_faces if 0 <= int(f) < len(all_mesh_faces)]
-    drop[numpy.asarray(valid_cap, dtype=numpy.int64)] = True
+    valid_cap = numpy.asarray(cap_faces, dtype=numpy.int64)
+    valid_cap = valid_cap[(valid_cap >= 0) & (valid_cap < len(all_mesh_faces))]
+    drop[valid_cap] = True
     wall = trimesh.Trimesh(
         vertices=numpy.asarray(mesh.vertices, dtype=numpy.float64),
         faces=all_mesh_faces[~drop],
