@@ -90,9 +90,13 @@ Item {
                 // on. Auto-on when an experimental mode is already active.
                 property var primaryValues: ["path", "path_isolate", "horizontal", "vertical"]
                 property var experimentalValues: ["smallest", "shortest", "radial", "valley", "valley_seam"]
-                property bool showExperimental: UM.ActiveTool
+                // manualShowExperimental is the user's toggle; showExperimental
+                // derives from it OR an experimental mode being active, so the
+                // checkbox assignment never breaks this binding.
+                property bool manualShowExperimental: false
+                property bool showExperimental: manualShowExperimental || (UM.ActiveTool
                     ? experimentalValues.indexOf(UM.ActiveTool.properties.getValue("CutMode")) >= 0
-                    : false
+                    : false)
                 property var modeValues: showExperimental ? primaryValues.concat(experimentalValues) : primaryValues
                 model: showExperimental
                     ? ["Multi-point", "Isolate region", "Horizontal", "Vertical", "Smallest Section", "Shortest Seam", "Radial (geodesic)", "Valley (groove)", "Valley Seam (concavity)"]
@@ -1157,7 +1161,7 @@ Item {
                 text: "Show experimental cut modes"
                 checked: cutModeComboBox.showExperimental
                 onToggled: {
-                    cutModeComboBox.showExperimental = checked
+                    cutModeComboBox.manualShowExperimental = checked
                     // Turning it off while an experimental mode is active would
                     // leave the combo and CutMode out of sync; snap to Multi-point.
                     if (!checked && UM.ActiveTool &&
