@@ -84,17 +84,17 @@ Item {
                 id: cutModeComboBox
                 width: 170
                 height: UM.Theme.getSize("setting_control").height
-                model: ["Horizontal", "Vertical", "Smallest Section", "Shortest Seam", "Radial (geodesic)", "Path (multi-point)", "Path Isolate (multi-loop)", "Valley (groove)", "Valley Seam (concavity)"]
+                model: ["Multi-point", "Isolate region", "Horizontal", "Vertical", "Smallest Section", "Shortest Seam", "Radial (geodesic)", "Valley (groove)", "Valley Seam (concavity)"]
                 currentIndex: {
                     if (UM.ActiveTool) {
                         var mode = UM.ActiveTool.properties.getValue("CutMode")
-                        if (mode === "horizontal") return 0
-                        if (mode === "vertical") return 1
-                        if (mode === "smallest") return 2
-                        if (mode === "shortest") return 3
-                        if (mode === "radial") return 4
-                        if (mode === "path") return 5
-                        if (mode === "path_isolate") return 6
+                        if (mode === "path") return 0
+                        if (mode === "path_isolate") return 1
+                        if (mode === "horizontal") return 2
+                        if (mode === "vertical") return 3
+                        if (mode === "smallest") return 4
+                        if (mode === "shortest") return 5
+                        if (mode === "radial") return 6
                         if (mode === "valley") return 7
                         if (mode === "valley_seam") return 8
                     }
@@ -102,7 +102,7 @@ Item {
                 }
                 onActivated: {
                     if (UM.ActiveTool) {
-                        var modeMap = ["horizontal", "vertical", "smallest", "shortest", "radial", "path", "path_isolate", "valley", "valley_seam"]
+                        var modeMap = ["path", "path_isolate", "horizontal", "vertical", "smallest", "shortest", "radial", "valley", "valley_seam"]
                         UM.ActiveTool.setProperty("CutMode", modeMap[currentIndex])
                     }
                 }
@@ -211,6 +211,41 @@ Item {
                 }
             }
 
+            Row {
+                spacing: Math.round(UM.Theme.getSize("default_margin").width / 2)
+
+                Label {
+                    height: UM.Theme.getSize("setting_control").height
+                    text: "Marker Color:"
+                    font: UM.Theme.getFont("default")
+                    color: UM.Theme.getColor("text")
+                    verticalAlignment: Text.AlignVCenter
+                    renderType: Text.NativeRendering
+                    width: 90
+                }
+
+                ComboBox {
+                    id: pathMarkerColorComboBox
+                    width: 140
+                    height: UM.Theme.getSize("setting_control").height
+                    property var colorNames: ["cyan", "yellow", "white", "black", "magenta", "green"]
+                    model: ["Cyan", "Yellow", "White", "Black", "Magenta", "Green"]
+                    currentIndex: {
+                        if (UM.ActiveTool) {
+                            var c = UM.ActiveTool.properties.getValue("PathMarkerColor")
+                            var idx = colorNames.indexOf(c)
+                            return idx >= 0 ? idx : 0
+                        }
+                        return 0
+                    }
+                    onActivated: {
+                        if (UM.ActiveTool) {
+                            UM.ActiveTool.setProperty("PathMarkerColor", colorNames[index])
+                        }
+                    }
+                }
+            }
+
             Label {
                 width: parent.width
                 visible: UM.ActiveTool &&
@@ -227,6 +262,16 @@ Item {
                 width: parent.width
                 visible: UM.ActiveTool && UM.ActiveTool.properties.getValue("PathSmallMarkers")
                 text: "Smaller dots and a smaller grab radius help place points closer together."
+                font: UM.Theme.getFont("default_italic")
+                color: UM.Theme.getColor("text_inactive")
+                wrapMode: Text.WordWrap
+                renderType: Text.NativeRendering
+            }
+
+            Label {
+                width: parent.width
+                visible: UM.ActiveTool && UM.ActiveTool.properties.getValue("CutMode") === "path"
+                text: "Undo steps through point edits. After a path cut, Undo restores the original object and path points."
                 font: UM.Theme.getFont("default_italic")
                 color: UM.Theme.getColor("text_inactive")
                 wrapMode: Text.WordWrap
@@ -359,10 +404,54 @@ Item {
                 }
             }
 
+            Row {
+                spacing: Math.round(UM.Theme.getSize("default_margin").width / 2)
+
+                Label {
+                    height: UM.Theme.getSize("setting_control").height
+                    text: "Marker Color:"
+                    font: UM.Theme.getFont("default")
+                    color: UM.Theme.getColor("text")
+                    verticalAlignment: Text.AlignVCenter
+                    renderType: Text.NativeRendering
+                    width: 90
+                }
+
+                ComboBox {
+                    id: isolatePathMarkerColorComboBox
+                    width: 140
+                    height: UM.Theme.getSize("setting_control").height
+                    property var colorNames: ["cyan", "yellow", "white", "black", "magenta", "green"]
+                    model: ["Cyan", "Yellow", "White", "Black", "Magenta", "Green"]
+                    currentIndex: {
+                        if (UM.ActiveTool) {
+                            var c = UM.ActiveTool.properties.getValue("PathMarkerColor")
+                            var idx = colorNames.indexOf(c)
+                            return idx >= 0 ? idx : 0
+                        }
+                        return 0
+                    }
+                    onActivated: {
+                        if (UM.ActiveTool) {
+                            UM.ActiveTool.setProperty("PathMarkerColor", colorNames[index])
+                        }
+                    }
+                }
+            }
+
             Label {
                 width: parent.width
                 visible: UM.ActiveTool && UM.ActiveTool.properties.getValue("PathSmallMarkers")
                 text: "Smaller dots and a smaller grab radius help place isolate-loop points closer together."
+                font: UM.Theme.getFont("default_italic")
+                color: UM.Theme.getColor("text_inactive")
+                wrapMode: Text.WordWrap
+                renderType: Text.NativeRendering
+            }
+
+            Label {
+                width: parent.width
+                text: "Undo steps through loop edits. After isolate, Undo restores the original object, loops, and target."
                 font: UM.Theme.getFont("default_italic")
                 color: UM.Theme.getColor("text_inactive")
                 wrapMode: Text.WordWrap
