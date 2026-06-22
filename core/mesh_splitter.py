@@ -436,18 +436,26 @@ def _orient_caps_to_boundary(
 
     This avoids a global fix_winding over the entire mesh.
     """
-    faces = numpy.asarray(combined.faces)
+    faces = numpy.asarray(combined.faces, dtype=numpy.int64)
     if base_faces <= 0 or base_faces >= len(faces):
         return
 
-    # Directed edges of the original (already-consistent) faces.
+    # Encode the directed edges of the original (already-consistent) faces as
+    # int64 keys, vectorised -- a per-face Python loop here is the dominant
+    # cost on large meshes (hundreds of thousands of faces).
     orig = faces[:base_faces]
-    orig_directed = set()
-    for a, b, c in orig:
-        a, b, c = int(a), int(b), int(c)
-        orig_directed.add((a, b))
-        orig_directed.add((b, c))
-        orig_directed.add((c, a))
+    key_base = int(faces.max()) + 1
+    orig_directed = numpy.concatenate([
+        orig[:, 0] * key_base + orig[:, 1],
+        orig[:, 1] * key_base + orig[:, 2],
+        orig[:, 2] * key_base + orig[:, 0],
+    ])
+    orig_directed.sort()
+
+    def _is_directed(x: int, y: int) -> bool:
+        k = x * key_base + y
+        i = numpy.searchsorted(orig_directed, k)
+        return i < len(orig_directed) and orig_directed[i] == k
 
     new_faces = faces.copy()
     flipped_any = False
@@ -456,10 +464,10 @@ def _orient_caps_to_boundary(
         for fi in range(start, end):
             a, b, c = int(faces[fi][0]), int(faces[fi][1]), int(faces[fi][2])
             for x, y in ((a, b), (b, c), (c, a)):
-                if (x, y) in orig_directed:
+                if _is_directed(x, y):
                     flip = True  # same direction as original -> inconsistent
                     break
-                if (y, x) in orig_directed:
+                if _is_directed(y, x):
                     flip = False  # opposite direction -> already consistent
                     break
             if flip is not None:
