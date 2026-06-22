@@ -23,6 +23,7 @@ from UM.Math.Matrix import Matrix
 from UM.Tool import Tool
 from UM.Event import Event, MouseEvent
 from UM.Mesh.MeshBuilder import MeshBuilder
+from UM.Mesh.MeshData import MeshData
 from UM.Scene.Selection import Selection
 from UM.Scene.SceneNode import SceneNode
 from UM.View.GL.OpenGL import OpenGL
@@ -2231,11 +2232,13 @@ class ObjectSplitter(Tool):
 
             node_upper = self._createMeshNode(
                 mesh_upper.vertices, mesh_upper.faces,
-                f"{original_name}_part1"
+                f"{original_name}_part1",
+                normals=self._safeVertexNormals(mesh_upper),
             )
             node_lower = self._createMeshNode(
                 mesh_lower.vertices, mesh_lower.faces,
-                f"{original_name}_part2"
+                f"{original_name}_part2",
+                normals=self._safeVertexNormals(mesh_lower),
             )
 
             self._updateProgress("Finalizing...", 90)
@@ -2588,10 +2591,12 @@ class ObjectSplitter(Tool):
             # Create scene nodes and replace original
             node_upper = self._createMeshNode(
                 mesh_upper.vertices, mesh_upper.faces,
-                node.getName() + " (A)")
+                node.getName() + " (A)",
+                normals=self._safeVertexNormals(mesh_upper))
             node_lower = self._createMeshNode(
                 mesh_lower.vertices, mesh_lower.faces,
-                node.getName() + " (B)")
+                node.getName() + " (B)",
+                normals=self._safeVertexNormals(mesh_lower))
 
             op = _PathStateGroupedOperation(self, undo_state=undo_state, redo_state=redo_state)
             scene_root = self._controller.getScene().getRoot()
@@ -2720,11 +2725,13 @@ class ObjectSplitter(Tool):
                 mesh_extracted.vertices,
                 mesh_extracted.faces,
                 node.getName() + " (Isolated)",
+                normals=self._safeVertexNormals(mesh_extracted),
             )
             node_remainder = self._createMeshNode(
                 mesh_remainder.vertices,
                 mesh_remainder.faces,
                 node.getName() + " (Remainder)",
+                normals=self._safeVertexNormals(mesh_remainder),
             )
 
             op = _PathStateGroupedOperation(self, undo_state=undo_state, redo_state=redo_state)
@@ -2824,14 +2831,44 @@ class ObjectSplitter(Tool):
             summary = ", ".join([f"{lp}pts/{ll:.2f}mm" for ll, lp in top])
             Logger.log("i", "Path %s boundary loops (largest): %s", label, summary)
 
-    def _createMeshNode(self, vertices: numpy.ndarray, faces: numpy.ndarray, name: str) -> CuraSceneNode:
-        """Create a new CuraSceneNode from vertices and faces."""
-        mesh_builder = MeshBuilder()
-        mesh_builder.setVertices(vertices.astype(numpy.float32))
-        mesh_builder.setIndices(faces.astype(numpy.int32))
-        mesh_builder.calculateNormals()
+    @staticmethod
+    def _safeVertexNormals(tm) -> Optional[numpy.ndarray]:
+        """trimesh vertex_normals, or None if they cannot be computed."""
+        try:
+            vn = numpy.asarray(tm.vertex_normals, dtype=numpy.float32)
+            if vn.shape == (len(tm.vertices), 3):
+                return vn
+        except Exception as e:
+            Logger.log("d", "vertex_normals unavailable, will recompute: %s", e)
+        return None
 
-        mesh_data = mesh_builder.build()
+    def _createMeshNode(self, vertices: numpy.ndarray, faces: numpy.ndarray, name: str,
+                        normals: Optional[numpy.ndarray] = None) -> CuraSceneNode:
+        """Create a new CuraSceneNode from vertices and faces.
+
+        If per-vertex ``normals`` are supplied (e.g. trimesh's vertex_normals)
+        they are used directly. Cura's MeshBuilder.calculateNormals() recomputes
+        normals in pure Python from indexed vertices, which is the dominant cost
+        of a cut on large meshes (~11s on a 666k-face half); trimesh computes the
+        same normals vectorised in a fraction of a second.
+        """
+        verts32 = vertices.astype(numpy.float32)
+        faces32 = faces.astype(numpy.int32)
+
+        normals32 = None
+        if normals is not None:
+            n = numpy.asarray(normals, dtype=numpy.float32)
+            if n.shape == verts32.shape:
+                normals32 = n
+
+        if normals32 is not None:
+            mesh_data = MeshData(vertices=verts32, indices=faces32, normals=normals32)
+        else:
+            mesh_builder = MeshBuilder()
+            mesh_builder.setVertices(verts32)
+            mesh_builder.setIndices(faces32)
+            mesh_builder.calculateNormals()
+            mesh_data = mesh_builder.build()
 
         node = CuraSceneNode()
         node.setName(name)

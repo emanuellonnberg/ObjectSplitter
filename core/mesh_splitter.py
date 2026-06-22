@@ -398,13 +398,86 @@ def _cap_open_boundaries(
     try:
         combined.merge_vertices(digits_vertex=7)
         combined.remove_unreferenced_vertices()
-        combined.fix_normals()
     except Exception as e:
         logger.debug("Post-cap cleanup failed: %s", e)
     cap_faces = []
     for start, end in cap_face_ranges:
         cap_faces.extend(range(start, end))
+
+    # Orient only the freshly added cap faces to match the existing surface.
+    # The original faces are already winding-consistent, so running a global
+    # fix_normals()/fix_winding() (which walks every face on the whole mesh)
+    # just to orient a few cap triangles was the dominant cost of capping on
+    # large meshes. Fall back to fix_normals only if local orientation fails.
+    try:
+        _orient_caps_to_boundary(combined, base_faces, cap_face_ranges)
+    except Exception as e:
+        logger.debug("Local cap orientation failed, using fix_normals: %s", e)
+        try:
+            combined.fix_normals()
+        except Exception:
+            pass
     return combined, cap_faces
+
+
+def _orient_caps_to_boundary(
+    combined: "trimesh.Trimesh",
+    base_faces: int,
+    cap_face_ranges: list,
+) -> None:
+    """Flip each cap's winding in place to agree with the original surface.
+
+    Assumes the first ``base_faces`` faces are already winding-consistent.
+    Each planar cap is uniformly wound, so one shared boundary edge decides
+    the flip for the whole cap: a manifold boundary edge is traversed in
+    *opposite* directions by the two faces sharing it, so if a cap face
+    traverses a boundary edge in the *same* direction as the original face,
+    the cap is reversed.
+
+    This avoids a global fix_winding over the entire mesh.
+    """
+    faces = numpy.asarray(combined.faces, dtype=numpy.int64)
+    if base_faces <= 0 or base_faces >= len(faces):
+        return
+
+    # Encode the directed edges of the original (already-consistent) faces as
+    # int64 keys, vectorised -- a per-face Python loop here is the dominant
+    # cost on large meshes (hundreds of thousands of faces).
+    orig = faces[:base_faces]
+    key_base = int(faces.max()) + 1
+    orig_directed = numpy.concatenate([
+        orig[:, 0] * key_base + orig[:, 1],
+        orig[:, 1] * key_base + orig[:, 2],
+        orig[:, 2] * key_base + orig[:, 0],
+    ])
+    orig_directed.sort()
+
+    def _is_directed(x: int, y: int) -> bool:
+        k = x * key_base + y
+        i = numpy.searchsorted(orig_directed, k)
+        return i < len(orig_directed) and orig_directed[i] == k
+
+    new_faces = faces.copy()
+    flipped_any = False
+    for start, end in cap_face_ranges:
+        flip = None
+        for fi in range(start, end):
+            a, b, c = int(faces[fi][0]), int(faces[fi][1]), int(faces[fi][2])
+            for x, y in ((a, b), (b, c), (c, a)):
+                if _is_directed(x, y):
+                    flip = True  # same direction as original -> inconsistent
+                    break
+                if _is_directed(y, x):
+                    flip = False  # opposite direction -> already consistent
+                    break
+            if flip is not None:
+                break
+        if flip:
+            new_faces[start:end] = new_faces[start:end][:, ::-1]
+            flipped_any = True
+
+    if flipped_any:
+        combined.faces = new_faces
 
 
 def _attempt_watertight_repair(
