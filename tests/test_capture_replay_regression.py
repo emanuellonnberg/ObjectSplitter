@@ -135,3 +135,41 @@ def test_path_capture_replay_roundtrip(tmp_path):
     assert split.success
     assert len(split.upper.faces) > 0
     assert len(split.lower.faces) > 0
+
+
+def test_path_capture_replay_includes_connectors(tmp_path):
+    """A path capture with connectors enabled exercises connector placement
+    during offline replay (not just the split)."""
+    import numpy
+    import trimesh
+    from core.debug_capture import capture_operation
+
+    mesh = trimesh.creation.icosphere(subdivisions=3, radius=15.0)
+    thetas = numpy.linspace(0, 2 * numpy.pi, 6, endpoint=False)
+    waypoints = [
+        numpy.array([15.0 * numpy.cos(t), 15.0 * numpy.sin(t), 0.0])
+        for t in thetas
+    ]
+    waypoints.append(waypoints[0].copy())
+
+    capture_dir = capture_operation(
+        mesh=mesh,
+        cut_mode="path",
+        click_position=waypoints[0],
+        waypoints=waypoints,
+        path_close_loop=True,
+        path_cap_ends=True,
+        connector_enabled=True,
+        connector_diameter=3.0,
+        connector_height=2.0,
+        connector_clearance=0.15,
+        capture_dir=str(tmp_path),
+    )
+
+    result = replay_operation(capture_dir)
+    assert result["split_result"].success
+    # Connector path is now exercised by replay (was always None before).
+    cr = result["connector_result"]
+    assert cr is not None
+    assert cr.connectors_added
+    assert cr.peg_on != cr.hole_on

@@ -398,6 +398,55 @@ class TestCapNativeConnectors:
         assert near_peak >= 8
 
 
+class TestAddPathConnectors:
+    """Tests for the path-cut connector search (core.connectors)."""
+
+    def _path_split(self, sphere_mesh):
+        from core.path_cutter import chain_paths, partition_faces_by_path
+        waypoints = [
+            sphere_mesh.centroid + numpy.array([15.0, 0.0, 0.0]),
+            sphere_mesh.centroid + numpy.array([0.0, 0.0, 15.0]),
+            sphere_mesh.centroid + numpy.array([-15.0, 0.0, 0.0]),
+            sphere_mesh.centroid + numpy.array([0.0, 0.0, -15.0]),
+            sphere_mesh.centroid + numpy.array([15.0, 0.0, 0.0]),
+        ]
+        vertex_path = chain_paths(sphere_mesh, waypoints)
+        set_a, set_b = partition_faces_by_path(sphere_mesh, vertex_path)
+        split = split_by_face_sets(
+            sphere_mesh, set_a, set_b,
+            strategy_name="path_cut", attempt_hole_fill=True,
+        )
+        path_points = numpy.asarray(sphere_mesh.vertices[vertex_path], dtype=numpy.float64)
+        return split, path_points
+
+    def test_path_connector_added_on_sphere_loop(self, sphere_mesh):
+        from core.connectors import add_path_connectors
+        split, path_points = self._path_split(sphere_mesh)
+        assert split.success and split.cap_faces_upper and split.cap_faces_lower
+
+        cr = add_path_connectors(
+            split.upper, split.lower, path_points,
+            split.cap_faces_upper, split.cap_faces_lower,
+            config=ConnectorConfig(diameter=3.0, height=2.0, clearance=0.15),
+            face_count=len(sphere_mesh.faces),
+        )
+        assert cr.connectors_added
+        assert cr.peg_on != cr.hole_on
+        assert cr.attempts >= 1
+        assert len(cr.upper.faces) > 0 and len(cr.lower.faces) > 0
+
+    def test_path_connector_disabled(self, sphere_mesh):
+        from core.connectors import add_path_connectors
+        split, path_points = self._path_split(sphere_mesh)
+        cr = add_path_connectors(
+            split.upper, split.lower, path_points,
+            split.cap_faces_upper, split.cap_faces_lower,
+            config=ConnectorConfig(enabled=False),
+        )
+        assert not cr.connectors_added
+        assert cr.skipped_reason == "connectors disabled"
+
+
 class TestCreatePegHoleArbitraryNormals:
     """Tests for peg/hole creation with various normal orientations."""
 
