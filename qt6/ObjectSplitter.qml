@@ -892,9 +892,27 @@ Item {
 
         // Connector Section
         Column {
+            id: connectorsSection
+            property bool expandedState: false
             width: parent.width
             spacing: Math.round(UM.Theme.getSize("default_margin").height / 2)
             visible: !(UM.ActiveTool && UM.ActiveTool.properties.getValue("CutMode") === "path_isolate")
+
+            Row {  // collapsible header
+                spacing: Math.round(UM.Theme.getSize("default_margin").width / 4)
+                Label {
+                    text: (connectorsSection.expandedState ? "▾  " : "▸  ") + "Connectors"
+                    font: UM.Theme.getFont("default_bold")
+                    color: UM.Theme.getColor("text")
+                    renderType: Text.NativeRendering
+                }
+                MouseArea { anchors.fill: parent; onClicked: connectorsSection.expandedState = !connectorsSection.expandedState }
+            }
+
+            Column {  // collapsible body
+                visible: connectorsSection.expandedState
+                width: parent.width
+                spacing: Math.round(UM.Theme.getSize("default_margin").height / 2)
 
             // Connector Enable Toggle
             Row {
@@ -1065,6 +1083,7 @@ Item {
                     }
                 }
             }
+            }  // end collapsible body
         }
 
         // Separator
@@ -1076,8 +1095,26 @@ Item {
 
         // Debug Capture Toggle
         Column {
+            id: debugSection
+            property bool expandedState: false
             width: parent.width
             spacing: Math.round(UM.Theme.getSize("default_margin").height / 2)
+
+            Row {  // collapsible header
+                spacing: Math.round(UM.Theme.getSize("default_margin").width / 4)
+                Label {
+                    text: (debugSection.expandedState ? "▾  " : "▸  ") + "Debug"
+                    font: UM.Theme.getFont("default_bold")
+                    color: UM.Theme.getColor("text")
+                    renderType: Text.NativeRendering
+                }
+                MouseArea { anchors.fill: parent; onClicked: debugSection.expandedState = !debugSection.expandedState }
+            }
+
+            Column {  // collapsible body
+                visible: debugSection.expandedState
+                width: parent.width
+                spacing: Math.round(UM.Theme.getSize("default_margin").height / 2)
 
             Row {
                 spacing: Math.round(UM.Theme.getSize("default_margin").width / 2)
@@ -1117,6 +1154,7 @@ Item {
                 wrapMode: Text.WordWrap
                 renderType: Text.NativeRendering
             }
+            }  // end collapsible body
         }
 
         // Separator
