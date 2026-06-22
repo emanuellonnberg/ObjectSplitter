@@ -187,7 +187,7 @@ def load_captured_operation(capture_path: str) -> tuple:
     return mesh, params
 
 
-def replay_operation(capture_path: str) -> dict:
+def replay_operation(capture_path: str, preloaded: Optional[tuple] = None) -> dict:
     """
     Replay a captured operation and return the results.
 
@@ -196,6 +196,10 @@ def replay_operation(capture_path: str) -> dict:
 
     Args:
         capture_path: Path to the capture directory.
+        preloaded: Optional ``(mesh, params)`` from a prior
+            ``load_captured_operation`` call. When given, the mesh is not
+            re-read from disk, so callers timing/profiling the cut can keep
+            disk I/O and STL parsing out of their measurements.
 
     Returns:
         Dictionary with keys:
@@ -219,7 +223,10 @@ def replay_operation(capture_path: str) -> dict:
     from .path_cutter import chain_paths, partition_faces_by_path
     from .connectors import add_connectors, ConnectorConfig
 
-    mesh, params = load_captured_operation(capture_path)
+    if preloaded is not None:
+        mesh, params = preloaded
+    else:
+        mesh, params = load_captured_operation(capture_path)
     click_pos = numpy.array(params.click_position)
 
     # Path (multi-point) mode replays purely from waypoints; it never

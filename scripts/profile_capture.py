@@ -44,7 +44,10 @@ def main():
 
     from core.debug_capture import load_captured_operation, replay_operation
 
+    # Load once, outside all timing, so disk I/O and STL parsing do not
+    # contaminate the wall-clock or cProfile measurements of the cut itself.
     mesh, params = load_captured_operation(args.capture_dir)
+    preloaded = (mesh, params)
     print("Capture:        %s" % args.capture_dir)
     print("Mode:           %s" % params.cut_mode)
     print("Mesh:           %d verts, %d faces" % (len(mesh.vertices), len(mesh.faces)))
@@ -55,7 +58,7 @@ def main():
     # Wall-clock first (uncontaminated by profiler overhead).
     t0 = time.perf_counter()
     for _ in range(args.repeat):
-        replay_operation(args.capture_dir)
+        replay_operation(args.capture_dir, preloaded=preloaded)
     wall = (time.perf_counter() - t0) / max(args.repeat, 1)
     print("Wall-clock replay: %.1f ms (avg of %d)" % (wall * 1000.0, args.repeat))
     print("-" * 60)
@@ -63,7 +66,7 @@ def main():
     # Profiled run.
     profiler = cProfile.Profile()
     profiler.enable()
-    replay_operation(args.capture_dir)
+    replay_operation(args.capture_dir, preloaded=preloaded)
     profiler.disable()
 
     stats = pstats.Stats(profiler)
