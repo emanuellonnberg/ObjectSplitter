@@ -1,0 +1,18 @@
+# Runtime dependencies to bundle into the plugin's lib/ folder.
+# Bundled with: python scripts/bundle_deps.py  (uses --no-deps; see that script)
+#
+# Only packages Cura does NOT ship are bundled here. Cura provides numpy,
+# scipy and shapely (ABI-correct for its own Python/platform), so we rely on
+# those instead of bundling Python-version-locked copies -- that keeps the
+# plugin working across Cura updates and avoids the cp3xx mismatch.
+#
+# Cura ships trimesh 3.9.x, but the plugin needs 4.x APIs (section() without
+# rtree, to_2D), so trimesh 4.x is bundled and loaded ahead of Cura's via
+# __init__.py.
+trimesh>=4.0.0
+# networkx: pure-Python, not shipped by Cura.
+networkx>=3.0.0
+# rtree: enables trimesh's capped planar slice (watertight). Its wheel bundles
+# libspatialindex; it is a plain DLL (not Python-version-locked), so it is safe
+# to keep on Windows. Without it, capping falls back to manual triangulation.
+rtree>=1.0.0

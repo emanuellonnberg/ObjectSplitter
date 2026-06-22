@@ -1,13 +1,17 @@
 # Copyright (c) 2024 Emanuel Lönnberg.
 # This tool is released under the terms of the LGPLv3 or higher.
 
-# Bundle trimesh and its dependencies for use inside Cura (which doesn't ship them).
-# Add plugin lib/ to sys.path before any other imports.
+# Add the plugin's lib/ (bundled non-Cura deps) to sys.path before other imports.
 #
-# Cura ships an old trimesh (3.9.36) whose section() requires rtree (not
-# available in Cura) and lacks the to_2D() API. We replace it globally with
-# our bundled trimesh 4.x. This is safe because trimesh 4.x is backward
-# compatible for the operations Cura uses (mesh loading via trimesh.load()).
+# Only packages Cura does not ship are bundled in lib/: trimesh 4.x, networkx
+# and rtree. numpy, scipy and shapely come from Cura itself, so the plugin
+# stays ABI-correct across Cura updates instead of carrying Python-version-
+# locked copies. See requirements-bundle.txt / scripts/bundle_deps.py.
+#
+# Cura ships an old trimesh (3.9.36) whose section() requires rtree and lacks
+# the to_2D() API, so we load our bundled trimesh 4.x ahead of it (replacing
+# the cached 3.x module). trimesh 4.x is backward compatible for the operations
+# Cura uses (mesh loading via trimesh.load()).
 import sys
 import os
 _plugin_dir = os.path.dirname(os.path.abspath(__file__))
