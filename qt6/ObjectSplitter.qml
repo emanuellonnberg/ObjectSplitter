@@ -173,6 +173,9 @@ Item {
                 text: "Close loop"
                 visible: UM.ActiveTool && UM.ActiveTool.properties.getValue("CutMode") === "path"
                 checked: UM.ActiveTool ? UM.ActiveTool.properties.getValue("PathCloseLoop") : false
+                hoverEnabled: true
+                ToolTip.visible: hovered
+                ToolTip.text: "Close the path into a loop so the cut separates an enclosed region."
                 onClicked: {
                     if (UM.ActiveTool) {
                         UM.ActiveTool.setProperty("PathCloseLoop", checked)
@@ -185,6 +188,9 @@ Item {
                 text: "Cap Path Cut"
                 visible: UM.ActiveTool && UM.ActiveTool.properties.getValue("CutMode") === "path"
                 checked: UM.ActiveTool ? UM.ActiveTool.properties.getValue("PathCapEnds") : true
+                hoverEnabled: true
+                ToolTip.visible: hovered
+                ToolTip.text: "Seal the cut faces so each half is closed, independent of connectors."
                 onClicked: {
                     if (UM.ActiveTool) {
                         UM.ActiveTool.setProperty("PathCapEnds", checked)
@@ -197,6 +203,9 @@ Item {
                 text: "Insert Points"
                 visible: UM.ActiveTool && UM.ActiveTool.properties.getValue("CutMode") === "path"
                 checked: UM.ActiveTool ? UM.ActiveTool.properties.getValue("PathInsertMode") : false
+                hoverEnabled: true
+                ToolTip.visible: hovered
+                ToolTip.text: "New clicks are inserted between the nearest existing points instead of appended to the end."
                 onClicked: {
                     if (UM.ActiveTool) {
                         UM.ActiveTool.setProperty("PathInsertMode", checked)
@@ -227,6 +236,9 @@ Item {
                         id: smallMarkersCheckbox
                         text: "Small Markers"
                         checked: UM.ActiveTool ? UM.ActiveTool.properties.getValue("PathSmallMarkers") : false
+                        hoverEnabled: true
+                        ToolTip.visible: hovered
+                        ToolTip.text: "Smaller dots and a smaller grab radius help place points closer together."
                         onClicked: {
                             if (UM.ActiveTool) {
                                 UM.ActiveTool.setProperty("PathSmallMarkers", checked)
@@ -269,38 +281,6 @@ Item {
                         }
                     }
                 }
-            }
-
-            Label {
-                width: parent.width
-                visible: UM.ActiveTool &&
-                         UM.ActiveTool.properties.getValue("CutMode") === "path" &&
-                         UM.ActiveTool.properties.getValue("PathInsertMode")
-                text: "Insert mode places new clicks between the nearest points."
-                font: UM.Theme.getFont("default_italic")
-                color: UM.Theme.getColor("text_inactive")
-                wrapMode: Text.WordWrap
-                renderType: Text.NativeRendering
-            }
-
-            Label {
-                width: parent.width
-                visible: UM.ActiveTool && UM.ActiveTool.properties.getValue("PathSmallMarkers")
-                text: "Smaller dots and a smaller grab radius help place points closer together."
-                font: UM.Theme.getFont("default_italic")
-                color: UM.Theme.getColor("text_inactive")
-                wrapMode: Text.WordWrap
-                renderType: Text.NativeRendering
-            }
-
-            Label {
-                width: parent.width
-                visible: UM.ActiveTool && UM.ActiveTool.properties.getValue("CutMode") === "path"
-                text: "Undo steps through point edits. After a path cut, Undo restores the original object and path points."
-                font: UM.Theme.getFont("default_italic")
-                color: UM.Theme.getColor("text_inactive")
-                wrapMode: Text.WordWrap
-                renderType: Text.NativeRendering
             }
 
             Label {
@@ -447,6 +427,9 @@ Item {
                         id: isolateSmallMarkersCheckbox
                         text: "Small Markers"
                         checked: UM.ActiveTool ? UM.ActiveTool.properties.getValue("PathSmallMarkers") : false
+                        hoverEnabled: true
+                        ToolTip.visible: hovered
+                        ToolTip.text: "Smaller dots and a smaller grab radius help place isolate-loop points closer together."
                         onClicked: {
                             if (UM.ActiveTool) {
                                 UM.ActiveTool.setProperty("PathSmallMarkers", checked)
@@ -489,25 +472,6 @@ Item {
                         }
                     }
                 }
-            }
-
-            Label {
-                width: parent.width
-                visible: UM.ActiveTool && UM.ActiveTool.properties.getValue("PathSmallMarkers")
-                text: "Smaller dots and a smaller grab radius help place isolate-loop points closer together."
-                font: UM.Theme.getFont("default_italic")
-                color: UM.Theme.getColor("text_inactive")
-                wrapMode: Text.WordWrap
-                renderType: Text.NativeRendering
-            }
-
-            Label {
-                width: parent.width
-                text: "Undo steps through loop edits. After isolate, Undo restores the original object, loops, and target."
-                font: UM.Theme.getFont("default_italic")
-                color: UM.Theme.getColor("text_inactive")
-                wrapMode: Text.WordWrap
-                renderType: Text.NativeRendering
             }
 
             Row {
@@ -625,6 +589,9 @@ Item {
                 id: isolateCleanupCheckBox
                 text: "Remove Tiny Fragments"
                 checked: UM.ActiveTool ? UM.ActiveTool.properties.getValue("PathIsolatePruneTinyFragments") : true
+                hoverEnabled: true
+                ToolTip.visible: hovered
+                ToolTip.text: "Drops disconnected pieces smaller than the threshold from each output."
                 onClicked: {
                     if (UM.ActiveTool) {
                         UM.ActiveTool.setProperty("PathIsolatePruneTinyFragments", checked)
@@ -636,15 +603,6 @@ Item {
                 width: parent.width
                 spacing: Math.round(UM.Theme.getSize("default_margin").height / 3)
                 visible: UM.ActiveTool && UM.ActiveTool.properties.getValue("PathIsolatePruneTinyFragments")
-
-                Label {
-                    width: parent.width
-                    text: "Drops disconnected pieces smaller than the threshold from each output."
-                    font: UM.Theme.getFont("default_italic")
-                    color: UM.Theme.getColor("text_inactive")
-                    wrapMode: Text.WordWrap
-                    renderType: Text.NativeRendering
-                }
 
                 RowLayout {
                     width: parent.width
@@ -820,6 +778,9 @@ Item {
                     to: 36
                     value: UM.ActiveTool ? UM.ActiveTool.properties.getValue("SearchResolution") : 18
                     stepSize: 1
+                    hoverEnabled: true
+                    ToolTip.visible: hovered
+                    ToolTip.text: "Higher = more accurate but slower."
 
                     onValueChanged: {
                         if (UM.ActiveTool) {
@@ -837,14 +798,6 @@ Item {
                     renderType: Text.NativeRendering
                     width: 30
                 }
-            }
-
-            Label {
-                width: parent.width
-                text: "Higher = more accurate but slower"
-                font: UM.Theme.getFont("default_italic")
-                color: UM.Theme.getColor("text_inactive")
-                renderType: Text.NativeRendering
             }
         }
 
