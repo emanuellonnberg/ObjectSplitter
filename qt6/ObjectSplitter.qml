@@ -289,13 +289,14 @@ Item {
                 renderType: Text.NativeRendering
             }
 
-            Row {
+            RowLayout {
+                width: parent.width
                 spacing: Math.round(UM.Theme.getSize("default_margin").width / 2)
 
                 Button {
                     text: "Clear Points"
-                    width: 85
-                    height: UM.Theme.getSize("setting_control").height
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: UM.Theme.getSize("setting_control").height
                     onClicked: {
                         if (UM.ActiveTool) {
                             UM.ActiveTool.setProperty("ClearPathPoints", true)
@@ -306,8 +307,9 @@ Item {
                 Button {
                     text: "Remove Selected"
                     visible: UM.ActiveTool && UM.ActiveTool.properties.getValue("CutMode") === "path"
-                    width: 120
-                    height: UM.Theme.getSize("setting_control").height
+                    Layout.fillWidth: true
+                    Layout.preferredWidth: visible ? implicitWidth : 0
+                    Layout.preferredHeight: UM.Theme.getSize("setting_control").height
                     enabled: UM.ActiveTool && UM.ActiveTool.properties.getValue("HasSelectedPathPoint")
                     onClicked: {
                         if (UM.ActiveTool) {
@@ -318,8 +320,8 @@ Item {
 
                 Button {
                     text: (UM.ActiveTool && UM.ActiveTool.properties.getValue("CutMode") === "path") ? "Cut Along Path" : "Cut Using Points"
-                    width: 100
-                    height: UM.Theme.getSize("setting_control").height
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: UM.Theme.getSize("setting_control").height
                     enabled: UM.ActiveTool && (
                         (UM.ActiveTool.properties.getValue("CutMode") === "path" && UM.ActiveTool.properties.getValue("PathPointCount") >= 2) ||
                         (UM.ActiveTool.properties.getValue("CutMode") !== "path" && UM.ActiveTool.properties.getValue("PathPointCount") >= 1)
@@ -595,22 +597,23 @@ Item {
                     renderType: Text.NativeRendering
                 }
 
-                Row {
+                RowLayout {
+                    width: parent.width
                     spacing: Math.round(UM.Theme.getSize("default_margin").width / 2)
 
                     Label {
-                        height: UM.Theme.getSize("setting_control").height
+                        Layout.preferredWidth: 70
+                        Layout.preferredHeight: UM.Theme.getSize("setting_control").height
                         text: "Min faces:"
                         font: UM.Theme.getFont("default")
                         color: UM.Theme.getColor("text")
                         verticalAlignment: Text.AlignVCenter
                         renderType: Text.NativeRendering
-                        width: 70
                     }
 
                     Slider {
                         id: isolateFragmentSlider
-                        width: 120
+                        Layout.fillWidth: true
                         from: 0
                         to: 300
                         stepSize: 10
@@ -624,13 +627,13 @@ Item {
                     }
 
                     Label {
-                        height: UM.Theme.getSize("setting_control").height
+                        Layout.preferredWidth: 65
+                        Layout.preferredHeight: UM.Theme.getSize("setting_control").height
                         text: Math.round(isolateFragmentSlider.value) + " faces"
                         font: UM.Theme.getFont("default")
                         color: UM.Theme.getColor("text")
                         verticalAlignment: Text.AlignVCenter
                         renderType: Text.NativeRendering
-                        width: 65
                     }
                 }
             }
@@ -940,22 +943,23 @@ Item {
                 visible: connectorCheckBox.checked
 
                 // Diameter
-                Row {
+                RowLayout {
+                    width: parent.width
                     spacing: Math.round(UM.Theme.getSize("default_margin").width / 2)
 
                     Label {
-                        height: UM.Theme.getSize("setting_control").height
+                        Layout.preferredWidth: 70
+                        Layout.preferredHeight: UM.Theme.getSize("setting_control").height
                         text: catalog.i18nc("@label", "Diameter:")
                         font: UM.Theme.getFont("default")
                         color: UM.Theme.getColor("text")
                         verticalAlignment: Text.AlignVCenter
                         renderType: Text.NativeRendering
-                        width: 70
                     }
 
                     Slider {
                         id: diameterSlider
-                        width: 120
+                        Layout.fillWidth: true
                         from: 2
                         to: 10
                         value: UM.ActiveTool ? UM.ActiveTool.properties.getValue("ConnectorDiameter") : 4
@@ -969,33 +973,34 @@ Item {
                     }
 
                     Label {
-                        height: UM.Theme.getSize("setting_control").height
+                        Layout.preferredWidth: 50
+                        Layout.preferredHeight: UM.Theme.getSize("setting_control").height
                         text: diameterSlider.value.toFixed(1) + " mm"
                         font: UM.Theme.getFont("default")
                         color: UM.Theme.getColor("text")
                         verticalAlignment: Text.AlignVCenter
                         renderType: Text.NativeRendering
-                        width: 50
                     }
                 }
 
                 // Height
-                Row {
+                RowLayout {
+                    width: parent.width
                     spacing: Math.round(UM.Theme.getSize("default_margin").width / 2)
 
                     Label {
-                        height: UM.Theme.getSize("setting_control").height
+                        Layout.preferredWidth: 70
+                        Layout.preferredHeight: UM.Theme.getSize("setting_control").height
                         text: catalog.i18nc("@label", "Height:")
                         font: UM.Theme.getFont("default")
                         color: UM.Theme.getColor("text")
                         verticalAlignment: Text.AlignVCenter
                         renderType: Text.NativeRendering
-                        width: 70
                     }
 
                     Slider {
                         id: heightConnectorSlider
-                        width: 120
+                        Layout.fillWidth: true
                         from: 1
                         to: 8
                         value: UM.ActiveTool ? UM.ActiveTool.properties.getValue("ConnectorHeight") : 3
@@ -1009,33 +1014,34 @@ Item {
                     }
 
                     Label {
-                        height: UM.Theme.getSize("setting_control").height
+                        Layout.preferredWidth: 50
+                        Layout.preferredHeight: UM.Theme.getSize("setting_control").height
                         text: heightConnectorSlider.value.toFixed(1) + " mm"
                         font: UM.Theme.getFont("default")
                         color: UM.Theme.getColor("text")
                         verticalAlignment: Text.AlignVCenter
                         renderType: Text.NativeRendering
-                        width: 50
                     }
                 }
 
                 // Clearance
-                Row {
+                RowLayout {
+                    width: parent.width
                     spacing: Math.round(UM.Theme.getSize("default_margin").width / 2)
 
                     Label {
-                        height: UM.Theme.getSize("setting_control").height
+                        Layout.preferredWidth: 70
+                        Layout.preferredHeight: UM.Theme.getSize("setting_control").height
                         text: catalog.i18nc("@label", "Clearance:")
                         font: UM.Theme.getFont("default")
                         color: UM.Theme.getColor("text")
                         verticalAlignment: Text.AlignVCenter
                         renderType: Text.NativeRendering
-                        width: 70
                     }
 
                     Slider {
                         id: clearanceSlider
-                        width: 120
+                        Layout.fillWidth: true
                         from: 0.1
                         to: 0.5
                         value: UM.ActiveTool ? UM.ActiveTool.properties.getValue("ConnectorClearance") : 0.2
@@ -1049,13 +1055,13 @@ Item {
                     }
 
                     Label {
-                        height: UM.Theme.getSize("setting_control").height
+                        Layout.preferredWidth: 50
+                        Layout.preferredHeight: UM.Theme.getSize("setting_control").height
                         text: clearanceSlider.value.toFixed(2) + " mm"
                         font: UM.Theme.getFont("default")
                         color: UM.Theme.getColor("text")
                         verticalAlignment: Text.AlignVCenter
                         renderType: Text.NativeRendering
-                        width: 50
                     }
                 }
             }
