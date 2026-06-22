@@ -107,6 +107,7 @@ from .core.connectors import (
     add_connectors,
     add_connectors_at_position,
     add_cap_native_connectors,
+    add_path_connectors,
     boolean_engine_available,
     find_connector_position,
     ConnectorConfig,
@@ -2390,8 +2391,9 @@ class ObjectSplitter(Tool):
                 self._logPathHalfDiagnostics("upper", mesh_upper)
                 self._logPathHalfDiagnostics("lower", mesh_lower)
 
-            # Path-mode connectors (non-planar): place at seam midpoint and use
-            # centroid-separation as an approximate connector direction.
+            # Path-mode connectors (non-planar): delegate the candidate search
+            # to core.connectors.add_path_connectors so the logic is testable
+            # and exercised by offline replay/profiling.
             if self._connector_enabled:
                 if len(vertex_path) >= 2:
                     try:
@@ -2404,218 +2406,34 @@ class ObjectSplitter(Tool):
                         )
                         self._updateProgress("Adding connectors...", 80)
                         path_points = numpy.asarray(tm.vertices[vertex_path], dtype=numpy.float64)
-                        base_normal = numpy.asarray(
-                            mesh_upper.centroid - mesh_lower.centroid, dtype=numpy.float64
+                        cr = add_path_connectors(
+                            mesh_upper,
+                            mesh_lower,
+                            path_points,
+                            split_result.cap_faces_upper,
+                            split_result.cap_faces_lower,
+                            config=ConnectorConfig(
+                                enabled=True,
+                                diameter=float(self._connector_diameter),
+                                height=float(self._connector_height),
+                                clearance=float(self._connector_clearance),
+                                sides=self._connector_sides,
+                            ),
+                            face_count=len(tm.faces),
                         )
-                        if numpy.linalg.norm(base_normal) < 1e-9:
-                            base_normal = numpy.asarray(
-                                path_points[-1] - path_points[0], dtype=numpy.float64
+                        if cr.connectors_added:
+                            mesh_upper = cr.upper
+                            mesh_lower = cr.lower
+                            Logger.log(
+                                "i",
+                                "Path connectors added: peg on %s, hole on %s (engine: %s, attempts=%d)",
+                                cr.peg_on, cr.hole_on, cr.hole_engine, cr.attempts,
                             )
-                        if numpy.linalg.norm(base_normal) < 1e-9:
-                            base_normal = numpy.array([0.0, 1.0, 0.0], dtype=numpy.float64)
-
-                        base_diameter = float(self._connector_diameter)
-                        base_height = float(self._connector_height)
-                        base_clearance = float(self._connector_clearance)
-                        # Retry with smaller connectors when geometry is too
-                        # thin/complex for the default size at a candidate point.
-                        size_scales = [1.0, 0.85, 0.7]
-                        if base_diameter <= 1.2 or base_height <= 1.0:
-                            size_scales = [1.0]
-
-                        # Try multiple candidate points across the seam instead of
-                        # only the exact midpoint. This improves robustness on
-                        # organic meshes where a single point may be too close to
-                        # thin features or rough triangles for boolean subtraction.
-                        n_path = len(path_points)
-                        if n_path <= 2:
-                            candidate_indices = [n_path // 2]
                         else:
-                            if len(tm.faces) > 200000:
-                                # Prefer geometric center first; fall back to side
-                                # positions only if center fails.
-                                fraction_seeds = [0.50, 0.33, 0.67]
-                            else:
-                                fraction_seeds = [0.50, 0.25, 0.75]
-                            candidate_indices = []
-                            for frac in fraction_seeds:
-                                idx = int(round((n_path - 1) * frac))
-                                idx = max(1, min(n_path - 2, idx))
-                                if idx not in candidate_indices:
-                                    candidate_indices.append(idx)
-                            if not candidate_indices:
-                                candidate_indices = [n_path // 2]
-
-                        attempt_failures = []
-                        connector_added = False
-                        total_attempts = 0
-
-                        for idx in candidate_indices:
-                            connector_pos = numpy.asarray(path_points[idx], dtype=numpy.float64)
-
-                            # Estimate a local seam tangent and remove tangent
-                            # component from base normal for a cleaner cut-through
-                            # direction at this candidate point.
-                            prev_idx = max(0, idx - 1)
-                            next_idx = min(n_path - 1, idx + 1)
-                            tangent = numpy.asarray(
-                                path_points[next_idx] - path_points[prev_idx],
-                                dtype=numpy.float64,
-                            )
-
-                            local_normal = numpy.asarray(base_normal, dtype=numpy.float64)
-                            tan_len = numpy.linalg.norm(tangent)
-                            if tan_len > 1e-9:
-                                tangent = tangent / tan_len
-                                projected = local_normal - numpy.dot(local_normal, tangent) * tangent
-                                if numpy.linalg.norm(projected) > 1e-9:
-                                    local_normal = projected
-
-                            normal_variants = [local_normal, -local_normal]
-                            for normal_variant in normal_variants:
-                                # Refine candidate position toward the local
-                                # cross-section center to avoid placing the hole
-                                # directly on a seam edge.
-                                refined_pos = connector_pos
-                                upper_pos = None
-                                lower_pos = None
-                                try:
-                                    upper_pos = find_connector_position(
-                                        mesh_upper, connector_pos, normal_variant
-                                    )
-                                except Exception:
-                                    pass
-                                try:
-                                    lower_pos = find_connector_position(
-                                        mesh_lower, connector_pos, normal_variant
-                                    )
-                                except Exception:
-                                    pass
-
-                                if upper_pos is not None and lower_pos is not None:
-                                    refined_pos = 0.5 * (
-                                        numpy.asarray(upper_pos, dtype=numpy.float64) +
-                                        numpy.asarray(lower_pos, dtype=numpy.float64)
-                                    )
-                                elif upper_pos is not None:
-                                    refined_pos = numpy.asarray(upper_pos, dtype=numpy.float64)
-                                elif lower_pos is not None:
-                                    refined_pos = numpy.asarray(lower_pos, dtype=numpy.float64)
-
-                                # Small lateral offsets move the tool away from
-                                # numerically unstable seam-edge placements.
-                                position_variants = [numpy.asarray(refined_pos, dtype=numpy.float64)]
-                                side_dir = numpy.cross(normal_variant, tangent)
-                                side_len = numpy.linalg.norm(side_dir)
-                                if side_len > 1e-9:
-                                    side_dir = side_dir / side_len
-                                    lateral = max(0.15, base_diameter * 0.15)
-                                    position_variants.append(
-                                        numpy.asarray(refined_pos, dtype=numpy.float64) + side_dir * lateral
-                                    )
-                                    position_variants.append(
-                                        numpy.asarray(refined_pos, dtype=numpy.float64) - side_dir * lateral
-                                    )
-
-                                for scale in size_scales:
-                                    for pos_variant in position_variants:
-                                        total_attempts += 1
-                                        config = ConnectorConfig(
-                                            enabled=True,
-                                            diameter=max(0.6, base_diameter * scale),
-                                            height=max(0.6, base_height * scale),
-                                            clearance=base_clearance,
-                                            sides=self._connector_sides,
-                                        )
-
-                                        # Preferred path: cap-native connector deformation
-                                        # on matched cap patches (no boolean subtraction).
-                                        if (
-                                            split_result.cap_faces_upper and
-                                            split_result.cap_faces_lower
-                                        ):
-                                            cap_native_result = add_cap_native_connectors(
-                                                mesh_upper=mesh_upper,
-                                                mesh_lower=mesh_lower,
-                                                connector_position=pos_variant,
-                                                connector_normal=normal_variant,
-                                                cap_faces_upper=split_result.cap_faces_upper,
-                                                cap_faces_lower=split_result.cap_faces_lower,
-                                                config=config,
-                                            )
-                                            if cap_native_result.connectors_added:
-                                                mesh_upper = cap_native_result.upper
-                                                mesh_lower = cap_native_result.lower
-                                                Logger.log(
-                                                    "i",
-                                                    "Path connectors added: peg on %s, hole on %s "
-                                                    "(engine: %s, attempts=%d, scale=%.2f)",
-                                                    cap_native_result.peg_on,
-                                                    cap_native_result.hole_on,
-                                                    cap_native_result.hole_engine,
-                                                    total_attempts,
-                                                    scale,
-                                                )
-                                                connector_added = True
-                                                break
-
-                                        # Boolean connectors need a working boolean
-                                        # engine (manifold/blender). When none is
-                                        # available every attempt fails slowly, so
-                                        # skip the boolean path entirely instead of
-                                        # retrying it for every candidate/scale.
-                                        if not boolean_engine_available():
-                                            attempt_failures.append(
-                                                f"idx={idx},s={scale:.2f}: cap-native failed, "
-                                                "no boolean engine for fallback"
-                                            )
-                                            continue
-
-                                        connector_result = add_connectors_at_position(
-                                            mesh_upper=mesh_upper,
-                                            mesh_lower=mesh_lower,
-                                            connector_position=pos_variant,
-                                            connector_normal=normal_variant,
-                                            config=config,
-                                        )
-                                        if connector_result.connectors_added:
-                                            mesh_upper = connector_result.upper
-                                            mesh_lower = connector_result.lower
-                                            Logger.log(
-                                                "i",
-                                                "Path connectors added: peg on %s, hole on %s "
-                                                "(engine: %s, attempts=%d, scale=%.2f)",
-                                                connector_result.peg_on,
-                                                connector_result.hole_on,
-                                                connector_result.hole_engine,
-                                                total_attempts,
-                                                scale,
-                                            )
-                                            connector_added = True
-                                            break
-
-                                        attempt_failures.append(
-                                            f"idx={idx},s={scale:.2f}: {connector_result.skipped_reason}"
-                                        )
-
-                                    if connector_added:
-                                        break
-
-                                if connector_added:
-                                    break
-
-                            if connector_added:
-                                break
-
-                        if not connector_added:
-                            preview = "; ".join(attempt_failures[:4])
-                            if len(attempt_failures) > 4:
-                                preview += f"; ... ({len(attempt_failures)} attempts)"
                             Logger.log(
                                 "w",
                                 "Path connectors skipped after %d attempts: %s",
-                                total_attempts,
-                                preview if preview else "no connector candidate succeeded",
+                                cr.attempts, cr.skipped_reason,
                             )
                     except Exception as e:
                         Logger.log("w", "Path connectors error: %s", str(e))

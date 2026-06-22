@@ -247,9 +247,29 @@ def replay_operation(capture_path: str, preloaded: Optional[tuple] = None) -> di
             strategy_name="path_cut",
             attempt_hole_fill=(params.connector_enabled or params.path_cap_ends),
         )
+
+        connector_result = None
+        if params.connector_enabled and split_result.success:
+            from .connectors import add_path_connectors
+            path_points = numpy.asarray(mesh.vertices[vertex_path], dtype=numpy.float64)
+            connector_result = add_path_connectors(
+                split_result.upper,
+                split_result.lower,
+                path_points,
+                split_result.cap_faces_upper,
+                split_result.cap_faces_lower,
+                config=ConnectorConfig(
+                    enabled=True,
+                    diameter=params.connector_diameter,
+                    height=params.connector_height,
+                    clearance=params.connector_clearance,
+                ),
+                face_count=len(mesh.faces),
+            )
+
         return {
             'split_result': split_result,
-            'connector_result': None,
+            'connector_result': connector_result,
             'plane': None,
             'params': params,
         }
