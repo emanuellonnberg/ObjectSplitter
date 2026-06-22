@@ -57,6 +57,11 @@ class CapturedOperation:
     plane_origin: Optional[list] = None
     plane_normal: Optional[list] = None
 
+    # Path / multi-point mode parameters
+    waypoints: Optional[list] = None  # list of [x, y, z], exact points passed to the cut
+    path_close_loop: bool = True
+    path_cap_ends: bool = True
+
 
 def get_capture_dir(base_dir: Optional[str] = None) -> Path:
     """Get or create the capture directory."""
@@ -82,6 +87,9 @@ def capture_operation(
     connector_clearance: float = 0.2,
     plane_origin: Optional[numpy.ndarray] = None,
     plane_normal: Optional[numpy.ndarray] = None,
+    waypoints: Optional[list] = None,
+    path_close_loop: bool = True,
+    path_cap_ends: bool = True,
     name: Optional[str] = None,
     capture_dir: Optional[str] = None
 ) -> str:
@@ -140,6 +148,12 @@ def capture_operation(
         connector_clearance=connector_clearance,
         plane_origin=plane_origin.tolist() if plane_origin is not None else None,
         plane_normal=plane_normal.tolist() if plane_normal is not None else None,
+        waypoints=(
+            [numpy.asarray(p, dtype=numpy.float64).reshape(3).tolist() for p in waypoints]
+            if waypoints else None
+        ),
+        path_close_loop=path_close_loop,
+        path_cap_ends=path_cap_ends,
     )
 
     with open(op_dir / "params.json", "w") as f:
@@ -173,7 +187,7 @@ def load_captured_operation(capture_path: str) -> tuple:
     return mesh, params
 
 
-def replay_operation(capture_path: str) -> dict:
+def replay_operation(capture_path: str, preloaded: Optional[tuple] = None) -> dict:
     """
     Replay a captured operation and return the results.
 
@@ -182,6 +196,10 @@ def replay_operation(capture_path: str) -> dict:
 
     Args:
         capture_path: Path to the capture directory.
+        preloaded: Optional ``(mesh, params)`` from a prior
+            ``load_captured_operation`` call. When given, the mesh is not
+            re-read from disk, so callers timing/profiling the cut can keep
+            disk I/O and STL parsing out of their measurements.
 
     Returns:
         Dictionary with keys:
@@ -202,10 +220,39 @@ def replay_operation(capture_path: str) -> dict:
         split_by_local_plane,
         split_by_face_sets,
     )
+    from .path_cutter import chain_paths, partition_faces_by_path
     from .connectors import add_connectors, ConnectorConfig
 
-    mesh, params = load_captured_operation(capture_path)
+    if preloaded is not None:
+        mesh, params = preloaded
+    else:
+        mesh, params = load_captured_operation(capture_path)
     click_pos = numpy.array(params.click_position)
+
+    # Path (multi-point) mode replays purely from waypoints; it never
+    # computes a plane, so handle it up front and return early.
+    if params.cut_mode == "path":
+        waypoints = [
+            numpy.asarray(p, dtype=numpy.float64).reshape(3)
+            for p in (params.waypoints or [])
+        ]
+        if len(waypoints) < 2:
+            raise ValueError("Path replay needs at least 2 waypoints")
+        vertex_path = chain_paths(mesh, waypoints)
+        face_set_a, face_set_b = partition_faces_by_path(mesh, vertex_path)
+        split_result = split_by_face_sets(
+            mesh,
+            face_set_a,
+            face_set_b,
+            strategy_name="path_cut",
+            attempt_hole_fill=(params.connector_enabled or params.path_cap_ends),
+        )
+        return {
+            'split_result': split_result,
+            'connector_result': None,
+            'plane': None,
+            'params': params,
+        }
     anchor_points = None
     if getattr(params, "anchor_points", None):
         anchor_points = [numpy.asarray(p, dtype=numpy.float64).reshape(3) for p in params.anchor_points]
