@@ -234,47 +234,71 @@ Item {
                 }
             }
 
-            CheckBox {
-                id: smallMarkersCheckbox
-                text: "Small Markers"
-                checked: UM.ActiveTool ? UM.ActiveTool.properties.getValue("PathSmallMarkers") : false
-                onClicked: {
-                    if (UM.ActiveTool) {
-                        UM.ActiveTool.setProperty("PathSmallMarkers", checked)
+            Column {
+                id: pathDisplaySection
+                property bool expandedState: false
+                width: parent.width
+                spacing: Math.round(UM.Theme.getSize("default_margin").height / 2)
+
+                Row {  // collapsible header
+                    spacing: Math.round(UM.Theme.getSize("default_margin").width / 4)
+                    Label {
+                        text: (pathDisplaySection.expandedState ? "▾  " : "▸  ") + "Display"
+                        font: UM.Theme.getFont("default")
+                        color: UM.Theme.getColor("text_inactive")
+                        renderType: Text.NativeRendering
                     }
-                }
-            }
-
-            Row {
-                spacing: Math.round(UM.Theme.getSize("default_margin").width / 2)
-
-                Label {
-                    height: UM.Theme.getSize("setting_control").height
-                    text: "Marker Color:"
-                    font: UM.Theme.getFont("default")
-                    color: UM.Theme.getColor("text")
-                    verticalAlignment: Text.AlignVCenter
-                    renderType: Text.NativeRendering
-                    width: 90
+                    MouseArea { anchors.fill: parent; onClicked: pathDisplaySection.expandedState = !pathDisplaySection.expandedState }
                 }
 
-                ComboBox {
-                    id: pathMarkerColorComboBox
-                    width: 140
-                    height: UM.Theme.getSize("setting_control").height
-                    property var colorNames: ["cyan", "yellow", "white", "black", "magenta", "green"]
-                    model: ["Cyan", "Yellow", "White", "Black", "Magenta", "Green"]
-                    currentIndex: {
-                        if (UM.ActiveTool) {
-                            var c = UM.ActiveTool.properties.getValue("PathMarkerColor")
-                            var idx = colorNames.indexOf(c)
-                            return idx >= 0 ? idx : 0
+                Column {  // collapsible body
+                    visible: pathDisplaySection.expandedState
+                    width: parent.width
+                    spacing: Math.round(UM.Theme.getSize("default_margin").height / 2)
+
+                    CheckBox {
+                        id: smallMarkersCheckbox
+                        text: "Small Markers"
+                        checked: UM.ActiveTool ? UM.ActiveTool.properties.getValue("PathSmallMarkers") : false
+                        onClicked: {
+                            if (UM.ActiveTool) {
+                                UM.ActiveTool.setProperty("PathSmallMarkers", checked)
+                            }
                         }
-                        return 0
                     }
-                    onActivated: {
-                        if (UM.ActiveTool) {
-                            UM.ActiveTool.setProperty("PathMarkerColor", colorNames[index])
+
+                    Row {
+                        spacing: Math.round(UM.Theme.getSize("default_margin").width / 2)
+
+                        Label {
+                            height: UM.Theme.getSize("setting_control").height
+                            text: "Marker Color:"
+                            font: UM.Theme.getFont("default")
+                            color: UM.Theme.getColor("text")
+                            verticalAlignment: Text.AlignVCenter
+                            renderType: Text.NativeRendering
+                            width: 90
+                        }
+
+                        ComboBox {
+                            id: pathMarkerColorComboBox
+                            width: 140
+                            height: UM.Theme.getSize("setting_control").height
+                            property var colorNames: ["cyan", "yellow", "white", "black", "magenta", "green"]
+                            model: ["Cyan", "Yellow", "White", "Black", "Magenta", "Green"]
+                            currentIndex: {
+                                if (UM.ActiveTool) {
+                                    var c = UM.ActiveTool.properties.getValue("PathMarkerColor")
+                                    var idx = colorNames.indexOf(c)
+                                    return idx >= 0 ? idx : 0
+                                }
+                                return 0
+                            }
+                            onActivated: {
+                                if (UM.ActiveTool) {
+                                    UM.ActiveTool.setProperty("PathMarkerColor", colorNames[index])
+                                }
+                            }
                         }
                     }
                 }
@@ -429,47 +453,71 @@ Item {
                 renderType: Text.NativeRendering
             }
 
-            CheckBox {
-                id: isolateSmallMarkersCheckbox
-                text: "Small Markers"
-                checked: UM.ActiveTool ? UM.ActiveTool.properties.getValue("PathSmallMarkers") : false
-                onClicked: {
-                    if (UM.ActiveTool) {
-                        UM.ActiveTool.setProperty("PathSmallMarkers", checked)
+            Column {
+                id: isolateDisplaySection
+                property bool expandedState: false
+                width: parent.width
+                spacing: Math.round(UM.Theme.getSize("default_margin").height / 2)
+
+                Row {  // collapsible header
+                    spacing: Math.round(UM.Theme.getSize("default_margin").width / 4)
+                    Label {
+                        text: (isolateDisplaySection.expandedState ? "▾  " : "▸  ") + "Display"
+                        font: UM.Theme.getFont("default")
+                        color: UM.Theme.getColor("text_inactive")
+                        renderType: Text.NativeRendering
                     }
-                }
-            }
-
-            Row {
-                spacing: Math.round(UM.Theme.getSize("default_margin").width / 2)
-
-                Label {
-                    height: UM.Theme.getSize("setting_control").height
-                    text: "Marker Color:"
-                    font: UM.Theme.getFont("default")
-                    color: UM.Theme.getColor("text")
-                    verticalAlignment: Text.AlignVCenter
-                    renderType: Text.NativeRendering
-                    width: 90
+                    MouseArea { anchors.fill: parent; onClicked: isolateDisplaySection.expandedState = !isolateDisplaySection.expandedState }
                 }
 
-                ComboBox {
-                    id: isolatePathMarkerColorComboBox
-                    width: 140
-                    height: UM.Theme.getSize("setting_control").height
-                    property var colorNames: ["cyan", "yellow", "white", "black", "magenta", "green"]
-                    model: ["Cyan", "Yellow", "White", "Black", "Magenta", "Green"]
-                    currentIndex: {
-                        if (UM.ActiveTool) {
-                            var c = UM.ActiveTool.properties.getValue("PathMarkerColor")
-                            var idx = colorNames.indexOf(c)
-                            return idx >= 0 ? idx : 0
+                Column {  // collapsible body
+                    visible: isolateDisplaySection.expandedState
+                    width: parent.width
+                    spacing: Math.round(UM.Theme.getSize("default_margin").height / 2)
+
+                    CheckBox {
+                        id: isolateSmallMarkersCheckbox
+                        text: "Small Markers"
+                        checked: UM.ActiveTool ? UM.ActiveTool.properties.getValue("PathSmallMarkers") : false
+                        onClicked: {
+                            if (UM.ActiveTool) {
+                                UM.ActiveTool.setProperty("PathSmallMarkers", checked)
+                            }
                         }
-                        return 0
                     }
-                    onActivated: {
-                        if (UM.ActiveTool) {
-                            UM.ActiveTool.setProperty("PathMarkerColor", colorNames[index])
+
+                    Row {
+                        spacing: Math.round(UM.Theme.getSize("default_margin").width / 2)
+
+                        Label {
+                            height: UM.Theme.getSize("setting_control").height
+                            text: "Marker Color:"
+                            font: UM.Theme.getFont("default")
+                            color: UM.Theme.getColor("text")
+                            verticalAlignment: Text.AlignVCenter
+                            renderType: Text.NativeRendering
+                            width: 90
+                        }
+
+                        ComboBox {
+                            id: isolatePathMarkerColorComboBox
+                            width: 140
+                            height: UM.Theme.getSize("setting_control").height
+                            property var colorNames: ["cyan", "yellow", "white", "black", "magenta", "green"]
+                            model: ["Cyan", "Yellow", "White", "Black", "Magenta", "Green"]
+                            currentIndex: {
+                                if (UM.ActiveTool) {
+                                    var c = UM.ActiveTool.properties.getValue("PathMarkerColor")
+                                    var idx = colorNames.indexOf(c)
+                                    return idx >= 0 ? idx : 0
+                                }
+                                return 0
+                            }
+                            onActivated: {
+                                if (UM.ActiveTool) {
+                                    UM.ActiveTool.setProperty("PathMarkerColor", colorNames[index])
+                                }
+                            }
                         }
                     }
                 }
