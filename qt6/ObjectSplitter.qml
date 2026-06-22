@@ -85,8 +85,18 @@ Item {
                 id: cutModeComboBox
                 width: 170
                 height: UM.Theme.getSize("setting_control").height
-                property var modeValues: ["path", "path_isolate", "horizontal", "vertical"]
-                model: ["Multi-point", "Isolate region", "Horizontal", "Vertical"]
+                // Experimental (secondary) modes only appear in this dropdown
+                // when the "Show experimental cut modes" toggle (near Debug) is
+                // on. Auto-on when an experimental mode is already active.
+                property var primaryValues: ["path", "path_isolate", "horizontal", "vertical"]
+                property var experimentalValues: ["smallest", "shortest", "radial", "valley", "valley_seam"]
+                property bool showExperimental: UM.ActiveTool
+                    ? experimentalValues.indexOf(UM.ActiveTool.properties.getValue("CutMode")) >= 0
+                    : false
+                property var modeValues: showExperimental ? primaryValues.concat(experimentalValues) : primaryValues
+                model: showExperimental
+                    ? ["Multi-point", "Isolate region", "Horizontal", "Vertical", "Smallest Section", "Shortest Seam", "Radial (geodesic)", "Valley (groove)", "Valley Seam (concavity)"]
+                    : ["Multi-point", "Isolate region", "Horizontal", "Vertical"]
                 currentIndex: {
                     if (UM.ActiveTool) {
                         var idx = modeValues.indexOf(UM.ActiveTool.properties.getValue("CutMode"))
@@ -97,44 +107,6 @@ Item {
                 onActivated: {
                     if (UM.ActiveTool) {
                         UM.ActiveTool.setProperty("CutMode", modeValues[currentIndex])
-                    }
-                }
-            }
-        }
-
-        // Secondary ("other") cut modes, tucked behind a disclosure.
-        Column {
-            id: otherModesSection
-            width: parent.width
-            spacing: Math.round(UM.Theme.getSize("default_margin").height / 4)
-            property var secondaryValues: ["smallest", "shortest", "radial", "valley", "valley_seam"]
-            property bool expandedState: UM.ActiveTool
-                ? otherModesSection.secondaryValues.indexOf(UM.ActiveTool.properties.getValue("CutMode")) >= 0
-                : false
-
-            Label {  // collapsible header
-                text: (otherModesSection.expandedState ? "▾  " : "▸  ") + "Other modes"
-                font: UM.Theme.getFont("default")
-                color: UM.Theme.getColor("text_inactive")
-                renderType: Text.NativeRendering
-                MouseArea { anchors.fill: parent; onClicked: otherModesSection.expandedState = !otherModesSection.expandedState }
-            }
-
-            ComboBox {
-                visible: otherModesSection.expandedState
-                width: 170
-                height: UM.Theme.getSize("setting_control").height
-                model: ["Smallest Section", "Shortest Seam", "Radial (geodesic)", "Valley (groove)", "Valley Seam (concavity)"]
-                currentIndex: {
-                    if (UM.ActiveTool) {
-                        var idx = otherModesSection.secondaryValues.indexOf(UM.ActiveTool.properties.getValue("CutMode"))
-                        return idx >= 0 ? idx : 0
-                    }
-                    return 0
-                }
-                onActivated: {
-                    if (UM.ActiveTool) {
-                        UM.ActiveTool.setProperty("CutMode", otherModesSection.secondaryValues[currentIndex])
                     }
                 }
             }
@@ -239,8 +211,8 @@ Item {
 
                 Label {  // collapsible header
                     text: (pathDisplaySection.expandedState ? "▾  " : "▸  ") + "Display"
-                    font: UM.Theme.getFont("default")
-                    color: UM.Theme.getColor("text_inactive")
+                    font: UM.Theme.getFont("default_bold")
+                    color: UM.Theme.getColor("text")
                     renderType: Text.NativeRendering
                     MouseArea { anchors.fill: parent; onClicked: pathDisplaySection.expandedState = !pathDisplaySection.expandedState }
                 }
@@ -455,8 +427,8 @@ Item {
 
                 Label {  // collapsible header
                     text: (isolateDisplaySection.expandedState ? "▾  " : "▸  ") + "Display"
-                    font: UM.Theme.getFont("default")
-                    color: UM.Theme.getColor("text_inactive")
+                    font: UM.Theme.getFont("default_bold")
+                    color: UM.Theme.getColor("text")
                     renderType: Text.NativeRendering
                     MouseArea { anchors.fill: parent; onClicked: isolateDisplaySection.expandedState = !isolateDisplaySection.expandedState }
                 }
@@ -769,11 +741,12 @@ Item {
             }
         }
 
-        // Separator
+        // Separator (only when a mode-specific parameter section follows)
         Rectangle {
             width: parent.width
             height: 1
             color: UM.Theme.getColor("lining")
+            visible: UM.ActiveTool && ["horizontal", "smallest", "valley", "valley_seam"].indexOf(UM.ActiveTool.properties.getValue("CutMode")) >= 0
         }
 
         // Cut Height (for horizontal mode)
@@ -1219,6 +1192,21 @@ Item {
                 visible: debugCaptureCheckBox.checked
                 wrapMode: Text.WordWrap
                 renderType: Text.NativeRendering
+            }
+
+            CheckBox {
+                id: showExperimentalCheckBox
+                text: "Show experimental cut modes"
+                checked: cutModeComboBox.showExperimental
+                onToggled: {
+                    cutModeComboBox.showExperimental = checked
+                    // Turning it off while an experimental mode is active would
+                    // leave the combo and CutMode out of sync; snap to Multi-point.
+                    if (!checked && UM.ActiveTool &&
+                        cutModeComboBox.experimentalValues.indexOf(UM.ActiveTool.properties.getValue("CutMode")) >= 0) {
+                        UM.ActiveTool.setProperty("CutMode", "path")
+                    }
+                }
             }
             }  // end collapsible body
         }
