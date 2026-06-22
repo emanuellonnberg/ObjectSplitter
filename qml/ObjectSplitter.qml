@@ -518,16 +518,35 @@ Item {
                 }
             }
 
-            Button {
-                text: "Pick Target Region"
-                width: 140
-                height: UM.Theme.getSize("setting_control").height
-                enabled: UM.ActiveTool &&
-                         UM.ActiveTool.properties.getValue("PathLoopCount") >= 1 &&
-                         UM.ActiveTool.properties.getValue("CurrentLoopPointCount") === 0
-                onClicked: {
-                    if (UM.ActiveTool) {
-                        UM.ActiveTool.setProperty("TriggerPickPathIsolateTarget", true)
+            Row {
+                spacing: Math.round(UM.Theme.getSize("default_margin").width / 2)
+
+                Button {
+                    text: "Pick Target Region"
+                    width: 125
+                    height: UM.Theme.getSize("setting_control").height
+                    enabled: UM.ActiveTool &&
+                             UM.ActiveTool.properties.getValue("PathLoopCount") >= 1 &&
+                             UM.ActiveTool.properties.getValue("CurrentLoopPointCount") === 0
+                    onClicked: {
+                        if (UM.ActiveTool) {
+                            UM.ActiveTool.setProperty("TriggerPickPathIsolateTarget", true)
+                        }
+                    }
+                }
+
+                Button {
+                    text: "Preview Loops"
+                    width: 115
+                    height: UM.Theme.getSize("setting_control").height
+                    enabled: UM.ActiveTool && (
+                        UM.ActiveTool.properties.getValue("PathLoopCount") >= 1 ||
+                        UM.ActiveTool.properties.getValue("CurrentLoopPointCount") >= 3
+                    )
+                    onClicked: {
+                        if (UM.ActiveTool) {
+                            UM.ActiveTool.setProperty("TriggerSuggestPath", true)
+                        }
                     }
                 }
             }

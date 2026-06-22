@@ -1327,12 +1327,20 @@ class ObjectSplitter(Tool):
             self._pushPathStateUndoOperation(undo_state, redo_state)
 
     def _suggestPathFromPoints(self):
-        """Compute a geodesic path suggestion from placed points and show dotted preview."""
-        if len(self._path_waypoints) < 2:
-            Logger.log("w", "Suggest path: need at least 2 points")
-            return
+        """Compute geodesic path previews from placed points and show as dots.
+
+        In path mode this previews the single open/closed path through the
+        current waypoints. In path_isolate mode it previews every finalized
+        loop plus the current in-progress loop (closed) so the user can see
+        what the cut will actually follow before committing.
+        """
         if self._path_node is None:
             Logger.log("w", "Suggest path: no node selected")
+            return
+
+        loop_sequences = self._collectSuggestPathSequences()
+        if not loop_sequences:
+            Logger.log("w", "Suggest path: need at least 2 points")
             return
 
         try:
@@ -1343,52 +1351,112 @@ class ObjectSplitter(Tool):
             tm, _, _ = extraction
 
             from .core.path_cutter import chain_paths
-            self._updateProgress("Tracing geodesic path...", 35)
-            waypoints = [p.copy() for p in self._path_waypoints]
-            if self._path_close_loop and len(waypoints) >= 3:
-                if not numpy.allclose(waypoints[0], waypoints[-1]):
-                    waypoints.append(waypoints[0].copy())
-            vertex_path = chain_paths(tm, waypoints)
-            if not vertex_path:
+            path_points_list = []
+            total = len(loop_sequences)
+            for i, sequence in enumerate(loop_sequences):
+                progress = int(20 + 60 * (i / max(total - 1, 1)))
+                self._updateProgress(
+                    "Tracing geodesic path %d/%d..." % (i + 1, total),
+                    progress,
+                )
+                vertex_path = chain_paths(tm, sequence)
+                if not vertex_path:
+                    continue
+                points = numpy.asarray(tm.vertices[vertex_path], dtype=numpy.float64)
+                path_points_list.append(points)
+
+            if not path_points_list:
                 Logger.log("w", "Suggest path: no path returned")
                 return
 
-            path_points = numpy.asarray(tm.vertices[vertex_path], dtype=numpy.float64)
-            self._updateProgress("Rendering path preview...", 75)
-            self._showSuggestedPath(path_points)
-            Logger.log("i", "Suggested path displayed with %d vertices", len(path_points))
+            self._updateProgress("Rendering path preview...", 85)
+            self._showSuggestedPathSet(path_points_list)
+            total_verts = sum(len(p) for p in path_points_list)
+            Logger.log(
+                "i",
+                "Suggested path displayed with %d vertices across %d loop(s)",
+                total_verts,
+                len(path_points_list),
+            )
         except Exception as e:
             Logger.log("w", "Suggest path failed: %s", str(e))
         finally:
             self._closeProgress()
 
+    def _collectSuggestPathSequences(self):
+        """Return list of waypoint sequences (each a list of numpy points) to preview."""
+        sequences = []
+        if self._cut_mode == self.CUT_MODE_PATH_ISOLATE:
+            for loop in self._path_isolate_loops:
+                pts = [numpy.asarray(p, dtype=numpy.float64).copy() for p in loop]
+                if len(pts) >= 2:
+                    sequences.append(pts)
+            if len(self._path_waypoints) >= 3:
+                current = [
+                    numpy.asarray(p, dtype=numpy.float64).copy()
+                    for p in self._path_waypoints
+                ]
+                if not numpy.allclose(current[0], current[-1]):
+                    current.append(current[0].copy())
+                sequences.append(current)
+        else:
+            if len(self._path_waypoints) >= 2:
+                pts = [
+                    numpy.asarray(p, dtype=numpy.float64).copy()
+                    for p in self._path_waypoints
+                ]
+                if self._path_close_loop and len(pts) >= 3:
+                    if not numpy.allclose(pts[0], pts[-1]):
+                        pts.append(pts[0].copy())
+                sequences.append(pts)
+        return sequences
+
+    _SUGGEST_PATH_COLOR = numpy.array([0.05, 0.45, 1.0, 0.95], dtype=numpy.float32)
+
     def _showSuggestedPath(self, path_points: numpy.ndarray):
-        """Show a dotted preview of the suggested path."""
+        """Show a dotted preview of a single suggested path (clears previous)."""
         self._clearSuggestedPath()
         if path_points is None or len(path_points) == 0:
             return
+        dot_size = self._suggestedPathDotSize(path_points)
+        self._appendSuggestedPathDots(path_points, dot_size)
 
+    def _showSuggestedPathSet(self, path_points_list):
+        """Show dotted previews for multiple suggested paths (clears previous)."""
+        self._clearSuggestedPath()
+        if not path_points_list:
+            return
+        valid_paths = [p for p in path_points_list if p is not None and len(p) > 0]
+        if not valid_paths:
+            return
+        all_points = numpy.concatenate(valid_paths, axis=0)
+        dot_size = self._suggestedPathDotSize(all_points)
+        for path_points in valid_paths:
+            self._appendSuggestedPathDots(path_points, dot_size)
+
+    def _suggestedPathDotSize(self, path_points: numpy.ndarray) -> float:
         mesh_size_max = max(
             1.0,
             float(numpy.linalg.norm(path_points.max(axis=0) - path_points.min(axis=0)))
         )
-        dot_size = max(0.2, mesh_size_max * 0.005)
+        return max(0.2, mesh_size_max * 0.005)
+
+    def _appendSuggestedPathDots(self, path_points: numpy.ndarray, dot_size: float):
         max_dots = 80
         step = max(1, int(numpy.ceil(len(path_points) / max_dots)))
         sampled = path_points[::step]
         if len(sampled) == 0 or not numpy.allclose(sampled[-1], path_points[-1]):
             sampled = numpy.vstack([sampled, path_points[-1]])
 
-        suggest_color = numpy.array([0.05, 0.45, 1.0, 0.95], dtype=numpy.float32)
+        scene_root = self._controller.getScene().getRoot()
         for pt in sampled:
-            marker_node = self._createColoredMarkerNode(suggest_color)
+            marker_node = self._createColoredMarkerNode(self._SUGGEST_PATH_COLOR)
             vertices, indices = create_dot_mesh_data(pt, dot_size)
             mesh_builder = MeshBuilder()
             mesh_builder.setVertices(vertices)
             mesh_builder.setIndices(indices)
             mesh_builder.calculateNormals()
             marker_node.setMeshData(mesh_builder.build())
-            scene_root = self._controller.getScene().getRoot()
             marker_node.setParent(scene_root)
             self._path_suggestion_nodes.append(marker_node)
 
