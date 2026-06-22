@@ -232,7 +232,7 @@ class ObjectSplitter(Tool):
         self._controller = self.getController()
 
         # Cut settings
-        self._cut_mode = self.CUT_MODE_HORIZONTAL
+        self._cut_mode = self.CUT_MODE_PATH
         self._cut_height = 0.0  # For horizontal cuts: Z position (relative to object)
         self._cut_height_percent = 50.0  # Percentage of object height
         self._plane_normal = numpy.array([0.0, 1.0, 0.0])  # Y-up in Cura
