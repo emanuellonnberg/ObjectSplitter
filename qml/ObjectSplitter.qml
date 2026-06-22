@@ -157,10 +157,11 @@ Item {
             }
 
             Label {
+                // Only for anchored (valley) modes; in path mode this would
+                // duplicate the cut-mode description shown under the combo.
                 width: parent.width
-                text: (UM.ActiveTool && UM.ActiveTool.properties.getValue("CutMode") === "path")
-                      ? "Click to place path points, then Cut Along Path."
-                      : "Click to place anchor points, then Cut Using Points."
+                visible: UM.ActiveTool && UM.ActiveTool.properties.getValue("CutMode") !== "path"
+                text: "Click to place anchor points, then Cut Using Points."
                 font: UM.Theme.getFont("default_italic")
                 color: UM.Theme.getColor("text_inactive")
                 wrapMode: Text.WordWrap
