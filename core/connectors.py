@@ -73,11 +73,23 @@ def determine_peg_side(
     Returns:
         ("peg", "hole") or ("hole", "peg") for (mesh_a_role, mesh_b_role).
     """
-    volume_a = get_mesh_volume(mesh_a)
-    volume_b = get_mesh_volume(mesh_b)
-    logger.debug("Volume comparison: a=%.2f mm^3, b=%.2f mm^3", volume_a, volume_b)
+    # True volume is only meaningful when both halves are watertight. For
+    # surface/path cuts the pieces are often open shells, and convex-hull
+    # volume is unstable for thin wide pieces -- a tiny edit could flip the
+    # comparison and move the peg to the larger piece between near-identical
+    # cuts. Fall back to face count, a stable, monotonic proxy that matches
+    # the visible "smaller piece".
+    if mesh_a.is_watertight and mesh_b.is_watertight:
+        size_a = abs(get_mesh_volume(mesh_a))
+        size_b = abs(get_mesh_volume(mesh_b))
+        metric = "volume"
+    else:
+        size_a = float(len(mesh_a.faces))
+        size_b = float(len(mesh_b.faces))
+        metric = "face_count"
+    logger.debug("Peg-side comparison (%s): a=%.2f, b=%.2f", metric, size_a, size_b)
 
-    if volume_a <= volume_b:
+    if size_a <= size_b:
         return ("peg", "hole")
     else:
         return ("hole", "peg")
