@@ -107,6 +107,7 @@ from .core.connectors import (
     add_connectors,
     add_connectors_at_position,
     add_cap_native_connectors,
+    boolean_engine_available,
     find_connector_position,
     ConnectorConfig,
 )
@@ -2557,6 +2558,18 @@ class ObjectSplitter(Tool):
                                                 )
                                                 connector_added = True
                                                 break
+
+                                        # Boolean connectors need a working boolean
+                                        # engine (manifold/blender). When none is
+                                        # available every attempt fails slowly, so
+                                        # skip the boolean path entirely instead of
+                                        # retrying it for every candidate/scale.
+                                        if not boolean_engine_available():
+                                            attempt_failures.append(
+                                                f"idx={idx},s={scale:.2f}: cap-native failed, "
+                                                "no boolean engine for fallback"
+                                            )
+                                            continue
 
                                         connector_result = add_connectors_at_position(
                                             mesh_upper=mesh_upper,
