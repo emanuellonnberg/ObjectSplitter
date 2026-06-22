@@ -73,11 +73,23 @@ def determine_peg_side(
     Returns:
         ("peg", "hole") or ("hole", "peg") for (mesh_a_role, mesh_b_role).
     """
-    volume_a = get_mesh_volume(mesh_a)
-    volume_b = get_mesh_volume(mesh_b)
-    logger.debug("Volume comparison: a=%.2f mm^3, b=%.2f mm^3", volume_a, volume_b)
+    # True volume is only meaningful when both halves are watertight. For
+    # surface/path cuts the pieces are often open shells, and convex-hull
+    # volume is unstable for thin wide pieces -- a tiny edit could flip the
+    # comparison and move the peg to the larger piece between near-identical
+    # cuts. Fall back to face count, a stable, monotonic proxy that matches
+    # the visible "smaller piece".
+    if mesh_a.is_watertight and mesh_b.is_watertight:
+        size_a = abs(get_mesh_volume(mesh_a))
+        size_b = abs(get_mesh_volume(mesh_b))
+        metric = "volume"
+    else:
+        size_a = float(len(mesh_a.faces))
+        size_b = float(len(mesh_b.faces))
+        metric = "face_count"
+    logger.debug("Peg-side comparison (%s): a=%.2f, b=%.2f", metric, size_a, size_b)
 
-    if volume_a <= volume_b:
+    if size_a <= size_b:
         return ("peg", "hole")
     else:
         return ("hole", "peg")
@@ -191,6 +203,30 @@ def create_hole_mesh(
     return hole
 
 
+_BOOLEAN_AVAILABLE: Optional[bool] = None
+
+
+def boolean_engine_available() -> bool:
+    """Whether any trimesh boolean engine actually works in this environment.
+
+    Probed once with a tiny difference and cached. When no engine is present
+    (e.g. manifold3d/blender not installed), every boolean connector attempt
+    is doomed and slow, so callers should skip the boolean path entirely
+    instead of retrying it dozens of times.
+    """
+    global _BOOLEAN_AVAILABLE
+    if _BOOLEAN_AVAILABLE is None:
+        try:
+            a = trimesh.creation.box(extents=(2.0, 2.0, 2.0))
+            b = trimesh.creation.box(extents=(1.0, 1.0, 3.0))
+            result = trimesh.boolean.difference([a, b])
+            _BOOLEAN_AVAILABLE = result is not None and len(result.vertices) > 0
+        except Exception as e:
+            logger.info("No boolean engine available (%s); boolean connectors disabled", e)
+            _BOOLEAN_AVAILABLE = False
+    return bool(_BOOLEAN_AVAILABLE)
+
+
 def try_boolean_difference(
     mesh: "trimesh.Trimesh",
     tool: "trimesh.Trimesh"
@@ -259,12 +295,28 @@ def _snap_point_to_cap(
     cap_faces: list,
     point: numpy.ndarray,
 ) -> Optional[numpy.ndarray]:
-    """Snap a 3D point to nearest cap vertex position."""
+    """Snap a 3D point to the nearest point on the cap *surface*.
+
+    Snapping to the nearest cap vertex pulls the connector to the cap rim
+    when the cap is a boundary-only triangulation (no interior vertices),
+    placing the peg at the edge of the cut. Snapping to the nearest surface
+    point keeps a centered query centered.
+    """
     vids = _cap_vertex_indices(mesh, cap_faces)
     if vids is None:
         return None
-    pts = numpy.asarray(mesh.vertices[vids], dtype=numpy.float64)
     p = numpy.asarray(point, dtype=numpy.float64).reshape(3)
+
+    try:
+        cap = mesh.submesh([cap_faces], append=True)
+        from trimesh.proximity import closest_point
+        cp, _, _ = closest_point(cap, p[None, :])
+        if cp is not None and len(cp) > 0:
+            return numpy.asarray(cp[0], dtype=numpy.float64)
+    except Exception as e:
+        logger.debug("closest_point cap snap failed, using nearest vertex: %s", e)
+
+    pts = numpy.asarray(mesh.vertices[vids], dtype=numpy.float64)
     d = numpy.linalg.norm(pts - p[None, :], axis=1)
     if len(d) == 0:
         return None
@@ -305,7 +357,251 @@ def _select_cap_patch_vertices(
     return numpy.asarray(chosen_vids, dtype=numpy.int64), numpy.asarray(chosen_dists, dtype=numpy.float64)
 
 
+def _boss_profile(dist: numpy.ndarray, radius: float) -> numpy.ndarray:
+    """Radial connector profile: flat core, smooth shoulder, zero past radius.
+
+    Returns a weight in [0, 1] for each distance: 1.0 within the flat core,
+    a quintic-smoothstep falloff through the shoulder, and exactly 0.0 at and
+    beyond ``radius``. Multiplying by the connector depth gives a blunt,
+    cylinder-like boss instead of a spike.
+    """
+    r = max(float(radius), 1e-6)
+    u = numpy.clip(numpy.asarray(dist, dtype=numpy.float64) / r, 0.0, 1.0)
+    core_ratio = 0.72
+    w = numpy.ones_like(u)
+    shoulder = u > core_ratio
+    if numpy.any(shoulder):
+        t = (u[shoulder] - core_ratio) / (1.0 - core_ratio)
+        s = t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
+        w[shoulder] = 1.0 - s
+    return w
+
+
+def _fit_cap_plane(points: numpy.ndarray):
+    """PCA best-fit plane for a set of 3D points -> (origin, u, v, normal)."""
+    pts = numpy.asarray(points, dtype=numpy.float64)
+    if len(pts) < 3:
+        return None
+    origin = pts.mean(axis=0)
+    centered = pts - origin
+    try:
+        _, vecs = numpy.linalg.eigh(centered.T @ centered)
+    except numpy.linalg.LinAlgError:
+        return None
+    normal = vecs[:, 0]
+    u = vecs[:, 2]
+    un = numpy.linalg.norm(u)
+    if un < 1e-12:
+        return None
+    u = u / un
+    v = numpy.cross(normal, u)
+    vn = numpy.linalg.norm(v)
+    if vn < 1e-12:
+        return None
+    v = v / vn
+    return origin, u, v, normal
+
+
+def _cap_plane_normal(
+    mesh: "trimesh.Trimesh",
+    cap_faces: list,
+) -> Optional[numpy.ndarray]:
+    """Unit normal of the best-fit plane through a cap's vertices."""
+    vids = _cap_vertex_indices(mesh, cap_faces)
+    if vids is None or len(vids) < 3:
+        return None
+    basis = _fit_cap_plane(numpy.asarray(mesh.vertices[vids], dtype=numpy.float64))
+    if basis is None:
+        return None
+    normal = numpy.asarray(basis[3], dtype=numpy.float64)
+    n = numpy.linalg.norm(normal)
+    if n < 1e-9:
+        return None
+    return normal / n
+
+
+def _deform_cap_patch_dense(
+    mesh: "trimesh.Trimesh",
+    cap_faces: list,
+    center: numpy.ndarray,
+    direction: numpy.ndarray,
+    radius: float,
+    depth: float,
+) -> Optional[Tuple["trimesh.Trimesh", Optional[str]]]:
+    """Rebuild the cap region with interior points, then form a smooth boss.
+
+    The default cap is a boundary-only triangulation (no interior vertices),
+    so displacing it produces a sharp tent rather than a peg. This re-meshes
+    the connector region with a dense interior point grid (constrained to the
+    cap outline), displaces only the interior by the boss profile, and welds
+    the rebuilt cap back onto the wall. Returns None to signal the caller to
+    fall back to the simple displacement path.
+    """
+    try:
+        from scipy.spatial import Delaunay
+        from shapely.geometry import Polygon, Point
+    except Exception:
+        return None
+
+    try:
+        from .mesh_splitter import _orient_caps_to_boundary
+    except Exception:
+        _orient_caps_to_boundary = None
+
+    cap_vids = _cap_vertex_indices(mesh, cap_faces)
+    if cap_vids is None or len(cap_vids) < 3:
+        return None
+
+    direction = numpy.asarray(direction, dtype=numpy.float64).reshape(3)
+    dn = numpy.linalg.norm(direction)
+    if dn < 1e-9:
+        return None
+    direction = direction / dn
+    center = numpy.asarray(center, dtype=numpy.float64).reshape(3)
+
+    # Cap outline loop(s) -> pick the largest as the patch boundary.
+    cap = mesh.submesh([cap_faces], append=True)
+    try:
+        outline = cap.outline()
+        loops = outline.discrete if (outline is not None and hasattr(outline, "discrete")) else None
+    except Exception:
+        loops = None
+    if not loops:
+        return None
+    loop3d = numpy.asarray(max(loops, key=len), dtype=numpy.float64)
+    if len(loop3d) >= 2 and numpy.allclose(loop3d[0], loop3d[-1]):
+        loop3d = loop3d[:-1]
+    if len(loop3d) < 3:
+        return None
+
+    basis = _fit_cap_plane(loop3d)
+    if basis is None:
+        return None
+    origin, u, v, _ = basis
+    loop2d = numpy.column_stack([(loop3d - origin) @ u, (loop3d - origin) @ v])
+    center2d = numpy.array([(center - origin) @ u, (center - origin) @ v])
+
+    try:
+        poly = Polygon(loop2d)
+    except Exception:
+        return None
+    if not poly.is_valid or poly.area <= 1e-9:
+        return None
+
+    # Interior sample grid inside the cap, clustered around the connector.
+    rr = float(radius) * 1.3
+    step = max(float(radius) / 5.0, 1e-3)
+    coords = numpy.arange(-rr, rr + step, step)
+    interior = []
+    for dx in coords:
+        for dy in coords:
+            if dx * dx + dy * dy > rr * rr:
+                continue
+            x = center2d[0] + dx
+            y = center2d[1] + dy
+            pt = Point(x, y)
+            if poly.contains(pt) and poly.boundary.distance(pt) > step * 0.5:
+                interior.append((x, y))
+    if len(interior) < 6:
+        return None
+    interior2d = numpy.asarray(interior, dtype=numpy.float64)
+
+    all2d = numpy.vstack([loop2d, interior2d])
+    n_boundary = len(loop2d)
+    try:
+        tri = Delaunay(all2d)
+    except Exception:
+        return None
+    keep_faces = []
+    for simplex in tri.simplices:
+        cen = all2d[simplex].mean(axis=0)
+        if poly.contains(Point(cen[0], cen[1])):
+            keep_faces.append(simplex)
+    if not keep_faces:
+        return None
+    new_faces = numpy.asarray(keep_faces, dtype=numpy.int64)
+
+    # 3D positions: boundary keeps exact original coords (weld seam),
+    # interior lifted onto the fit plane.
+    interior3d = (
+        origin[None, :]
+        + interior2d[:, 0:1] * u[None, :]
+        + interior2d[:, 1:2] * v[None, :]
+    )
+    new_cap_verts = numpy.vstack([loop3d, interior3d])
+
+    # Displace only interior vertices to form the boss; seam stays put.
+    dist_c = numpy.linalg.norm(new_cap_verts - center[None, :], axis=1)
+    w = _boss_profile(dist_c, radius)
+    w[:n_boundary] = 0.0
+    max_disp = float(w.max() * float(depth)) if len(w) else 0.0
+    if max_disp < max(0.03, float(depth) * 0.08):
+        return None
+    new_cap_verts = new_cap_verts + (w * float(depth))[:, None] * direction[None, :]
+
+    new_cap = trimesh.Trimesh(
+        vertices=new_cap_verts, faces=new_faces, process=False, validate=False
+    )
+
+    # Wall = original mesh minus old cap faces; weld the rebuilt cap on.
+    all_mesh_faces = numpy.asarray(mesh.faces, dtype=numpy.int64)
+    drop = numpy.zeros(len(all_mesh_faces), dtype=bool)
+    valid_cap = numpy.asarray(cap_faces, dtype=numpy.int64)
+    valid_cap = valid_cap[(valid_cap >= 0) & (valid_cap < len(all_mesh_faces))]
+    drop[valid_cap] = True
+    wall = trimesh.Trimesh(
+        vertices=numpy.asarray(mesh.vertices, dtype=numpy.float64),
+        faces=all_mesh_faces[~drop],
+        process=False,
+        validate=False,
+    )
+    base_faces = len(wall.faces)
+    combined = trimesh.util.concatenate([wall, new_cap])
+    try:
+        combined.merge_vertices(digits_vertex=7)
+        combined.remove_unreferenced_vertices()
+    except Exception:
+        pass
+
+    if _orient_caps_to_boundary is not None:
+        try:
+            _orient_caps_to_boundary(
+                combined, base_faces, [(base_faces, base_faces + len(new_faces))]
+            )
+        except Exception:
+            try:
+                combined.fix_normals()
+            except Exception:
+                pass
+    else:
+        try:
+            combined.fix_normals()
+        except Exception:
+            pass
+
+    return combined, None
+
+
 def _deform_cap_patch(
+    mesh: "trimesh.Trimesh",
+    cap_faces: list,
+    center: numpy.ndarray,
+    direction: numpy.ndarray,
+    radius: float,
+    depth: float,
+) -> Tuple[Optional["trimesh.Trimesh"], Optional[str]]:
+    """Form a connector boss on the cap.
+
+    Prefers a dense re-mesh (smooth, peg-like). Falls back to the simple
+    in-place vertex displacement if the dense path is unavailable or fails.
+    """
+    dense = _deform_cap_patch_dense(mesh, cap_faces, center, direction, radius, depth)
+    if dense is not None and dense[0] is not None:
+        return dense
+    return _deform_cap_patch_simple(mesh, cap_faces, center, direction, radius, depth)
+
+
+def _deform_cap_patch_simple(
     mesh: "trimesh.Trimesh",
     cap_faces: list,
     center: numpy.ndarray,
@@ -630,6 +926,21 @@ def add_cap_native_connectors(
         pos = upper_snap
     elif lower_snap is not None:
         pos = lower_snap
+
+    # The connector must push perpendicular to the cut surface ("straight in"),
+    # not along the caller's rough normal. On organic closed-loop carves the
+    # passed normal (e.g. a centroid difference) can be 60-90 deg off the cut
+    # plane, which drives the peg sideways under the surface. Use the cap's
+    # best-fit plane normal as the true axis, keeping the caller's normal only
+    # to choose the sign (which side is "out"). Both halves share this single
+    # world axis so the peg and hole stay aligned.
+    cap_axis = _cap_plane_normal(mesh_upper, cap_faces_upper)
+    if cap_axis is None:
+        cap_axis = _cap_plane_normal(mesh_lower, cap_faces_lower)
+    if cap_axis is not None:
+        if float(numpy.dot(cap_axis, normal)) < 0.0:
+            cap_axis = -cap_axis
+        normal = cap_axis
 
     upper_role, _ = determine_peg_side(mesh_upper, mesh_lower)
     # connector_normal is interpreted as lower->upper.
