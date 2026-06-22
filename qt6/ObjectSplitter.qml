@@ -112,14 +112,11 @@ Item {
                 ? otherModesSection.secondaryValues.indexOf(UM.ActiveTool.properties.getValue("CutMode")) >= 0
                 : false
 
-            Row {  // collapsible header
-                spacing: Math.round(UM.Theme.getSize("default_margin").width / 4)
-                Label {
-                    text: (otherModesSection.expandedState ? "▾  " : "▸  ") + "Other modes"
-                    font: UM.Theme.getFont("default")
-                    color: UM.Theme.getColor("text_inactive")
-                    renderType: Text.NativeRendering
-                }
+            Label {  // collapsible header
+                text: (otherModesSection.expandedState ? "▾  " : "▸  ") + "Other modes"
+                font: UM.Theme.getFont("default")
+                color: UM.Theme.getColor("text_inactive")
+                renderType: Text.NativeRendering
                 MouseArea { anchors.fill: parent; onClicked: otherModesSection.expandedState = !otherModesSection.expandedState }
             }
 
@@ -240,14 +237,11 @@ Item {
                 width: parent.width
                 spacing: Math.round(UM.Theme.getSize("default_margin").height / 2)
 
-                Row {  // collapsible header
-                    spacing: Math.round(UM.Theme.getSize("default_margin").width / 4)
-                    Label {
-                        text: (pathDisplaySection.expandedState ? "▾  " : "▸  ") + "Display"
-                        font: UM.Theme.getFont("default")
-                        color: UM.Theme.getColor("text_inactive")
-                        renderType: Text.NativeRendering
-                    }
+                Label {  // collapsible header
+                    text: (pathDisplaySection.expandedState ? "▾  " : "▸  ") + "Display"
+                    font: UM.Theme.getFont("default")
+                    color: UM.Theme.getColor("text_inactive")
+                    renderType: Text.NativeRendering
                     MouseArea { anchors.fill: parent; onClicked: pathDisplaySection.expandedState = !pathDisplaySection.expandedState }
                 }
 
@@ -459,14 +453,11 @@ Item {
                 width: parent.width
                 spacing: Math.round(UM.Theme.getSize("default_margin").height / 2)
 
-                Row {  // collapsible header
-                    spacing: Math.round(UM.Theme.getSize("default_margin").width / 4)
-                    Label {
-                        text: (isolateDisplaySection.expandedState ? "▾  " : "▸  ") + "Display"
-                        font: UM.Theme.getFont("default")
-                        color: UM.Theme.getColor("text_inactive")
-                        renderType: Text.NativeRendering
-                    }
+                Label {  // collapsible header
+                    text: (isolateDisplaySection.expandedState ? "▾  " : "▸  ") + "Display"
+                    font: UM.Theme.getFont("default")
+                    color: UM.Theme.getColor("text_inactive")
+                    renderType: Text.NativeRendering
                     MouseArea { anchors.fill: parent; onClicked: isolateDisplaySection.expandedState = !isolateDisplaySection.expandedState }
                 }
 
@@ -979,14 +970,11 @@ Item {
             spacing: Math.round(UM.Theme.getSize("default_margin").height / 2)
             visible: !(UM.ActiveTool && UM.ActiveTool.properties.getValue("CutMode") === "path_isolate")
 
-            Row {  // collapsible header
-                spacing: Math.round(UM.Theme.getSize("default_margin").width / 4)
-                Label {
-                    text: (connectorsSection.expandedState ? "▾  " : "▸  ") + "Connectors"
-                    font: UM.Theme.getFont("default_bold")
-                    color: UM.Theme.getColor("text")
-                    renderType: Text.NativeRendering
-                }
+            Label {  // collapsible header
+                text: (connectorsSection.expandedState ? "▾  " : "▸  ") + "Connectors"
+                font: UM.Theme.getFont("default_bold")
+                color: UM.Theme.getColor("text")
+                renderType: Text.NativeRendering
                 MouseArea { anchors.fill: parent; onClicked: connectorsSection.expandedState = !connectorsSection.expandedState }
             }
 
@@ -1181,14 +1169,11 @@ Item {
             width: parent.width
             spacing: Math.round(UM.Theme.getSize("default_margin").height / 2)
 
-            Row {  // collapsible header
-                spacing: Math.round(UM.Theme.getSize("default_margin").width / 4)
-                Label {
-                    text: (debugSection.expandedState ? "▾  " : "▸  ") + "Debug"
-                    font: UM.Theme.getFont("default_bold")
-                    color: UM.Theme.getColor("text")
-                    renderType: Text.NativeRendering
-                }
+            Label {  // collapsible header
+                text: (debugSection.expandedState ? "▾  " : "▸  ") + "Debug"
+                font: UM.Theme.getFont("default_bold")
+                color: UM.Theme.getColor("text")
+                renderType: Text.NativeRendering
                 MouseArea { anchors.fill: parent; onClicked: debugSection.expandedState = !debugSection.expandedState }
             }
 
