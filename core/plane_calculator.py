@@ -399,7 +399,7 @@ def find_smallest_cut_plane(
     # to break ties between similar-area candidates in favor of the click
     # direction.  The heavy lifting for filtering surface-grazing planes is
     # done by min_section_area, not the bias.
-    ALIGNMENT_BIAS = 0.5
+    ALIGNMENT_BIAS = 2.0
     use_bias = (surface_normal is not None and
                 numpy.linalg.norm(surface_normal) > 0.5)
     if use_bias:
@@ -422,7 +422,11 @@ def find_smallest_cut_plane(
         if not use_bias:
             return area
         alignment = abs(numpy.dot(normal, surface_normal))  # 0..1
-        penalty = 1.0 + ALIGNMENT_BIAS * (1.0 - alignment)
+        # Penalize planes ALIGNED with the surface normal: those graze the
+        # surface (the plane is tangent to it) and produce misleading slivers.
+        # Prefer planes perpendicular to the normal -- they cut ACROSS the
+        # clicked feature (a neck/wrist), which is what the user wants.
+        penalty = 1.0 + ALIGNMENT_BIAS * alignment
         return area * penalty
 
     n_theta = search_resolution
@@ -645,7 +649,7 @@ def find_valley_cut_plane(
     trace["inputs"]["anchor_count"] = int(len(anchors))
 
     # Alignment bias (same as find_smallest_cut_plane)
-    ALIGNMENT_BIAS = 0.5
+    ALIGNMENT_BIAS = 2.0
     use_bias = (surface_normal is not None and
                 numpy.linalg.norm(surface_normal) > 0.5)
     if use_bias:
@@ -658,7 +662,11 @@ def find_valley_cut_plane(
         if not use_bias:
             return area
         alignment = abs(numpy.dot(normal, surface_normal))
-        penalty = 1.0 + ALIGNMENT_BIAS * (1.0 - alignment)
+        # Penalize planes ALIGNED with the surface normal: those graze the
+        # surface (the plane is tangent to it) and produce misleading slivers.
+        # Prefer planes perpendicular to the normal -- they cut ACROSS the
+        # clicked feature (a neck/wrist), which is what the user wants.
+        penalty = 1.0 + ALIGNMENT_BIAS * alignment
         return area * penalty
 
     # Minimum area threshold (same as smallest mode)
