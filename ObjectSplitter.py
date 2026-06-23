@@ -89,6 +89,7 @@ from .core.plane_calculator import (
     CutPlane,
     horizontal_cut_plane,
     vertical_cut_plane,
+    find_plane_along_normal,
     find_smallest_cut_plane,
     find_valley_cut_plane,
     find_valley_seam_partition,
@@ -2024,40 +2025,16 @@ class ObjectSplitter(Tool):
             _, click_face_id = snap_point_to_mesh_surface(tm, click_pos_arr)
 
             if self._cut_mode == self.CUT_MODE_PLANE:
-                # Cut ALONG the surface normal (the hover arrow): the cut plane
-                # CONTAINS the arrow and the camera view direction, so it slices
-                # into the surface in the direction the arrow points rather than
-                # grazing across it. Plane normal = arrow x view_direction.
+                # Cut ALONG the surface normal (the hover arrow): the plane is
+                # constrained to CONTAIN the arrow (which excludes the grazing
+                # tangent plane), and we rotate about it to the smallest local
+                # cross-section -- the natural neck/base of the clicked feature.
+                # Deterministic and view-independent.
                 snap_point, click_face_id = snap_point_to_mesh_surface(tm, click_pos_arr)
                 arrow = numpy.array([0.0, 1.0, 0.0])
                 if click_face_id is not None and click_face_id < len(tm.face_normals):
                     arrow = numpy.array(tm.face_normals[click_face_id], dtype=numpy.float64)
-                arrow = arrow / (numpy.linalg.norm(arrow) or 1.0)
-
-                view_dir = None
-                try:
-                    cam = self._controller.getScene().getActiveCamera()
-                    if cam is not None:
-                        cm = numpy.array(cam.getWorldTransformation().getData(),
-                                         dtype=numpy.float64)
-                        view_dir = -cm[:3, 2]  # camera forward (-Z of its transform)
-                        view_dir = view_dir / (numpy.linalg.norm(view_dir) or 1.0)
-                except Exception as e:
-                    Logger.log("d", "Plane mode: camera view dir unavailable: %s", e)
-
-                # Fall back to a world axis if the view is unavailable or parallel
-                # to the arrow (cross product would be degenerate).
-                if view_dir is None or abs(float(numpy.dot(view_dir, arrow))) > 0.99:
-                    ref = numpy.array([0.0, 1.0, 0.0])
-                    if abs(float(numpy.dot(ref, arrow))) > 0.9:
-                        ref = numpy.array([1.0, 0.0, 0.0])
-                    view_dir = ref
-
-                plane_normal = numpy.cross(arrow, view_dir)
-                nn = numpy.linalg.norm(plane_normal)
-                plane_normal = (plane_normal / nn) if nn > 1e-9 else numpy.array([0.0, 1.0, 0.0])
-                plane = CutPlane(origin=numpy.asarray(snap_point, dtype=numpy.float64),
-                                 normal=plane_normal)
+                plane = find_plane_along_normal(tm, snap_point, arrow)
             elif self._cut_mode == self.CUT_MODE_HORIZONTAL:
                 plane = horizontal_cut_plane(tm, self._cut_height_percent)
             elif self._cut_mode == self.CUT_MODE_VERTICAL:

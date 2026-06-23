@@ -73,6 +73,23 @@ def test_whole_model_cuts_every_feature():
     assert (r.upper.bounds[1][0] - r.upper.bounds[0][0]) > 20.0
 
 
+def test_find_plane_along_normal_contains_arrow_and_cuts():
+    from core.plane_calculator import find_plane_along_normal
+    mesh = create_fork()
+    # Click the side of the middle tooth; the surface normal points outward (~+X).
+    click = np.array([3.0, 35.0, 2.5])
+    snap, fid = snap_point_to_mesh_surface(mesh, click)
+    arrow = np.array(mesh.face_normals[fid], dtype=float)
+    arrow = arrow / np.linalg.norm(arrow)
+    plane = find_plane_along_normal(mesh, snap, arrow)
+    # The cut plane CONTAINS the arrow, so the plane normal is perpendicular to it.
+    assert abs(float(np.dot(plane.normal, arrow))) < 1e-6
+    # And it produces a real, watertight cut (not a grazing sliver).
+    r = clean_local_plane_split(mesh, plane.origin, plane.normal, fid)
+    assert r.success, r.summary()
+    assert r.upper.is_watertight
+
+
 def test_degenerate_normal_does_not_crash():
     mesh, face_id = _fork_middle_tooth()
     # Zero normal must not raise; it returns a SplitResult (via fallback).

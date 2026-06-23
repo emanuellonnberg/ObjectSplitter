@@ -506,6 +506,73 @@ def find_smallest_cut_plane(
     )
 
 
+def find_plane_along_normal(
+    mesh: "trimesh.Trimesh",
+    click_position: numpy.ndarray,
+    surface_normal: numpy.ndarray,
+    n_angles: int = 36,
+) -> CutPlane:
+    """Find a cut plane that CONTAINS the surface normal (cuts *along* the arrow).
+
+    The plane is constrained to contain ``surface_normal`` (so its own normal is
+    perpendicular to it), which geometrically excludes the grazing tangent plane.
+    Rotating about the surface normal, the rotation with the smallest local
+    cross-section is the natural neck/base of the clicked feature.
+
+    Args:
+        mesh: The trimesh object.
+        click_position: 3D point the plane passes through.
+        surface_normal: Surface normal at the click (the hover arrow direction).
+        n_angles: Number of rotations to test about the surface normal.
+
+    Returns:
+        CutPlane through the click whose normal is perpendicular to surface_normal.
+    """
+    click = numpy.asarray(click_position, dtype=numpy.float64)
+    axis = numpy.asarray(surface_normal, dtype=numpy.float64)
+    axis_norm = numpy.linalg.norm(axis)
+    if axis_norm < 1e-9:
+        return CutPlane(origin=click, normal=numpy.array([0.0, 1.0, 0.0]))
+    axis = axis / axis_norm
+
+    # Orthonormal basis (u, v) spanning the plane perpendicular to the axis.
+    u = numpy.array([1.0, 0.0, 0.0])
+    if abs(float(numpy.dot(u, axis))) > 0.9:
+        u = numpy.array([0.0, 0.0, 1.0])
+    u = u - numpy.dot(u, axis) * axis
+    u = u / numpy.linalg.norm(u)
+    v = numpy.cross(axis, u)
+
+    avg_face_area = mesh.area / max(len(mesh.faces), 1)
+    min_area = avg_face_area * 5.0
+
+    best_normal = None
+    best_area = float("inf")
+    for k in range(n_angles):
+        theta = numpy.pi * k / n_angles
+        # Candidate plane normal lies in the plane perpendicular to the axis,
+        # so the cut plane itself contains the axis (the surface normal/arrow).
+        candidate = numpy.cos(theta) * u + numpy.sin(theta) * v
+        try:
+            section = mesh.section(plane_origin=click, plane_normal=candidate)
+            if section is None:
+                continue
+            path_2d, to_3D = _section_to_2d(section)
+            area = _local_section_area(path_2d, to_3D, click)
+        except Exception as e:
+            logger.debug("along-normal section failed at theta=%.2f: %s", theta, e)
+            continue
+        if area >= min_area and area < best_area:
+            best_area = area
+            best_normal = candidate
+
+    if best_normal is None:
+        best_normal = u  # no real cross-section found; any plane containing the axis
+    logger.debug("find_plane_along_normal: best_area=%.2f normal=%s",
+                 best_area, best_normal)
+    return CutPlane(origin=click, normal=best_normal)
+
+
 def find_valley_cut_plane(
     mesh: "trimesh.Trimesh",
     click_position: numpy.ndarray,
