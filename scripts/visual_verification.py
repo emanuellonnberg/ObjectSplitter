@@ -71,8 +71,19 @@ def create_fork():
         (17, 41), (17, 5), (5, 5), (5, -19)
     ]
     poly = Polygon(pts)
-    fork = trimesh.creation.extrude_polygon(poly, height=5.0)
-    
+    # Pin the triangulation engine: the shortest-seam Dijkstra mincut is
+    # sensitive to the cap tessellation, and the orthographic baselines were
+    # authored against the `triangle` engine's topology. mapbox_earcut produces
+    # a different tessellation that degenerates the seam to a tiny sliver, so we
+    # prefer `triangle` to keep the fork (and its golden cuts) deterministic.
+    # Fall back to the default engine if `triangle` is unavailable (e.g. no
+    # wheel for the running Python) so the viz CLI still works; the
+    # tessellation-sensitive tests guard on `triangle` being importable.
+    try:
+        fork = trimesh.creation.extrude_polygon(poly, height=5.0, engine="triangle")
+    except Exception:
+        fork = trimesh.creation.extrude_polygon(poly, height=5.0)
+
     # Subdivide multiple times so the Dijkstra seam can trace smoothly
     # without crossing massive quadrilateral faces
     vertices, faces = trimesh.remesh.subdivide(fork.vertices, fork.faces)

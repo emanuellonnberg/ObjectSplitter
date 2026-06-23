@@ -1,7 +1,19 @@
+import importlib.util
+
 import numpy as np
 import pytest
 import trimesh
 from scripts.visual_verification import create_fork
+
+# The legacy sharp-tooth fork (create_fork) pins the `triangle` tessellation
+# engine so its Dijkstra-seam cuts are deterministic and match the orthographic
+# baselines. When `triangle` has no wheel for the running Python, create_fork
+# falls back to a different tessellation that the baselines don't describe, so
+# skip the tessellation-sensitive fork tests rather than report false failures.
+requires_triangle = pytest.mark.skipif(
+    importlib.util.find_spec("triangle") is None,
+    reason="needs the 'triangle' engine for a deterministic fork tessellation",
+)
 from core.plane_calculator import (
     find_shortest_seam_partition,
     find_valley_seam_partition,
@@ -302,6 +314,7 @@ def fork_split_meshes():
     return mesh, mesh_a, mesh_b
 
 
+@requires_triangle
 def test_fork_middle_tooth_cut_orthographic_projection(fork_split_meshes):
     """
     Validates that a shortest seam cut across the middle tooth of a fork mesh 
@@ -337,6 +350,7 @@ def test_fork_middle_tooth_cut_orthographic_projection(fork_split_meshes):
 
 
 @pytest.mark.parametrize("resolution", [16, 20, 24])
+@requires_triangle
 def test_fork_projection_signature_stable_across_resolutions(fork_split_meshes, resolution):
     """Top row signature should remain stable: tooth-only piece=1 run, body piece=2 side runs."""
     mesh, mesh_a, mesh_b = fork_split_meshes
@@ -430,6 +444,7 @@ def test_valley_cut_orthographic_signature(cylinder_mesh):
     _assert_axis_coverage_similar(img_upper, img_lower, axis="x", max_span_delta=3)
 
 
+@requires_triangle
 def test_fork_smallest_cut_orthographic_signature():
     """
     Smallest mode on a fork should avoid tiny surface-graze slivers and produce
@@ -476,6 +491,7 @@ def test_fork_smallest_cut_orthographic_signature():
     assert not img_b[center_slice, -1].any(), f"Expected top-center gap in remainder.\n{print_image(img_b)}"
 
 
+@requires_triangle
 def test_fork_valley_cut_orthographic_signature():
     """
     Legacy planar valley mode on the fork should remain stable against
@@ -521,6 +537,7 @@ def test_fork_valley_cut_orthographic_signature():
     assert not img_b[center_slice, -1].any(), f"Expected top-center gap in valley remainder.\n{print_image(img_b)}"
 
 
+@requires_triangle
 def test_fork_valley_seam_cut_orthographic_signature():
     """
     Valley seam mode should improve over planar valley on fork geometry by

@@ -377,8 +377,9 @@ class TestCapNativeConnectors:
         # Both halves must actually deform (boss on one side, recess on the other).
         upper_after = numpy.asarray(cr.upper.vertices, dtype=numpy.float64)
         lower_after = numpy.asarray(cr.lower.vertices, dtype=numpy.float64)
-        upper_span = float((upper_after @ normal).ptp() - upper_before_h.ptp())
-        lower_span = float((lower_after @ normal).ptp() - lower_before_h.ptp())
+        # numpy 2.0 removed the ndarray.ptp() method; use the function form.
+        upper_span = float(numpy.ptp(upper_after @ normal) - numpy.ptp(upper_before_h))
+        lower_span = float(numpy.ptp(lower_after @ normal) - numpy.ptp(lower_before_h))
         assert abs(upper_span) > 0.02 or abs(lower_span) > 0.02
 
         # Shape guard: the peg must have a broad plateau near its apex (a blunt
