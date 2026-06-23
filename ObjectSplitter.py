@@ -333,6 +333,12 @@ class ObjectSplitter(Tool):
         self._last_picked_node = None
         self._last_picked_position = None
         self._hover_node = None  # Node currently being hovered over
+        # Cached world-space trimesh for the hovered node, so the surface-normal
+        # arrow can be computed cheaply per mouse-move (rebuilt only when the
+        # node or its transform changes).
+        self._hover_tm = None
+        self._hover_tm_node = None
+        self._hover_tm_xform = None
         self._picking_pass = None  # Cached picking pass
         self._progress_dialog = None  # Progress dialog for long operations
 
@@ -1761,9 +1767,19 @@ class ObjectSplitter(Tool):
             center = numpy.array([picked_position.x, picked_position.y, picked_position.z])
             mesh_size_max = max(mesh_size[0], mesh_size[1], mesh_size[2])
             marker_size = max(0.5, mesh_size_max * 0.012)  # 1.2% of mesh or 0.5mm
-            # Marker orientation is intentionally fixed for preview performance.
-            # Surface-normal-based orientation is computed only when executing the cut.
-            self._createOrUpdateMarker(center, marker_size, None)
+            # Orient the marker along the surface normal at the hover point. The
+            # trimesh is cached per node, so the nearest-face lookup stays cheap.
+            normal_dir = None
+            try:
+                tm = self._getCachedHoverTrimesh(picked_node)
+                if tm is not None:
+                    _, hover_face_id = snap_point_to_mesh_surface(tm, center)
+                    if hover_face_id is not None and hover_face_id < len(tm.face_normals):
+                        normal_dir = numpy.asarray(
+                            tm.face_normals[hover_face_id], dtype=numpy.float64)
+            except Exception as e:
+                Logger.log("d", "Hover normal lookup failed: %s", e)
+            self._createOrUpdateMarker(center, marker_size, normal_dir)
             self._hover_node = picked_node
             return
 
@@ -1860,6 +1876,31 @@ class ObjectSplitter(Tool):
     # ==========================================================================
     # Cutting Logic (delegates to core modules)
     # ==========================================================================
+
+    def _getCachedHoverTrimesh(self, node: CuraSceneNode):
+        """Return a world-space trimesh for the hovered node, cached.
+
+        Extracting the trimesh transforms every vertex, so it is rebuilt only
+        when the hovered node or its world transform changes -- keeping the
+        per-hover surface-normal lookup cheap on dense meshes.
+        """
+        try:
+            xform = node.getWorldTransformation().getData().tobytes()
+        except Exception:
+            xform = None
+        if (self._hover_tm is not None and self._hover_tm_node is node
+                and self._hover_tm_xform == xform):
+            return self._hover_tm
+        extraction = self._extractTrimesh(node)
+        if extraction is None:
+            self._hover_tm = None
+            self._hover_tm_node = None
+            self._hover_tm_xform = None
+            return None
+        self._hover_tm = extraction[0]
+        self._hover_tm_node = node
+        self._hover_tm_xform = xform
+        return self._hover_tm
 
     def _extractTrimesh(self, node: CuraSceneNode) -> Optional[Tuple["trimesh.Trimesh", numpy.ndarray, numpy.ndarray]]:
         """
