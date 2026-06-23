@@ -545,11 +545,14 @@ Item {
                     text: "Pick Target Region"
                     width: 125
                     height: UM.Theme.getSize("setting_control").height
-                    // Requires at least one finished loop and no half-drawn
-                    // current loop, so it can't be pressed mid-draw.
+                    // Needs at least one finished loop. Stays enabled between
+                    // loops (current empty) and while a complete extra loop is
+                    // pending (>=3 pts, auto-finalized on click); only greys out
+                    // during a half-drawn new loop (1-2 pts).
                     enabled: UM.ActiveTool &&
                              UM.ActiveTool.properties.getValue("PathLoopCount") >= 1 &&
-                             UM.ActiveTool.properties.getValue("CurrentLoopPointCount") === 0
+                             (UM.ActiveTool.properties.getValue("CurrentLoopPointCount") === 0 ||
+                              UM.ActiveTool.properties.getValue("CurrentLoopPointCount") >= 3)
                     onClicked: {
                         if (UM.ActiveTool) {
                             UM.ActiveTool.setProperty("TriggerPickPathIsolateTarget", true)

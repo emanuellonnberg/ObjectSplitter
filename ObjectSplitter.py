@@ -1234,6 +1234,12 @@ class ObjectSplitter(Tool):
     def _armPathIsolateTargetPick(self):
         if self._cut_mode != self.CUT_MODE_PATH_ISOLATE:
             return
+        # If at least one loop is already finished and a complete extra loop is
+        # pending, finalize it automatically so the last loop needs no explicit
+        # Finish Loop. The first loop must still be finished by hand, so this
+        # never fires before/while the first loop is being drawn.
+        if self._path_isolate_loops and len(self._path_waypoints) >= 3:
+            self._startNewPathLoop()
         if not self._path_isolate_loops:
             Logger.log("w", "Path isolate: add at least one closed loop before picking a target")
             return
