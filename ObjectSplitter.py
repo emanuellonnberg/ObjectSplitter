@@ -239,6 +239,8 @@ class ObjectSplitter(Tool):
         self._cut_mode = self.CUT_MODE_PATH
         self._cut_height = 0.0  # For horizontal cuts: Z position (relative to object)
         self._cut_height_percent = 50.0  # Percentage of object height
+        self._plane_orientation = "surface"  # surface | horizontal | vertical
+        self._cut_whole_model = False  # Plane mode: cut whole model vs clicked feature
         self._plane_normal = numpy.array([0.0, 1.0, 0.0])  # Y-up in Cura
         self._plane_origin = numpy.array([0.0, 0.0, 0.0])
 
@@ -349,6 +351,8 @@ class ObjectSplitter(Tool):
             "CutMode",
             "CutModes",
             "CutHeightPercent",
+            "PlaneOrientation",
+            "CutWholeModel",
             "ShowPreview",
             "TrimeshAvailable",
             "SearchResolution",
@@ -518,6 +522,26 @@ class ObjectSplitter(Tool):
         if value != self._cut_height_percent:
             self._cut_height_percent = float(value)
             Logger.log("d", "Cut height percent changed to: %s", str(value))
+            self.propertyChanged.emit()
+
+    def getPlaneOrientation(self) -> str:
+        return self._plane_orientation
+
+    def setPlaneOrientation(self, value: str) -> None:
+        value = str(value)
+        if value != self._plane_orientation:
+            self._plane_orientation = value
+            Logger.log("d", "Plane orientation changed to: %s", value)
+            self.propertyChanged.emit()
+
+    def getCutWholeModel(self) -> bool:
+        return self._cut_whole_model
+
+    def setCutWholeModel(self, value: bool) -> None:
+        enabled = bool(value)
+        if enabled != self._cut_whole_model:
+            self._cut_whole_model = enabled
+            Logger.log("d", "Cut whole model: %s", enabled)
             self.propertyChanged.emit()
 
     def getShowPreview(self) -> bool:
@@ -2025,16 +2049,30 @@ class ObjectSplitter(Tool):
             _, click_face_id = snap_point_to_mesh_surface(tm, click_pos_arr)
 
             if self._cut_mode == self.CUT_MODE_PLANE:
-                # Cut ALONG the surface normal (the hover arrow): the plane is
-                # constrained to CONTAIN the arrow (which excludes the grazing
-                # tangent plane), and we rotate about it to the smallest local
-                # cross-section -- the natural neck/base of the clicked feature.
-                # Deterministic and view-independent.
                 snap_point, click_face_id = snap_point_to_mesh_surface(tm, click_pos_arr)
-                arrow = numpy.array([0.0, 1.0, 0.0])
-                if click_face_id is not None and click_face_id < len(tm.face_normals):
-                    arrow = numpy.array(tm.face_normals[click_face_id], dtype=numpy.float64)
-                plane = find_plane_along_normal(tm, snap_point, arrow)
+                if self._plane_orientation == "horizontal":
+                    # Bed-parallel (Y up). Whole-model uses the height slider;
+                    # local passes through the clicked feature's height.
+                    if self._cut_whole_model:
+                        plane = horizontal_cut_plane(tm, self._cut_height_percent)
+                    else:
+                        plane = CutPlane(origin=numpy.asarray(snap_point, dtype=numpy.float64),
+                                         normal=numpy.array([0.0, 1.0, 0.0]))
+                elif self._plane_orientation == "vertical":
+                    # Perpendicular to the bed, view-aligned through the click.
+                    if R is not None:
+                        plane = vertical_cut_plane(snap_point, R @ numpy.array([1.0, 0.0, 0.0]))
+                    else:
+                        plane = vertical_cut_plane(snap_point)
+                else:
+                    # "surface": cut ALONG the hover arrow (the clicked surface
+                    # normal). The plane CONTAINS the arrow (excludes the grazing
+                    # tangent plane); rotating about it to the smallest local
+                    # cross-section gives the feature's neck. Deterministic.
+                    arrow = numpy.array([0.0, 1.0, 0.0])
+                    if click_face_id is not None and click_face_id < len(tm.face_normals):
+                        arrow = numpy.array(tm.face_normals[click_face_id], dtype=numpy.float64)
+                    plane = find_plane_along_normal(tm, snap_point, arrow)
             elif self._cut_mode == self.CUT_MODE_HORIZONTAL:
                 plane = horizontal_cut_plane(tm, self._cut_height_percent)
             elif self._cut_mode == self.CUT_MODE_VERTICAL:
@@ -2236,9 +2274,11 @@ class ObjectSplitter(Tool):
             self._updateProgress("Splitting mesh...", 40)
             if self._cut_mode == self.CUT_MODE_PLANE:
                 # Clean local split: capped slice + clicked-component selection
-                # gives a flat watertight cut localized to the clicked feature.
+                # gives a flat watertight cut localized to the clicked feature
+                # (or the whole model when CutWholeModel is on).
                 split_result = clean_local_plane_split(
-                    tm, plane.origin, plane.normal, click_face_id
+                    tm, plane.origin, plane.normal, click_face_id,
+                    whole_model=self._cut_whole_model
                 )
             elif self._cut_mode in (
                 self.CUT_MODE_SHORTEST,

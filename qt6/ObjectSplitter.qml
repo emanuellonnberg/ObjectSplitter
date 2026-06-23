@@ -856,11 +856,71 @@ Item {
             visible: UM.ActiveTool && ["horizontal", "smallest", "valley", "valley_seam"].indexOf(UM.ActiveTool.properties.getValue("CutMode")) >= 0
         }
 
-        // Cut Height (for horizontal mode)
+        // Plane mode controls (orientation + whole-model)
         Column {
             width: parent.width
             spacing: Math.round(UM.Theme.getSize("default_margin").height / 2)
-            visible: UM.ActiveTool && UM.ActiveTool.properties.getValue("CutMode") === "horizontal"
+            visible: UM.ActiveTool && UM.ActiveTool.properties.getValue("CutMode") === "plane"
+
+            Row {
+                spacing: Math.round(UM.Theme.getSize("default_margin").width / 2)
+
+                Label {
+                    height: UM.Theme.getSize("setting_control").height
+                    text: catalog.i18nc("@label", "Orientation:")
+                    width: 70
+                    font: UM.Theme.getFont("default")
+                    color: UM.Theme.getColor("text")
+                    verticalAlignment: Text.AlignVCenter
+                    renderType: Text.NativeRendering
+                }
+
+                ComboBox {
+                    id: planeOrientationCombo
+                    width: 150
+                    height: UM.Theme.getSize("setting_control").height
+                    property var values: ["surface", "horizontal", "vertical"]
+                    model: ["Along surface", "Horizontal", "Vertical"]
+                    currentIndex: {
+                        if (UM.ActiveTool) {
+                            var i = values.indexOf(UM.ActiveTool.properties.getValue("PlaneOrientation"))
+                            return i >= 0 ? i : 0
+                        }
+                        return 0
+                    }
+                    onActivated: {
+                        if (UM.ActiveTool) {
+                            UM.ActiveTool.setProperty("PlaneOrientation", values[currentIndex])
+                        }
+                    }
+                }
+            }
+
+            CheckBox {
+                id: cutWholeModelCheckbox
+                text: catalog.i18nc("@option", "Cut whole model")
+                checked: UM.ActiveTool ? UM.ActiveTool.properties.getValue("CutWholeModel") : false
+                hoverEnabled: true
+                ToolTip.visible: hovered
+                ToolTip.text: "Cut the entire model at the plane instead of just the clicked feature."
+                onClicked: {
+                    if (UM.ActiveTool) {
+                        UM.ActiveTool.setProperty("CutWholeModel", checked)
+                    }
+                }
+            }
+        }
+
+        // Cut Height (horizontal mode, or Plane + Horizontal + whole model)
+        Column {
+            width: parent.width
+            spacing: Math.round(UM.Theme.getSize("default_margin").height / 2)
+            visible: UM.ActiveTool && (
+                UM.ActiveTool.properties.getValue("CutMode") === "horizontal" ||
+                (UM.ActiveTool.properties.getValue("CutMode") === "plane" &&
+                 UM.ActiveTool.properties.getValue("PlaneOrientation") === "horizontal" &&
+                 UM.ActiveTool.properties.getValue("CutWholeModel"))
+            )
 
             Label {
                 text: catalog.i18nc("@label", "Cut Height:")
