@@ -1234,11 +1234,16 @@ class ObjectSplitter(Tool):
     def _armPathIsolateTargetPick(self):
         if self._cut_mode != self.CUT_MODE_PATH_ISOLATE:
             return
+        # Auto-finalize a complete pending loop so the user does not have to
+        # press "Start New Loop" after their final loop just to enable picking.
+        if len(self._path_waypoints) >= 3:
+            self._startNewPathLoop()
         if not self._path_isolate_loops:
             Logger.log("w", "Path isolate: add at least one closed loop before picking a target")
             return
         if self._path_waypoints:
-            Logger.log("w", "Path isolate: finish or clear the current loop before picking a target")
+            # 1-2 leftover points cannot form a loop; ask the user to resolve them.
+            Logger.log("w", "Path isolate: finish (>=3 points) or clear the current loop before picking a target")
             return
         undo_state = self._capturePathToolState()
         self._path_isolate_target_pick_active = True

@@ -545,9 +545,12 @@ Item {
                     text: "Pick Target Region"
                     width: 125
                     height: UM.Theme.getSize("setting_control").height
-                    enabled: UM.ActiveTool &&
-                             UM.ActiveTool.properties.getValue("PathLoopCount") >= 1 &&
-                             UM.ActiveTool.properties.getValue("CurrentLoopPointCount") === 0
+                    // Enabled with a finalized loop, OR a complete current loop
+                    // (>=3 pts) which is auto-finalized when the button is pressed.
+                    enabled: UM.ActiveTool && (
+                             UM.ActiveTool.properties.getValue("PathLoopCount") >= 1 ||
+                             UM.ActiveTool.properties.getValue("CurrentLoopPointCount") >= 3
+                    )
                     onClicked: {
                         if (UM.ActiveTool) {
                             UM.ActiveTool.setProperty("TriggerPickPathIsolateTarget", true)
