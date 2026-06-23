@@ -907,6 +907,9 @@ def clean_local_plane_split(
 
     try:
         src_centroid = mesh.vertices[mesh.faces[source_face_id]].mean(axis=0)
+        # Reject grazing slivers: the separated feature must be a real piece,
+        # not a one-triangle fragment the slice grazed off near the click.
+        min_feature_faces = max(20, int(0.003 * len(mesh.faces)))
 
         def _split_feature_on(side_normal):
             """Separate the near-click feature on the +side_normal side.
@@ -919,7 +922,11 @@ def clean_local_plane_split(
             cap_comps = cap.split(only_watertight=False)
             if not cap_comps:
                 return None
-            separated = _component_nearest_point(cap_comps, src_centroid).copy()
+            # Pick the nearest component that is a real feature, not a sliver.
+            sized = [c for c in cap_comps if len(c.faces) >= min_feature_faces]
+            separated = _component_nearest_point(sized or cap_comps, src_centroid).copy()
+            if len(separated.faces) < min_feature_faces:
+                return None
 
             # Uncapped slices share plane-loop vertices, so welding the
             # non-clicked feature-side components back onto the body is seamless.
