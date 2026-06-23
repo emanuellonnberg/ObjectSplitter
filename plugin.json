@@ -1,7 +1,7 @@
 {
     "name": "Object Splitter",
     "author": "Emanuel Lönnberg",
-    "version": "0.1.0",
+    "version": "0.9.0",
     "description": "Split 3D objects into multiple parts by cutting along planes. Useful for separating complex models like miniatures into smaller printable pieces.",
     "i18n-catalog": "objectsplitter",
     "api": 8,

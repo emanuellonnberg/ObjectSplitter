@@ -5,3 +5,4 @@ __pycache__/
 radial_debug.log
 lib/
 captures/
+dist/
