@@ -969,7 +969,10 @@ def clean_local_plane_split(
         fb = split_by_local_plane(
             mesh, origin, [numpy.asarray(plane_normal, dtype=numpy.float64)],
             source_face_id)
-        fb.strategies_attempted.insert(0, "clean_local_plane_split(failed)")
+        # Record the exception type+message in the strategy trail so it surfaces
+        # in the host log line (the mesh_splitter logger may not propagate there).
+        detail = ("%s: %s" % (type(e).__name__, e))[:160]
+        fb.strategies_attempted.insert(0, "clean_local_plane_split(failed: %s)" % detail)
         return fb
 
 
