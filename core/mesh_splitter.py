@@ -915,21 +915,12 @@ def clean_local_plane_split(
             """Separate the near-click feature on the +side_normal side.
 
             Returns (separated, remainder, separated_face_count) or None.
-            """
-            cap = trimesh.intersections.slice_mesh_plane(
-                mesh, plane_normal=side_normal, plane_origin=origin, cap=True)
-            cap.merge_vertices()
-            cap_comps = cap.split(only_watertight=False)
-            if not cap_comps:
-                return None
-            # Pick the nearest component that is a real feature, not a sliver.
-            sized = [c for c in cap_comps if len(c.faces) >= min_feature_faces]
-            separated = _component_nearest_point(sized or cap_comps, src_centroid).copy()
-            if len(separated.faces) < min_feature_faces:
-                return None
 
-            # Uncapped slices share plane-loop vertices, so welding the
-            # non-clicked feature-side components back onto the body is seamless.
+            Both pieces are sliced UNCAPPED and capped with the scipy-based
+            watertight repair, never trimesh's cap=True -- the latter triangulates
+            the cap via mapbox_earcut/triangle, which Cura's bundled environment
+            does not provide ("No available triangulation engine!").
+            """
             feat = trimesh.intersections.slice_mesh_plane(
                 mesh, plane_normal=side_normal, plane_origin=origin, cap=False)
             feat.merge_vertices()
@@ -939,9 +930,17 @@ def clean_local_plane_split(
             feat_comps = feat.split(only_watertight=False)
             if not feat_comps:
                 return None
-            clicked = _component_nearest_point(feat_comps, src_centroid)
+            # Pick the nearest component that is a real feature, not a sliver.
+            sized = [c for c in feat_comps if len(c.faces) >= min_feature_faces]
+            clicked = _component_nearest_point(sized or feat_comps, src_centroid)
+            if len(clicked.faces) < min_feature_faces:
+                return None
             others = [c for c in feat_comps if c is not clicked]
 
+            # Separated feature: cap its open cut with the scipy repair.
+            separated, _ = _attempt_watertight_repair(clicked.copy())
+            # Remainder: weld other feature-side components onto the body (the
+            # uncapped slices share plane-loop vertices), then cap the hole.
             remainder = trimesh.util.concatenate([body] + others)
             remainder.merge_vertices()
             remainder, _cap_faces = _attempt_watertight_repair(remainder)
