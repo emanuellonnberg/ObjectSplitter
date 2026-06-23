@@ -2048,7 +2048,29 @@ class ObjectSplitter(Tool):
             from .core.plane_calculator import snap_point_to_mesh_surface
             _, click_face_id = snap_point_to_mesh_surface(tm, click_pos_arr)
 
-            if self._cut_mode == self.CUT_MODE_PLANE:
+            # Point-based modes: when the user has placed anchor points, the cut
+            # follows those points deterministically (a geodesic path through
+            # them, like Multi-point) instead of seeding the unreliable search.
+            used_anchor_path = False
+            if (self._multi_point_anchors_enabled
+                    and self._cut_mode in (self.CUT_MODE_VALLEY, self.CUT_MODE_VALLEY_SEAM)
+                    and anchor_points_arr and len(anchor_points_arr) >= 2):
+                try:
+                    from .core.path_cutter import chain_paths, partition_faces_by_path
+                    self._updateProgress("Computing geodesic path through points...", 20)
+                    anchor_pts = numpy.asarray(anchor_points_arr, dtype=numpy.float64)
+                    vertex_path = chain_paths(tm, anchor_pts)
+                    face_set_a, face_set_b = partition_faces_by_path(tm, vertex_path)
+                    used_anchor_path = True
+                    plane = None
+                    Logger.log("i", "Point mode: geodesic path cut through %d anchor points",
+                               len(anchor_pts))
+                except Exception as e:
+                    Logger.log("w", "Anchor path cut failed (%s); using search instead", e)
+
+            if used_anchor_path:
+                pass  # face sets already computed from the geodesic path
+            elif self._cut_mode == self.CUT_MODE_PLANE:
                 snap_point, click_face_id = snap_point_to_mesh_surface(tm, click_pos_arr)
                 if self._plane_orientation == "horizontal":
                     # Bed-parallel (Y up). Whole-model uses the height slider;
@@ -2272,7 +2294,14 @@ class ObjectSplitter(Tool):
 
             # Perform the split (delegates to core.mesh_splitter)
             self._updateProgress("Splitting mesh...", 40)
-            if self._cut_mode == self.CUT_MODE_PLANE:
+            if used_anchor_path:
+                # Geodesic path cut through the placed points (Multi-point style).
+                split_result = split_by_face_sets(
+                    tm, face_set_a, face_set_b,
+                    strategy_name="anchor_path",
+                    attempt_hole_fill=False,
+                )
+            elif self._cut_mode == self.CUT_MODE_PLANE:
                 # Clean local split: capped slice + clicked-component selection
                 # gives a flat watertight cut localized to the clicked feature
                 # (or the whole model when CutWholeModel is on).
