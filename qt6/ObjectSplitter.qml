@@ -27,9 +27,9 @@ Item {
     // Mode help text shown by the (i) popup next to the mode description.
     function getModeHelp(mode) {
         if (mode === "plane") return {
-            "title": "Plane (across surface)",
-            "body": "A clean, flat cut across the feature you click. Hover shows an arrow along the surface normal; the cut plane is perpendicular to it, so clicking the end of a tooth, finger or peg lops it off cleanly. Only the clicked feature is separated.",
-            "steps": ["Hover to aim the arrow along the feature", "Click the end of the feature to cut off", "The piece is separated with a clean flat face"]
+            "title": "Plane cut",
+            "body": "A clean, flat cut. 'Along surface' uses the hover arrow to cut across the clicked feature; 'Horizontal' and 'Vertical' use fixed axes. It separates only the clicked feature, or the whole model with 'Cut whole model'. Best for protruding, separable features (limbs, pegs, fingers). For interconnected parts like ladder rungs, a single plane crosses them all -- use Multi-point instead.",
+            "steps": ["Pick an orientation (Along surface / Horizontal / Vertical)", "Hover to aim, click the feature to separate", "Toggle 'Cut whole model' for a full split (e.g. stacking)"]
         }
         if (mode === "horizontal") return {
             "title": "Horizontal cut",
@@ -238,7 +238,7 @@ Item {
                 text: {
                     if (UM.ActiveTool) {
                         var mode = UM.ActiveTool.properties.getValue("CutMode")
-                        if (mode === "plane") return "Clean cut across the clicked surface (along the arrow)"
+                        if (mode === "plane") return "Clean plane cut: along the clicked surface, or Horizontal/Vertical"
                         if (mode === "horizontal") return "Cut parallel to the build plate"
                         if (mode === "vertical") return "Cut perpendicular to the build plate"
                         if (mode === "smallest") return "Find smallest cross-section at click point"
