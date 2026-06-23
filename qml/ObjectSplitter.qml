@@ -26,6 +26,11 @@ Item {
 
     // Mode help text shown by the (i) popup next to the mode description.
     function getModeHelp(mode) {
+        if (mode === "plane") return {
+            "title": "Plane (across surface)",
+            "body": "A clean, flat cut across the feature you click. Hover shows an arrow along the surface normal; the cut plane is perpendicular to it, so clicking the end of a tooth, finger or peg lops it off cleanly. Only the clicked feature is separated.",
+            "steps": ["Hover to aim the arrow along the feature", "Click the end of the feature to cut off", "The piece is separated with a clean flat face"]
+        }
         if (mode === "horizontal") return {
             "title": "Horizontal cut",
             "body": "A flat cut parallel to the build plate at a chosen height. Use it to split tall prints into stackable parts or to fit the printer's Z height.",
@@ -195,7 +200,7 @@ Item {
                 // Experimental (secondary) modes only appear in this dropdown
                 // when the "Show experimental cut modes" toggle (near Debug) is
                 // on. Auto-on when an experimental mode is already active.
-                property var primaryValues: ["path", "path_isolate", "horizontal", "vertical"]
+                property var primaryValues: ["path", "path_isolate", "plane", "horizontal", "vertical"]
                 property var experimentalValues: ["smallest", "shortest", "radial", "valley", "valley_seam"]
                 // manualShowExperimental is the user's toggle; showExperimental
                 // derives from it OR an experimental mode being active, so the
@@ -206,8 +211,8 @@ Item {
                     : false)
                 property var modeValues: showExperimental ? primaryValues.concat(experimentalValues) : primaryValues
                 model: showExperimental
-                    ? ["Multi-point", "Isolate region", "Horizontal", "Vertical", "Smallest Section", "Shortest Seam", "Radial (geodesic)", "Valley (groove)", "Valley Seam (concavity)"]
-                    : ["Multi-point", "Isolate region", "Horizontal", "Vertical"]
+                    ? ["Multi-point", "Isolate region", "Plane (across)", "Horizontal", "Vertical", "Smallest Section", "Shortest Seam", "Radial (geodesic)", "Valley (groove)", "Valley Seam (concavity)"]
+                    : ["Multi-point", "Isolate region", "Plane (across)", "Horizontal", "Vertical"]
                 currentIndex: {
                     if (UM.ActiveTool) {
                         var idx = modeValues.indexOf(UM.ActiveTool.properties.getValue("CutMode"))
@@ -233,6 +238,7 @@ Item {
                 text: {
                     if (UM.ActiveTool) {
                         var mode = UM.ActiveTool.properties.getValue("CutMode")
+                        if (mode === "plane") return "Clean cut across the clicked surface (along the arrow)"
                         if (mode === "horizontal") return "Cut parallel to the build plate"
                         if (mode === "vertical") return "Cut perpendicular to the build plate"
                         if (mode === "smallest") return "Find smallest cross-section at click point"

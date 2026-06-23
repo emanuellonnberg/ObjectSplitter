@@ -86,6 +86,7 @@ from .core.geometry import (
     create_dot_mesh_data,
 )
 from .core.plane_calculator import (
+    CutPlane,
     horizontal_cut_plane,
     vertical_cut_plane,
     find_smallest_cut_plane,
@@ -216,6 +217,7 @@ class ObjectSplitter(Tool):
     """Tool for splitting 3D objects into multiple parts by cutting along planes."""
 
     # Cut mode constants
+    CUT_MODE_PLANE = "plane"                # Predictable plane cut across the clicked surface
     CUT_MODE_HORIZONTAL = "horizontal"      # Cut parallel to build plate
     CUT_MODE_VERTICAL = "vertical"          # Cut perpendicular to build plate
     CUT_MODE_SMALLEST = "smallest"          # Find smallest cross-section
@@ -1758,6 +1760,7 @@ class ObjectSplitter(Tool):
 
         # For smallest/shortest seam: show arrow at click point along surface normal
         if self._cut_mode in (
+            self.CUT_MODE_PLANE,
             self.CUT_MODE_SMALLEST,
             self.CUT_MODE_SHORTEST,
             self.CUT_MODE_RADIAL,
@@ -2020,7 +2023,17 @@ class ObjectSplitter(Tool):
             from .core.plane_calculator import snap_point_to_mesh_surface
             _, click_face_id = snap_point_to_mesh_surface(tm, click_pos_arr)
 
-            if self._cut_mode == self.CUT_MODE_HORIZONTAL:
+            if self._cut_mode == self.CUT_MODE_PLANE:
+                # Predictable cut: the plane is perpendicular to the surface
+                # normal at the click (cuts ACROSS the feature you clicked the
+                # end of), passing through the click point.
+                snap_point, click_face_id = snap_point_to_mesh_surface(tm, click_pos_arr)
+                surf_normal = numpy.array([0.0, 1.0, 0.0])
+                if click_face_id is not None and click_face_id < len(tm.face_normals):
+                    surf_normal = numpy.array(tm.face_normals[click_face_id], dtype=numpy.float64)
+                plane = CutPlane(origin=numpy.asarray(snap_point, dtype=numpy.float64),
+                                 normal=surf_normal)
+            elif self._cut_mode == self.CUT_MODE_HORIZONTAL:
                 plane = horizontal_cut_plane(tm, self._cut_height_percent)
             elif self._cut_mode == self.CUT_MODE_VERTICAL:
                 if R is not None:
@@ -2219,7 +2232,13 @@ class ObjectSplitter(Tool):
 
             # Perform the split (delegates to core.mesh_splitter)
             self._updateProgress("Splitting mesh...", 40)
-            if self._cut_mode in (
+            if self._cut_mode == self.CUT_MODE_PLANE:
+                # Clean local split: capped slice + clicked-component selection
+                # gives a flat watertight cut localized to the clicked feature.
+                split_result = clean_local_plane_split(
+                    tm, plane.origin, plane.normal, click_face_id
+                )
+            elif self._cut_mode in (
                 self.CUT_MODE_SHORTEST,
                 self.CUT_MODE_RADIAL,
                 self.CUT_MODE_VALLEY_SEAM,
