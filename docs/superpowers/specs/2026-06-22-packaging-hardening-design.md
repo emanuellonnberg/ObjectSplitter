@@ -46,10 +46,17 @@ applies even to the Windows-first milestone.
   versions expose the APIs the code uses — see Risks.)
 - **trimesh:** Cura is stuck on 3.9.36, so 4.x must be supplied by the plugin.
   Handling is the one **open decision** (see below).
-- **rtree:** drop it. It is only used by mesh_splitter's preferred capped-slice
-  strategy, which already has manual-cap and face-split fallbacks (now solid).
-  Removing it eliminates a native dependency. Verify the fallbacks produce
-  acceptable caps without it.
+- **rtree:** **keep bundling it** (decision changed from the initial draft,
+  which proposed dropping it). It enables trimesh's preferred capped planar
+  slice and its wheel is self-contained. Its native library is **not**
+  Python-version-locked (it loads `libspatialindex` via `ctypes`, not a
+  cp3xx `.pyd`), so it does not cause the ABI/Cura-update fragility this work
+  targets. **Trade-off:** the bundled `libspatialindex` is platform-specific
+  (Windows `.dll`), so this Windows-first bundle would `OSError` on
+  import if shipped as-is to macOS/Linux. That is acceptable here because
+  cross-platform is explicitly deferred (see Out of scope). When/if
+  cross-platform is pursued, rtree must either be dropped (rely on the
+  manual-cap and face-split fallbacks) or bundled per-platform.
 - **manifold3d:** remains optional and unbundled; cap-native connectors work
   without it. Document the degraded boolean path.
 - **networkx:** keep bundling (pure-Python, platform-independent).
@@ -77,14 +84,16 @@ maintainer's.
 
 ## Plan (Windows-first milestone)
 
-1. **Slim the bundle.** Remove numpy, scipy, shapely (and rtree) from `lib/`.
-   Keep trimesh 4.x + networkx. Update `__init__.py` so it adds `lib/` to
-   `sys.path` for the pure-Python packages only and no longer expects bundled
-   numpy/scipy.
-2. **trimesh loading.** Implement the chosen option (default #2: guarded,
-   version-checked, reversible global replace).
-3. **rtree removal.** Confirm mesh_splitter falls back cleanly; adjust the
-   strategy chain/messaging so a missing rtree is normal, not a warning.
+1. **Slim the bundle.** Remove numpy, scipy, shapely from `lib/`. Keep
+   trimesh 4.x, networkx and rtree. Update `__init__.py` so it adds `lib/` to
+   `sys.path` for the bundled packages and no longer expects bundled
+   numpy/scipy/shapely.
+2. **trimesh loading.** Keep the existing guarded, version-checked global
+   replace (load bundled 4.x ahead of Cura's 3.9). Private vendoring is left
+   as a pre-Marketplace follow-up.
+3. **rtree kept.** It stays bundled (see Decisions). The manual-cap and
+   face-split fallbacks remain in place, so a future drop of rtree (for
+   cross-platform) is still possible without code changes.
 4. **Refresh `scripts/bundle_deps.py`** to produce the slim, pure-Python bundle
    (and document which deps are expected from Cura).
 5. **CI.** Add a GitHub Actions workflow running `pytest` on push/PR.
@@ -113,8 +122,10 @@ maintainer's.
   confirm at runtime inside Cura (and check the minimum supported Cura in the
   SDK range, whose scipy may be older — fall back or keep a documented minimal
   bundle if so).
-- **rtree removal** changes the capping path; verify cap quality/watertightness
-  on representative meshes via the replay harness.
+- **rtree is platform-specific.** The bundled `libspatialindex` is a Windows
+  `.dll`; this bundle would fail to import on macOS/Linux. Acceptable for the
+  Windows-first milestone; revisit (drop or per-platform bundle) for
+  cross-platform.
 - **trimesh option #2** is a stopgap; carries the coexistence risk until #1.
 - **No clean-room CI for QML/Cura**; CI covers `pytest` only. The clean-install
   smoke stays manual.
@@ -124,5 +135,5 @@ maintainer's.
 - `pytest` (279) green throughout; it runs against whatever numpy/scipy/trimesh
   resolve, so also run it once in an environment matching Cura's dep versions.
 - Replay harness (`scripts/profile_capture.py`, capture replay tests) to
-  confirm cut/cap results unchanged after rtree removal and dep swap.
+  confirm cut/cap results unchanged after the dependency swap.
 - Manual clean-install smoke on Windows Cura 5.12.
