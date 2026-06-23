@@ -1738,13 +1738,15 @@ class ObjectSplitter(Tool):
             self._removePreview()
             return
 
-        # Calculate plane parameters based on cut mode
-        transformed_mesh = mesh_data.getTransformed(picked_node.getWorldTransformation())
-        vertices = transformed_mesh.getVertices()
-
-        # Get bounding box for plane size
-        min_bounds = vertices.min(axis=0)
-        max_bounds = vertices.max(axis=0)
+        # Use the node's cached world-space bounding box instead of transforming
+        # every vertex on each hover. Transforming a dense mesh (tens of thousands
+        # of vertices) per mouse-move was the cause of laggy hover previews.
+        bbox = picked_node.getBoundingBox()
+        if bbox is None:
+            self._removePreview()
+            return
+        min_bounds = numpy.array([bbox.minimum.x, bbox.minimum.y, bbox.minimum.z])
+        max_bounds = numpy.array([bbox.maximum.x, bbox.maximum.y, bbox.maximum.z])
         mesh_size = max_bounds - min_bounds
         plane_size = max(mesh_size[0], mesh_size[2]) * 1.2  # 20% larger than mesh
 
