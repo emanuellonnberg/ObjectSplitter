@@ -31,6 +31,36 @@ logger = logging.getLogger("objectsplitter.path_cutter")
 # Mesh graph cache
 # ---------------------------------------------------------------------------
 
+def _concavity_weight(
+    mesh: "trimesh.Trimesh",
+    edges_unique: numpy.ndarray,
+    valley_bias: float,
+) -> numpy.ndarray:
+    """Per-edge cost multiplier in [~0.05, 1.0]; concave edges get a discount.
+
+    Concave (valley) edges -- where the two adjacent faces fold inward -- are
+    made cheaper so a shortest path prefers them, hugging grooves. Convex and
+    boundary edges keep their full length (multiplier 1.0).
+    """
+    n = len(edges_unique)
+    weight = numpy.ones(n, dtype=numpy.float64)
+    try:
+        fa_edges = numpy.sort(numpy.asarray(mesh.face_adjacency_edges), axis=1)
+        convex = numpy.asarray(mesh.face_adjacency_convex, dtype=bool)
+        angles = numpy.asarray(mesh.face_adjacency_angles, dtype=numpy.float64)
+        eu = numpy.sort(numpy.asarray(edges_unique), axis=1)
+        index = {(int(a), int(b)): i for i, (a, b) in enumerate(eu)}
+        for k in numpy.where(~convex)[0]:
+            i = index.get((int(fa_edges[k, 0]), int(fa_edges[k, 1])))
+            if i is not None:
+                # Stronger concavity (larger fold angle) -> bigger discount.
+                strength = min(1.0, float(angles[k]) / (numpy.pi / 2.0))
+                weight[i] = max(0.05, 1.0 - valley_bias * strength)
+    except Exception as e:  # noqa: BLE001 - weighting is best-effort
+        logger.debug("concavity weighting unavailable: %s", e)
+    return weight
+
+
 class _MeshGraph:
     """Precomputed mesh graph state shared across a chain_paths call.
 
@@ -41,7 +71,7 @@ class _MeshGraph:
 
     __slots__ = ("vertices", "csr", "kdtree", "component_labels", "n_components")
 
-    def __init__(self, mesh: "trimesh.Trimesh"):
+    def __init__(self, mesh: "trimesh.Trimesh", valley_bias: float = 0.0):
         vertices = numpy.asarray(mesh.vertices, dtype=numpy.float64)
         edges = numpy.asarray(mesh.edges_unique, dtype=numpy.int64)
         n_verts = len(vertices)
@@ -49,6 +79,11 @@ class _MeshGraph:
         edge_lengths = numpy.linalg.norm(
             vertices[edges[:, 0]] - vertices[edges[:, 1]], axis=1
         )
+        if valley_bias > 0.0:
+            # Lower the cost of concave (valley) edges so the shortest path
+            # prefers to run along grooves while still passing through the
+            # waypoints. Convex/ridge edges keep their full length.
+            edge_lengths = edge_lengths * _concavity_weight(mesh, edges, valley_bias)
         rows = numpy.concatenate([edges[:, 0], edges[:, 1]])
         cols = numpy.concatenate([edges[:, 1], edges[:, 0]])
         data = numpy.concatenate([edge_lengths, edge_lengths])
@@ -136,10 +171,14 @@ def snap_to_nearest_vertex(
 def chain_paths(
     mesh: "trimesh.Trimesh",
     waypoints: List[numpy.ndarray],
+    valley_bias: float = 0.0,
 ) -> List[int]:
     """
     Given 2+ waypoints (3D positions on mesh surface), snap each to the
     nearest vertex and compute geodesic paths between consecutive pairs.
+
+    valley_bias > 0 discounts concave (valley) edges so the path hugs grooves
+    while still passing through the waypoints (0 = plain geodesic).
 
     Handles disconnected components: if a waypoint snaps to a vertex on a
     different component from the first waypoint, it is re-snapped to the
@@ -152,7 +191,7 @@ def chain_paths(
     if len(waypoints) < 2:
         raise ValueError("Need at least 2 waypoints")
 
-    graph = _MeshGraph(mesh)
+    graph = _MeshGraph(mesh, valley_bias=valley_bias)
     points = numpy.asarray(waypoints, dtype=numpy.float64).reshape(-1, 3)
 
     # Bulk-snap waypoints to nearest vertices via KD-tree.

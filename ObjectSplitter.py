@@ -2059,11 +2059,13 @@ class ObjectSplitter(Tool):
                     from .core.path_cutter import chain_paths, partition_faces_by_path
                     self._updateProgress("Computing geodesic path through points...", 20)
                     anchor_pts = numpy.asarray(anchor_points_arr, dtype=numpy.float64)
-                    vertex_path = chain_paths(tm, anchor_pts)
+                    # Valley modes hug concave grooves between the points; plain
+                    # Multi-point would use valley_bias=0.
+                    vertex_path = chain_paths(tm, anchor_pts, valley_bias=0.75)
                     face_set_a, face_set_b = partition_faces_by_path(tm, vertex_path)
                     used_anchor_path = True
                     plane = None
-                    Logger.log("i", "Point mode: geodesic path cut through %d anchor points",
+                    Logger.log("i", "Point mode: valley-weighted path cut through %d anchor points",
                                len(anchor_pts))
                 except Exception as e:
                     Logger.log("w", "Anchor path cut failed (%s); using search instead", e)
