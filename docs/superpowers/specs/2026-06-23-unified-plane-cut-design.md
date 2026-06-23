@@ -1,131 +1,134 @@
-# Unified "Plane" Cut — Design
+# Unified "Plane" Cut + Clean Local Split — Design
 
-Date: 2026-06-23
+Date: 2026-06-23 (revised after spikes)
 
 ## Goal
 
-Replace the separate **Horizontal** and **Vertical** cut modes with a single
-**Plane** mode, and make a plane cut act **locally on the clicked feature**
-(e.g. cut one tooth of a fork) instead of slicing the whole model at that
-plane. Keep the whole-model slice available for height-based stacking splits.
+Two linked goals:
 
-Motivation: horizontal/vertical "don't work well" because they use the global
-infinite-plane slice (`slice_mesh_with_fallback`), which cuts every feature the
-plane passes through. Smallest/Valley already cut locally via
-`split_by_local_plane`; Plane mode should use the same machinery.
+1. **Fix the sawtooth.** The local/face-partition cut modes
+   (smallest, valley, and the seam modes) produce a jagged cut surface that
+   follows triangle edges. This is the root cause of the "advanced modes don't
+   work" experience. Make planar local cuts produce a **clean, flat, watertight**
+   cut surface.
+2. **Unify + localize plane cuts.** Replace the separate Horizontal and
+   Vertical modes with one **Plane** mode whose cut acts on the **clicked
+   feature** (e.g. one fork tooth), with a whole-model option for stacking
+   splits.
 
-## Behaviour
+## Findings from spikes (measured, not assumed)
 
-### Local by default, whole-model opt-in
+- `split_by_face_sets` builds each side with `mesh.submesh(face_set)` — whole
+  triangles, never sliced along the cut. On an irregular mesh (icosphere,
+  tilted plane) the open boundary spans **3.34 mm** off the plane: the sawtooth.
+  Every face-partition mode (smallest, valley, shortest, radial, valley_seam,
+  path_isolate) shares this.
+- trimesh's **capped slice** (`slice_mesh_plane`) slices triangles along the
+  plane: the cut vertices land exactly on the plane (spread ~0) — clean.
+- Picking the **connected component containing the click** from a capped slice
+  yields a clean, **watertight** separated piece (fork middle-tooth tip: 286
+  faces, watertight, X[-3,3]).
+- The **remainder** stays watertight with other features intact by slicing
+  uncapped, welding the non-clicked components back to the body
+  (`merge_vertices` welds the shared plane loops), then repairing the single
+  leftover hole with the existing `_attempt_watertight_repair` (fork remainder:
+  3750 faces, watertight, both other teeth kept).
 
-- **Local (default):** the cut separates only the connected feature at the
-  click, via `split_by_local_plane(mesh, origin, [normal...], click_face_id)`.
-- **Whole model (checkbox "Cut whole model"):** the current global slice
-  (`slice_mesh_with_fallback`) at the plane, for splitting a tall print into
-  stackable parts.
+These confirm the strategy below works on a connected multi-feature mesh.
 
-### Orientation selector — Auto / Horizontal / Vertical
+## Cut strategy: clean local plane split
 
-- **Horizontal** — plane normal = up (Y axis); parallel to the build plate.
-- **Vertical** — plane through the click, aligned to the camera view direction
-  (today's vertical behaviour); falls back to the X axis when no view normal is
-  available.
-- **Auto** — orient automatically by running the smallest-cross-section search
-  (`find_smallest_cut_plane`) at the click and using its best normal (and its
-  ranked `top_candidates` as fallbacks). This is the same engine the Smallest
-  mode uses; Auto is that search surfaced inside Plane mode. (Folding the
-  standalone Smallest mode into Plane/Auto is explicitly out of scope here.)
+New core function in `core/mesh_splitter.py`:
 
-### Position
+```
+clean_local_plane_split(mesh, plane_origin, plane_normal, source_face_id,
+                        whole_model=False) -> SplitResult
+```
 
-- Local cut (any orientation): plane origin = the click point.
-- Whole-model + Horizontal: plane origin from the existing **Height %** slider.
-- Whole-model + Vertical/Auto: plane origin = the click point.
+- **whole_model=True:** current behaviour — `slice_mesh_with_fallback`
+  (global capped slice). For stacking-split tall prints.
+- **whole_model=False (default, local):**
+  1. `up_cap = slice_mesh_plane(mesh, +n, o, cap=True)`; `merge_vertices`.
+  2. `separated` = the connected component of `up_cap` containing the clicked
+     face's centroid side (nearest the click). Clean, watertight.
+  3. `up = slice(+n, cap=False)`, `lo = slice(-n, cap=False)`, both
+     `merge_vertices`. `others` = `up` components except the clicked one.
+  4. `remainder = concatenate([lo] + others)`, `merge_vertices`,
+     `_attempt_watertight_repair` to cap the single removed-feature hole.
+  5. Return `SplitResult(upper=separated, lower=remainder, capped=...)`.
+- **Robustness:** wrap in try/except; on any failure fall back to the current
+  `split_by_local_plane` (face partition) so a cut never crashes. Record the
+  strategy used in `SplitResult.strategies_attempted`.
 
-## Components
+Scope: **planar modes only** (there is a real plane to slice along). The
+**seam modes** (shortest/radial/valley_seam/path_isolate) have no single plane;
+de-sawtoothing them is a separate, harder problem and is **out of scope here**.
 
-### Backend (`ObjectSplitter.py`)
+## Plane mode (UI), built on the clean split
 
-- Add `CUT_MODE_PLANE = "plane"`. Keep `CUT_MODE_HORIZONTAL`/`_VERTICAL`
-  constants only as migration aliases (see Migration); remove them from the UI
-  combobox.
-- New exposed properties:
+Replace Horizontal + Vertical with one **Plane** mode.
+
+- `CUT_MODE_PLANE = "plane"`. Keep `CUT_MODE_HORIZONTAL`/`_VERTICAL` only as
+  migration aliases; remove from the combobox.
+- Properties:
   - `PlaneOrientation` (`"auto" | "horizontal" | "vertical"`, default `"auto"`).
   - `CutWholeModel` (bool, default `false`).
-- `_performCut` for `plane` mode:
-  - Build candidate normals + origin from orientation:
-    - horizontal → `horizontal_cut_plane` normal/origin (origin = click for
-      local; height-% for whole-model).
-    - vertical → `vertical_cut_plane(click, view_normal?)`.
-    - auto → `find_smallest_cut_plane(...)` at the click; candidates = its
-      `top_candidates`.
-  - Local: `split_by_local_plane(tm, origin, candidate_normals, click_face_id)`.
-  - Whole model: `slice_mesh_with_fallback(tm, origin, normal, face_id=...)`.
+- Orientation → (origin, normal):
+  - **Horizontal** — normal = up (Y); origin = click (local) or Height-% point
+    (whole model).
+  - **Vertical** — normal = view-aligned (else X) through the click.
+  - **Auto** — `find_smallest_cut_plane` at the click; use its best normal.
+    (Auto reuses the Smallest engine; folding the standalone Smallest mode into
+    Plane is out of scope.)
+- `_performCut` calls `clean_local_plane_split(tm, origin, normal,
+  click_face_id, whole_model=self._cut_whole_model)`.
 
-### Plane construction helper (`core/plane_calculator.py`)
+### Apply the clean split to Smallest and Valley too
 
-- Small helper `plane_for_orientation(mesh, orientation, click_point,
-  click_face_id, view_normal, height_percent, whole_model)` returning
-  `(origin, candidate_normals)`, so `_performCut` stays thin and the logic is
-  unit-testable without Cura. Auto delegates to `find_smallest_cut_plane`.
+Smallest and Valley are planar; route them through `clean_local_plane_split`
+(with their searched normal) instead of `split_by_local_plane`, so they also get
+clean cuts. This is the highest-value part — it fixes the modes the user already
+relies on the search for.
 
 ### UI (`qml/` and `qt6/`, kept in sync)
 
 - Combobox: replace the two entries with one **"Plane"**.
-- New controls, visible only in Plane mode:
-  - Orientation selector (Auto / Horizontal / Vertical) — a small ComboBox or
-    segmented row.
-  - "Cut whole model" checkbox.
-  - Existing **Height %** slider shown only when Horizontal + whole-model.
-- Mode description + `getModeHelp("plane")` entry updated; remove the
-  `horizontal`/`vertical` help entries (or keep, harmless).
+- Plane-mode controls: orientation selector (Auto/Horizontal/Vertical),
+  "Cut whole model" checkbox, Height-% slider shown only for
+  Horizontal + whole-model.
+- `getModeDescription` + `getModeHelp("plane")` entry; drop `horizontal`/
+  `vertical` entries.
 
 ### Migration
 
-- On load, map a saved `cut_mode` of `"horizontal"`/`"vertical"` to
-  `plane` with `PlaneOrientation` set accordingly and `CutWholeModel = true`
-  (old behaviour was whole-model), so existing preferences keep working.
+On load, map a saved `cut_mode` of `"horizontal"`/`"vertical"` to `plane` with
+`PlaneOrientation` set and `CutWholeModel = true` (old behaviour was global).
 
 ## Testing
 
-- `core` unit tests for `plane_for_orientation`: correct normals/origins for
-  each orientation; Auto returns the smallest-search candidates; height-% vs
-  click origin selection.
-- Split behaviour: local plane cut on the fork separates only the clicked tooth
-  (assert the other teeth stay with the body); whole-model cut splits across.
-- Integration test exercising `plane` mode end-to-end through the existing
-  capture/replay or direct core calls.
-- `pytest` green; QML paren/brace balance; manual Cura smoke (local + whole
-  model, all three orientations).
-
-## Validation (pre-implementation spike)
-
-Ran the core machinery directly on the fork test mesh (no Cura) to confirm the
-foundation before building on it, because the user reported the "advanced"
-modes being unreliable:
-
-- **Local horizontal** cut through a middle-tooth click → separated piece was
-  exactly that tooth tip (X[-3,3], Y[35,41], 286 faces); the other teeth stayed
-  with the body. Correct.
-- **Local vertical** through a tooth cut *along* it (split the whole fork
-  left/right) — geometrically expected, since the tooth extends upward; matches
-  the user's "across, not along" caveat. Vertical is the wrong tool for a tooth.
-- **Auto** (`find_smallest_cut_plane`) localized correctly for both a middle-
-  tooth click (132 faces, X[-3,3]) and a left-tooth side click (639 faces,
-  X[-17,-11], cut across the tooth).
-
-Conclusion: `split_by_local_plane` and the Smallest engine are sound for this
-mode. The unreliable "advanced" modes are the **geodesic seam** family
-(shortest / radial / valley_seam), which Plane mode does **not** use. Real-world
-STLs still warrant a Cura smoke test (tessellation / non-watertight meshes).
+- `core` unit tests for `clean_local_plane_split`:
+  - separated piece is watertight and localized to the clicked feature
+    (fork middle tooth: X within [-6,6]);
+  - remainder is watertight and keeps the other features (left/right teeth
+    present);
+  - cut-face flatness: separated piece vertices on the cut all lie on the plane
+    (distance spread < 1e-4);
+  - on a single-feature mesh (icosphere) it still produces two watertight halves;
+  - failure path falls back to `split_by_local_plane`.
+- `plane_for_orientation` helper: correct normals/origins per orientation; Auto
+  delegates to `find_smallest_cut_plane`.
+- Smallest/Valley still pass existing tests after rerouting (or update the
+  orthographic baselines if the cleaner cut changes them).
+- `pytest` green; QML balance; manual Cura smoke (Plane local + whole-model,
+  three orientations; re-test Smallest for the sawtooth being gone).
 
 ## Out of scope
 
-- Folding the standalone Smallest mode into Plane/Auto (possible later).
-- Changing Smallest/Valley/seam/path modes.
-- New connector behaviour.
+- De-sawtoothing the seam modes (shortest/radial/valley_seam/path_isolate).
+- Folding the standalone Smallest mode into Plane/Auto.
+- Connector changes.
 
 ## Branch
 
-Feature, not packaging — its own branch + PR off `main`, after PR #12
-(packaging-hardening) merges. Not added to the packaging branch.
+`unified-plane-cut`, off `packaging-hardening` (inherits the UI infra). Rebase
+onto `main` after PR #12 merges.
