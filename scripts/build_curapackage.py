@@ -46,6 +46,7 @@ INCLUDE_TOP_LEVEL = [
     "ObjectSplitter.py",
     "plugin.json",
     "README.md",
+    "LICENSE",
     "icon.svg",
     "core",
     "qml",
