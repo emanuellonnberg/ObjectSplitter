@@ -847,6 +847,125 @@ def split_by_local_plane(
     return result
 
 
+def _component_nearest_point(components, point):
+    """Return the connected-component submesh whose surface is closest to point."""
+    point = numpy.asarray(point, dtype=numpy.float64)
+    best = None
+    best_d = None
+    for comp in components:
+        d = float(numpy.linalg.norm(comp.vertices - point, axis=1).min())
+        if best_d is None or d < best_d:
+            best_d = d
+            best = comp
+    return best
+
+
+def clean_local_plane_split(
+    mesh: "trimesh.Trimesh",
+    plane_origin: numpy.ndarray,
+    plane_normal: numpy.ndarray,
+    source_face_id: int,
+    whole_model: bool = False,
+) -> SplitResult:
+    """
+    Split a mesh with a plane, producing a clean (triangle-sliced) cut surface.
+
+    Local (default): separates only the clicked connected feature. The clicked
+    component comes from a capped slice (clean and watertight); the other cut
+    components are welded back onto the body and the single leftover hole is
+    repaired, so the remainder stays watertight with the other features intact.
+
+    whole_model=True: behaves like the global capped slice (cuts everything the
+    plane crosses) -- for stacking-split tall prints.
+
+    Falls back to split_by_local_plane (face partition) on any failure so a cut
+    never crashes.
+
+    Args:
+        mesh: The trimesh object.
+        plane_origin: A point on the cutting plane.
+        plane_normal: Normal vector of the cutting plane.
+        source_face_id: The face the user clicked on.
+        whole_model: If True, cut the whole model instead of just the click.
+
+    Returns:
+        SplitResult with upper = separated piece, lower = remainder.
+    """
+    result = SplitResult()
+    result.strategies_attempted.append("clean_local_plane_split")
+
+    origin = numpy.asarray(plane_origin, dtype=numpy.float64)
+    normal = numpy.asarray(plane_normal, dtype=numpy.float64)
+    norm = float(numpy.linalg.norm(normal))
+    if norm > 0:
+        normal = normal / norm
+
+    if whole_model:
+        gr = slice_mesh_with_fallback(mesh, origin, normal, face_id=source_face_id)
+        gr.strategies_attempted.insert(0, "clean_local_plane_split(whole_model)")
+        return gr
+
+    try:
+        src_centroid = mesh.vertices[mesh.faces[source_face_id]].mean(axis=0)
+
+        def _split_feature_on(side_normal):
+            """Separate the near-click feature on the +side_normal side.
+
+            Returns (separated, remainder, separated_face_count) or None.
+            """
+            cap = trimesh.intersections.slice_mesh_plane(
+                mesh, plane_normal=side_normal, plane_origin=origin, cap=True)
+            cap.merge_vertices()
+            cap_comps = cap.split(only_watertight=False)
+            if not cap_comps:
+                return None
+            separated = _component_nearest_point(cap_comps, src_centroid).copy()
+
+            # Uncapped slices share plane-loop vertices, so welding the
+            # non-clicked feature-side components back onto the body is seamless.
+            feat = trimesh.intersections.slice_mesh_plane(
+                mesh, plane_normal=side_normal, plane_origin=origin, cap=False)
+            feat.merge_vertices()
+            body = trimesh.intersections.slice_mesh_plane(
+                mesh, plane_normal=-side_normal, plane_origin=origin, cap=False)
+            body.merge_vertices()
+            feat_comps = feat.split(only_watertight=False)
+            if not feat_comps:
+                return None
+            clicked = _component_nearest_point(feat_comps, src_centroid)
+            others = [c for c in feat_comps if c is not clicked]
+
+            remainder = trimesh.util.concatenate([body] + others)
+            remainder.merge_vertices()
+            remainder, _cap_faces = _attempt_watertight_repair(remainder)
+            if len(separated.vertices) == 0 or len(remainder.vertices) == 0:
+                return None
+            return separated, remainder, len(separated.faces)
+
+        # The clicked face lies on the plane, so its centroid side is unreliable.
+        # Try both orientations and keep the one whose separated piece is smaller
+        # -- the local feature (e.g. a tooth tip), not the whole body.
+        candidates = [r for r in (_split_feature_on(normal),
+                                  _split_feature_on(-normal)) if r is not None]
+        if not candidates:
+            raise ValueError("no valid clean split on either side")
+        separated, remainder, _ = min(candidates, key=lambda r: r[2])
+
+        result.upper = separated
+        result.lower = remainder
+        result.capped = bool(separated.is_watertight and remainder.is_watertight)
+        result.strategy_used = "clean_local_plane_split"
+        return result
+    except Exception as e:  # noqa: BLE001 - a cut must never crash
+        logger.warning(
+            "clean_local_plane_split failed (%s); falling back to face partition", e)
+        fb = split_by_local_plane(
+            mesh, origin, [numpy.asarray(plane_normal, dtype=numpy.float64)],
+            source_face_id)
+        fb.strategies_attempted.insert(0, "clean_local_plane_split(failed)")
+        return fb
+
+
 def split_by_face_sets(
     mesh: "trimesh.Trimesh",
     face_set_a: list,
