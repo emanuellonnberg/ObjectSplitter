@@ -2298,10 +2298,11 @@ class ObjectSplitter(Tool):
             self._updateProgress("Splitting mesh...", 40)
             if used_anchor_path:
                 # Geodesic path cut through the placed points (Multi-point style).
+                # Cap the cut like path mode so the faces seal and connectors work.
                 split_result = split_by_face_sets(
                     tm, face_set_a, face_set_b,
                     strategy_name="anchor_path",
-                    attempt_hole_fill=False,
+                    attempt_hole_fill=(self._connector_enabled or self._path_cap_ends),
                 )
             elif self._cut_mode == self.CUT_MODE_PLANE:
                 # Clean local split: capped slice + clicked-component selection
