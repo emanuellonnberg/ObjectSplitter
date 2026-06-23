@@ -392,7 +392,7 @@ Item {
                     if (UM.ActiveTool.properties.getValue("PathIsolateTargetPickActive")) {
                         return "Click the region you want to isolate."
                     }
-                    return "Click to place points for the current closed loop, then press Start New Loop."
+                    return "Place at least 3 points, press Finish Loop, then Pick Target Region (or start another loop)."
                 }
                 font: UM.Theme.getFont("default_italic")
                 color: UM.Theme.getColor("text_inactive")
@@ -510,7 +510,7 @@ Item {
                 spacing: Math.round(UM.Theme.getSize("default_margin").width / 2)
 
                 Button {
-                    text: "Start New Loop"
+                    text: "Finish Loop"
                     width: 110
                     height: UM.Theme.getSize("setting_control").height
                     enabled: UM.ActiveTool && UM.ActiveTool.properties.getValue("CurrentLoopPointCount") >= 3
@@ -545,12 +545,11 @@ Item {
                     text: "Pick Target Region"
                     width: 125
                     height: UM.Theme.getSize("setting_control").height
-                    // Enabled with a finalized loop, OR a complete current loop
-                    // (>=3 pts) which is auto-finalized when the button is pressed.
-                    enabled: UM.ActiveTool && (
-                             UM.ActiveTool.properties.getValue("PathLoopCount") >= 1 ||
-                             UM.ActiveTool.properties.getValue("CurrentLoopPointCount") >= 3
-                    )
+                    // Requires at least one finished loop and no half-drawn
+                    // current loop, so it can't be pressed mid-draw.
+                    enabled: UM.ActiveTool &&
+                             UM.ActiveTool.properties.getValue("PathLoopCount") >= 1 &&
+                             UM.ActiveTool.properties.getValue("CurrentLoopPointCount") === 0
                     onClicked: {
                         if (UM.ActiveTool) {
                             UM.ActiveTool.setProperty("TriggerPickPathIsolateTarget", true)
