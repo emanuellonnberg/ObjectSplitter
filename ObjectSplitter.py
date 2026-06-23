@@ -2193,11 +2193,20 @@ class ObjectSplitter(Tool):
                     attempt_hole_fill=False,
                 )
             elif self._cut_mode in (self.CUT_MODE_SMALLEST, self.CUT_MODE_VALLEY):
-                # Clean local split: capped slice + clicked-component selection
-                # gives a flat watertight cut instead of a triangle-edge sawtooth.
-                # It falls back to the face partition internally if the slice fails.
-                split_result = clean_local_plane_split(
-                    tm, plane.origin, plane.normal, click_face_id
+                # Use graph-based local separation with candidate fallback.
+                # If the best plane only grazes the surface (single-triangle cut),
+                # try the next-best candidates until we get a meaningful partition.
+                # NOTE: these auto-search modes still pick grazing planes on some
+                # geometry (tracked separately); the Plane mode is the reliable
+                # path. clean_local_plane_split is used there, not here.
+                candidate_normals = []
+                if search_result and search_result.top_candidates:
+                    candidate_normals = [n for _, n in search_result.top_candidates]
+                if not candidate_normals:
+                    candidate_normals = [plane.normal]
+
+                split_result = split_by_local_plane(
+                    tm, plane.origin, candidate_normals, click_face_id
                 )
             else:
                 split_result = slice_mesh_with_fallback(
