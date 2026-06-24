@@ -344,6 +344,7 @@ class ObjectSplitter(Tool):
         self._hover_tm = None
         self._hover_tm_node = None
         self._hover_tm_xform = None
+        self._hover_kdtree = None  # KD-tree of hover trimesh vertices (fast normal lookup)
         self._picking_pass = None  # Cached picking pass
         self._progress_dialog = None  # Progress dialog for long operations
 
@@ -1800,11 +1801,13 @@ class ObjectSplitter(Tool):
             normal_dir = None
             try:
                 tm = self._getCachedHoverTrimesh(picked_node)
-                if tm is not None:
-                    _, hover_face_id = snap_point_to_mesh_surface(tm, center)
-                    if hover_face_id is not None and hover_face_id < len(tm.face_normals):
-                        normal_dir = numpy.asarray(
-                            tm.face_normals[hover_face_id], dtype=numpy.float64)
+                if tm is not None and self._hover_kdtree is not None:
+                    # Nearest-vertex normal: microsecond KD-tree query instead of
+                    # the slow nearest-face proximity. Good enough for the arrow.
+                    _, vidx = self._hover_kdtree.query(center)
+                    vnormals = tm.vertex_normals
+                    if vidx is not None and vidx < len(vnormals):
+                        normal_dir = numpy.asarray(vnormals[vidx], dtype=numpy.float64)
             except Exception as e:
                 Logger.log("d", "Hover normal lookup failed: %s", e)
             self._createOrUpdateMarker(center, marker_size, normal_dir)
@@ -1924,10 +1927,19 @@ class ObjectSplitter(Tool):
             self._hover_tm = None
             self._hover_tm_node = None
             self._hover_tm_xform = None
+            self._hover_kdtree = None
             return None
         self._hover_tm = extraction[0]
         self._hover_tm_node = node
         self._hover_tm_xform = xform
+        # Cache a KD-tree of vertices so the hover arrow can find the nearest
+        # vertex normal in microseconds, instead of the ~4 ms nearest-FACE
+        # proximity query (which also builds a ~100 ms triangle tree).
+        try:
+            from scipy.spatial import cKDTree
+            self._hover_kdtree = cKDTree(self._hover_tm.vertices)
+        except Exception:
+            self._hover_kdtree = None
         return self._hover_tm
 
     def _extractTrimesh(self, node: CuraSceneNode) -> Optional[Tuple["trimesh.Trimesh", numpy.ndarray, numpy.ndarray]]:
