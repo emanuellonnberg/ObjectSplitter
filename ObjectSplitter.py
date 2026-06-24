@@ -2413,7 +2413,36 @@ class ObjectSplitter(Tool):
 
             # Add connectors if enabled (delegates to core.connectors)
             if self._connector_enabled:
-                if self._cut_mode in (
+                if used_anchor_path:
+                    # Non-planar geodesic path cut through the points: place
+                    # connectors along the path (same as Multi-point), not the
+                    # planar peg/hole which needs a single cut plane.
+                    try:
+                        self._updateProgress("Adding connectors...", 60)
+                        path_points = numpy.asarray(
+                            tm.vertices[vertex_path], dtype=numpy.float64)
+                        cr = add_path_connectors(
+                            mesh_upper, mesh_lower, path_points,
+                            split_result.cap_faces_upper,
+                            split_result.cap_faces_lower,
+                            config=ConnectorConfig(
+                                enabled=True,
+                                diameter=float(self._connector_diameter),
+                                height=float(self._connector_height),
+                                clearance=float(self._connector_clearance),
+                                sides=self._connector_sides,
+                            ),
+                            face_count=len(tm.faces),
+                        )
+                        if cr.connectors_added:
+                            mesh_upper = cr.upper
+                            mesh_lower = cr.lower
+                            Logger.log("i", "Path connectors added (anchor cut)")
+                        else:
+                            Logger.log("w", "Connectors skipped: %s", cr.skipped_reason)
+                    except Exception as e:
+                        Logger.log("w", "Anchor-path connectors failed: %s", e)
+                elif self._cut_mode in (
                     self.CUT_MODE_SHORTEST,
                     self.CUT_MODE_RADIAL,
                     self.CUT_MODE_VALLEY_SEAM,

@@ -45,17 +45,32 @@ def _concavity_weight(
     n = len(edges_unique)
     weight = numpy.ones(n, dtype=numpy.float64)
     try:
-        fa_edges = numpy.sort(numpy.asarray(mesh.face_adjacency_edges), axis=1)
         convex = numpy.asarray(mesh.face_adjacency_convex, dtype=bool)
+        concave = ~convex
+        if not concave.any():
+            return weight
         angles = numpy.asarray(mesh.face_adjacency_angles, dtype=numpy.float64)
+        fa_edges = numpy.sort(numpy.asarray(mesh.face_adjacency_edges), axis=1)
         eu = numpy.sort(numpy.asarray(edges_unique), axis=1)
-        index = {(int(a), int(b)): i for i, (a, b) in enumerate(eu)}
-        for k in numpy.where(~convex)[0]:
-            i = index.get((int(fa_edges[k, 0]), int(fa_edges[k, 1])))
-            if i is not None:
-                # Stronger concavity (larger fold angle) -> bigger discount.
-                strength = min(1.0, float(angles[k]) / (numpy.pi / 2.0))
-                weight[i] = max(0.05, 1.0 - valley_bias * strength)
+
+        # Encode each sorted (v0, v1) edge as a single integer key, then match
+        # concave adjacency edges to unique-edge rows with searchsorted -- fully
+        # vectorized, no per-edge Python loop or dict.
+        stride = numpy.int64(int(eu.max()) + 1) if n else numpy.int64(1)
+        eu_key = eu[:, 0].astype(numpy.int64) * stride + eu[:, 1]
+        order = numpy.argsort(eu_key)
+        eu_key_sorted = eu_key[order]
+
+        fk = fa_edges[concave, 0].astype(numpy.int64) * stride + fa_edges[concave, 1]
+        strength = numpy.clip(angles[concave] / (numpy.pi / 2.0), 0.0, 1.0)
+        discount = numpy.maximum(0.05, 1.0 - valley_bias * strength)
+
+        pos = numpy.searchsorted(eu_key_sorted, fk)
+        pos = numpy.clip(pos, 0, len(eu_key_sorted) - 1)
+        valid = eu_key_sorted[pos] == fk
+        idx = order[pos[valid]]
+        # Several concave adjacencies can map to one edge -> keep the strongest.
+        numpy.minimum.at(weight, idx, discount[valid])
     except Exception as e:  # noqa: BLE001 - weighting is best-effort
         logger.debug("concavity weighting unavailable: %s", e)
     return weight

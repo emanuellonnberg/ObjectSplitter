@@ -911,23 +911,24 @@ def clean_local_plane_split(
         # not a one-triangle fragment the slice grazed off near the click.
         min_feature_faces = max(20, int(0.003 * len(mesh.faces)))
 
-        def _split_feature_on(side_normal):
-            """Separate the near-click feature on the +side_normal side.
-
-            Returns (separated, remainder, separated_face_count) or None.
-
-            Both pieces are sliced UNCAPPED and capped with the scipy-based
-            watertight repair, never trimesh's cap=True -- the latter triangulates
-            the cap via mapbox_earcut/triangle, which Cura's bundled environment
-            does not provide ("No available triangulation engine!").
-            """
-            feat = trimesh.intersections.slice_mesh_plane(
+        # Slice each side ONCE (uncapped). The +normal slice is the feature side
+        # for one candidate and the body side for the other, so two slices cover
+        # both orientations -- no redundant re-slicing. Capping is the scipy-based
+        # watertight repair, never trimesh's cap=True (that triangulates the cap
+        # via mapbox_earcut/triangle, absent in Cura's bundled environment).
+        def _slice(side_normal):
+            s = trimesh.intersections.slice_mesh_plane(
                 mesh, plane_normal=side_normal, plane_origin=origin, cap=False)
-            feat.merge_vertices()
-            body = trimesh.intersections.slice_mesh_plane(
-                mesh, plane_normal=-side_normal, plane_origin=origin, cap=False)
-            body.merge_vertices()
-            feat_comps = feat.split(only_watertight=False)
+            s.merge_vertices()
+            return s
+
+        pos = _slice(normal)
+        neg = _slice(-normal)
+        pos_comps = pos.split(only_watertight=False)
+        neg_comps = neg.split(only_watertight=False)
+
+        def _build(feat_comps, body):
+            """Feature = clicked component of feat_comps; remainder = body + the rest."""
             if not feat_comps:
                 return None
             # Pick the nearest component that is a real feature, not a sliver.
@@ -936,11 +937,7 @@ def clean_local_plane_split(
             if len(clicked.faces) < min_feature_faces:
                 return None
             others = [c for c in feat_comps if c is not clicked]
-
-            # Separated feature: cap its open cut with the scipy repair.
             separated, _ = _attempt_watertight_repair(clicked.copy())
-            # Remainder: weld other feature-side components onto the body (the
-            # uncapped slices share plane-loop vertices), then cap the hole.
             remainder = trimesh.util.concatenate([body] + others)
             remainder.merge_vertices()
             remainder, _cap_faces = _attempt_watertight_repair(remainder)
@@ -951,8 +948,8 @@ def clean_local_plane_split(
         # The clicked face lies on the plane, so its centroid side is unreliable.
         # Try both orientations and keep the one whose separated piece is smaller
         # -- the local feature (e.g. a tooth tip), not the whole body.
-        candidates = [r for r in (_split_feature_on(normal),
-                                  _split_feature_on(-normal)) if r is not None]
+        candidates = [r for r in (_build(pos_comps, neg),
+                                  _build(neg_comps, pos)) if r is not None]
         if not candidates:
             raise ValueError("no valid clean split on either side")
         separated, remainder, _ = min(candidates, key=lambda r: r[2])
