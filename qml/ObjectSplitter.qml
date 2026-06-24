@@ -200,7 +200,7 @@ Item {
                 // Experimental (secondary) modes only appear in this dropdown
                 // when the "Show experimental cut modes" toggle (near Debug) is
                 // on. Auto-on when an experimental mode is already active.
-                property var primaryValues: ["path", "path_isolate", "plane", "horizontal", "vertical"]
+                property var primaryValues: ["path", "path_isolate", "plane"]
                 property var experimentalValues: ["smallest", "shortest", "radial", "valley", "valley_seam"]
                 // manualShowExperimental is the user's toggle; showExperimental
                 // derives from it OR an experimental mode being active, so the
@@ -211,8 +211,8 @@ Item {
                     : false)
                 property var modeValues: showExperimental ? primaryValues.concat(experimentalValues) : primaryValues
                 model: showExperimental
-                    ? ["Multi-point", "Isolate region", "Plane (across)", "Horizontal", "Vertical", "Smallest Section", "Shortest Seam", "Radial (geodesic)", "Valley (groove)", "Valley Seam (concavity)"]
-                    : ["Multi-point", "Isolate region", "Plane (across)", "Horizontal", "Vertical"]
+                    ? ["Multi-point", "Isolate region", "Plane", "Smallest Section", "Shortest Seam", "Radial (geodesic)", "Valley (groove)", "Valley Seam (concavity)"]
+                    : ["Multi-point", "Isolate region", "Plane"]
                 currentIndex: {
                     if (UM.ActiveTool) {
                         var idx = modeValues.indexOf(UM.ActiveTool.properties.getValue("CutMode"))
