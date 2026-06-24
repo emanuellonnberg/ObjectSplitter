@@ -28,8 +28,8 @@ Item {
     function getModeHelp(mode) {
         if (mode === "plane") return {
             "title": "Plane cut",
-            "body": "A clean, flat cut. 'Along surface' uses the hover arrow to cut across the clicked feature; 'Horizontal' and 'Vertical' use fixed axes. It separates only the clicked feature, or the whole model with 'Cut whole model'. Best for protruding, separable features (limbs, pegs, fingers). For interconnected parts like ladder rungs, a single plane crosses them all -- use Multi-point instead.",
-            "steps": ["Pick an orientation (Along surface / Horizontal / Vertical)", "Hover to aim, click the feature to separate", "Toggle 'Cut whole model' for a full split (e.g. stacking)"]
+            "body": "A clean, flat cut. 'Along surface' cuts across the clicked feature (aim with the hover arrow); 'Horizontal' is bed-parallel; '3-point plane' lets you click three points to define a plane at any angle. Separates only the clicked feature, or the whole model with 'Cut whole model'. For interconnected parts like ladder rungs a single plane crosses them all -- use Multi-point there.",
+            "steps": ["Pick an orientation", "Along surface / Horizontal: click the feature. 3-point: click three points to set the plane", "Toggle 'Cut whole model' for a full split (e.g. stacking)"]
         }
         if (mode === "horizontal") return {
             "title": "Horizontal cut",
@@ -879,8 +879,8 @@ Item {
                     id: planeOrientationCombo
                     width: 150
                     height: UM.Theme.getSize("setting_control").height
-                    property var values: ["surface", "horizontal", "vertical"]
-                    model: ["Along surface", "Horizontal", "Vertical"]
+                    property var values: ["surface", "horizontal", "points"]
+                    model: ["Along surface", "Horizontal", "3-point plane"]
                     currentIndex: {
                         if (UM.ActiveTool) {
                             var i = values.indexOf(UM.ActiveTool.properties.getValue("PlaneOrientation"))

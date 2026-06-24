@@ -532,6 +532,8 @@ class ObjectSplitter(Tool):
         value = str(value)
         if value != self._plane_orientation:
             self._plane_orientation = value
+            self._clearPathWaypoints()  # clear any placed 3-point markers
+            self._removePreview()
             Logger.log("d", "Plane orientation changed to: %s", value)
             self.propertyChanged.emit()
 
@@ -1107,6 +1109,10 @@ class ObjectSplitter(Tool):
             self._cut_mode == self.CUT_MODE_PATH or
             self._cut_mode == self.CUT_MODE_PATH_ISOLATE or
             (
+                self._cut_mode == self.CUT_MODE_PLANE and
+                self._plane_orientation == "points"
+            ) or
+            (
                 self._multi_point_anchors_enabled and
                 self._cut_mode in (self.CUT_MODE_VALLEY, self.CUT_MODE_VALLEY_SEAM)
             )
@@ -1600,6 +1606,23 @@ class ObjectSplitter(Tool):
         self._clearPathWaypoints()
         self._performCut(node, Vector(*click_point.tolist()), anchor_points=anchor_points)
 
+    def _planeFromThreePoints(self, p1, p2, p3):
+        """Cut plane through three clicked points (any orientation).
+
+        Normal = (p2-p1) x (p3-p1); origin = the centroid of the three points.
+        Accepts Vectors or numpy arrays. Returns (origin, normal) numpy arrays.
+        """
+        def _arr(p):
+            if hasattr(p, "x"):
+                return numpy.array([p.x, p.y, p.z], dtype=numpy.float64)
+            return numpy.asarray(p, dtype=numpy.float64).reshape(3)
+        a, b, c = _arr(p1), _arr(p2), _arr(p3)
+        normal = numpy.cross(b - a, c - a)
+        n = numpy.linalg.norm(normal)
+        normal = (normal / n) if n > 1e-9 else numpy.array([0.0, 1.0, 0.0])
+        origin = (a + b + c) / 3.0
+        return origin, normal
+
     def event(self, event):
         super().event(event)
         modifiers = QApplication.keyboardModifiers()
@@ -1684,6 +1707,17 @@ class ObjectSplitter(Tool):
                     Logger.log("d", "Dragging point %d", hit_idx + 1)
                     return
                 self._addPathWaypoint(picked_position, picked_node)
+                # Plane + 3-point: once three points are placed, cut along the
+                # plane through them (any orientation).
+                if (self._cut_mode == self.CUT_MODE_PLANE
+                        and self._plane_orientation == "points"
+                        and len(self._path_waypoints) >= 3):
+                    pts = list(self._path_waypoints[:3])
+                    origin, normal = self._planeFromThreePoints(*pts)
+                    self._clearPathWaypoints()
+                    self._removePreview()
+                    self._performCut(picked_node, picked_position,
+                                     plane_override=(origin, normal))
                 return
 
             Logger.log("i", "Splitting object '%s' at position %s", picked_node.getName(), str(picked_position))
@@ -1747,6 +1781,11 @@ class ObjectSplitter(Tool):
             self._removePreview()
             self._hover_node = picked_node
             return
+        if (self._cut_mode == self.CUT_MODE_PLANE
+                and self._plane_orientation == "points"):
+            self._removePreview()
+            self._hover_node = picked_node
+            return
         if (
             self._multi_point_anchors_enabled and
             self._cut_mode in (self.CUT_MODE_VALLEY, self.CUT_MODE_VALLEY_SEAM)
@@ -1784,15 +1823,17 @@ class ObjectSplitter(Tool):
         mesh_size = max_bounds - min_bounds
         plane_size = max(mesh_size[0], mesh_size[2]) * 1.2  # 20% larger than mesh
 
-        # For smallest/shortest seam: show arrow at click point along surface normal
-        if self._cut_mode in (
-            self.CUT_MODE_PLANE,
+        # Surface-relative modes (and Plane "along surface"): show the normal arrow.
+        arrow_modes = (
             self.CUT_MODE_SMALLEST,
             self.CUT_MODE_SHORTEST,
             self.CUT_MODE_RADIAL,
             self.CUT_MODE_VALLEY,
             self.CUT_MODE_VALLEY_SEAM,
-        ):
+        )
+        plane_surface = (self._cut_mode == self.CUT_MODE_PLANE
+                         and self._plane_orientation == "surface")
+        if self._cut_mode in arrow_modes or plane_surface:
             center = numpy.array([picked_position.x, picked_position.y, picked_position.z])
             mesh_size_max = max(mesh_size[0], mesh_size[1], mesh_size[2])
             marker_size = max(0.5, mesh_size_max * 0.012)  # 1.2% of mesh or 0.5mm
@@ -2000,6 +2041,7 @@ class ObjectSplitter(Tool):
         node: CuraSceneNode,
         click_position: Vector,
         anchor_points: Optional[list] = None,
+        plane_override: Optional[tuple] = None,
     ):
         """Perform the cut operation on the given node using core algorithms."""
         self._showProgress("Object Splitter", "Preparing mesh...", 0, 100)
@@ -2084,6 +2126,13 @@ class ObjectSplitter(Tool):
 
             if used_anchor_path:
                 pass  # face sets already computed from the geodesic path
+            elif plane_override is not None:
+                # Caller supplied the plane directly (e.g. 2-click vertical cut).
+                snap_point, click_face_id = snap_point_to_mesh_surface(tm, click_pos_arr)
+                plane = CutPlane(
+                    origin=numpy.asarray(plane_override[0], dtype=numpy.float64),
+                    normal=numpy.asarray(plane_override[1], dtype=numpy.float64),
+                )
             elif self._cut_mode == self.CUT_MODE_PLANE:
                 snap_point, click_face_id = snap_point_to_mesh_surface(tm, click_pos_arr)
                 if self._plane_orientation == "horizontal":
