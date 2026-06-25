@@ -953,15 +953,18 @@ def clean_local_plane_split(
             raise ValueError("no valid clean split on either side")
         clicked, others, body, _ = min(picks, key=lambda p: p[3])
 
-        separated, _ = _attempt_watertight_repair(clicked.copy())
+        separated, cap_faces_sep = _attempt_watertight_repair(clicked.copy())
         remainder = trimesh.util.concatenate([body] + others)
         remainder.merge_vertices()
-        remainder, _cap_faces = _attempt_watertight_repair(remainder)
+        remainder, cap_faces_rem = _attempt_watertight_repair(remainder)
         if len(separated.vertices) == 0 or len(remainder.vertices) == 0:
             raise ValueError("empty separated or remainder piece")
 
         result.upper = separated
         result.lower = remainder
+        # The cut-face cap patches enable engine-free (cap-native) connectors.
+        result.cap_faces_upper = cap_faces_sep
+        result.cap_faces_lower = cap_faces_rem
         result.capped = bool(separated.is_watertight and remainder.is_watertight)
         result.strategy_used = "clean_local_plane_split"
         return result

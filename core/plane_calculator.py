@@ -514,14 +514,20 @@ def find_plane_along_normal(
     mesh: "trimesh.Trimesh",
     click_position: numpy.ndarray,
     surface_normal: numpy.ndarray,
-    n_angles: int = 18,
+    n_angles: int = 36,
 ) -> CutPlane:
-    """Find a cut plane that CONTAINS the surface normal (cuts *along* the arrow).
+    """Find a cut plane that CONTAINS the surface normal (cuts *across* the feature).
 
     The plane is constrained to contain ``surface_normal`` (so its own normal is
     perpendicular to it), which geometrically excludes the grazing tangent plane.
     Rotating about the surface normal, the rotation with the smallest local
     cross-section is the natural neck/base of the clicked feature.
+
+    Scoring by smallest local cross-section *area* (not separated-feature size)
+    is what gives a stable, predictable cut: the area landscape has one clear
+    minimum at the neck, so nearby clicks give the same plane. ``n_angles`` of
+    36 samples it finely enough to be stable (18 was too coarse and jumped
+    between minima).
 
     Args:
         mesh: The trimesh object.

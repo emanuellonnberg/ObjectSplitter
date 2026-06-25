@@ -2150,10 +2150,11 @@ class ObjectSplitter(Tool):
                     else:
                         plane = vertical_cut_plane(snap_point)
                 else:
-                    # "surface": cut ALONG the hover arrow (the clicked surface
-                    # normal). The plane CONTAINS the arrow (excludes the grazing
-                    # tangent plane); rotating about it to the smallest local
-                    # cross-section gives the feature's neck. Deterministic.
+                    # "surface": cut ACROSS the clicked feature. The plane
+                    # CONTAINS the hover arrow (the clicked surface normal, which
+                    # excludes the grazing tangent plane); rotating about it, the
+                    # rotation that separates the smallest connected feature is
+                    # the neck. Deterministic and view-independent.
                     arrow = numpy.array([0.0, 1.0, 0.0])
                     if click_face_id is not None and click_face_id < len(tm.face_normals):
                         arrow = numpy.array(tm.face_normals[click_face_id], dtype=numpy.float64)
@@ -2448,7 +2449,9 @@ class ObjectSplitter(Tool):
                     self.CUT_MODE_VALLEY_SEAM,
                 ):
                     Logger.log("w", "Skipping connectors - not supported for non-planar seam modes")
-                elif split_result.capped and plane is not None:
+                elif (plane is not None
+                        and split_result.cap_faces_upper
+                        and split_result.cap_faces_lower):
                     self._updateProgress("Adding connectors...", 60)
                     config = ConnectorConfig(
                         enabled=True,
@@ -2457,20 +2460,27 @@ class ObjectSplitter(Tool):
                         clearance=self._connector_clearance,
                         sides=self._connector_sides,
                     )
-                    connector_result = add_connectors(
+                    # Cap-native connectors (boss + matching recess on the cut
+                    # face): engine-free, so they work in stock Cura, and they
+                    # only need the clean cut surface -- not a fully watertight
+                    # piece -- so a non-watertight input mesh no longer blocks
+                    # connectors.
+                    connector_result = add_cap_native_connectors(
                         mesh_upper, mesh_lower,
-                        plane.origin, plane.normal, config
+                        plane.origin, plane.normal,
+                        split_result.cap_faces_upper,
+                        split_result.cap_faces_lower,
+                        config,
                     )
                     if connector_result.connectors_added:
                         mesh_upper = connector_result.upper
                         mesh_lower = connector_result.lower
-                        Logger.log("i", "Connectors added: peg on %s, hole on %s (engine: %s)",
-                                   connector_result.peg_on, connector_result.hole_on,
-                                   connector_result.hole_engine)
+                        Logger.log("i", "Connectors added (cap-native): peg on %s",
+                                   connector_result.peg_on)
                     else:
                         Logger.log("w", "Connectors skipped: %s", connector_result.skipped_reason)
                 else:
-                    Logger.log("w", "Skipping connectors - mesh was not capped (open edges)")
+                    Logger.log("w", "Skipping connectors - no cut-face cap available")
 
             # Create Cura scene nodes from result meshes
             self._updateProgress("Creating new objects...", 80)

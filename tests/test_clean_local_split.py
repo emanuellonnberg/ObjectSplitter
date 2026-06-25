@@ -90,6 +90,27 @@ def test_find_plane_along_normal_contains_arrow_and_cuts():
     assert r.upper.is_watertight
 
 
+def test_clean_split_exposes_cap_faces_for_engine_free_connectors():
+    # The clean split must report the cut-face cap patches so connectors can be
+    # added without a boolean engine (Cura ships none).
+    from core.connectors import add_cap_native_connectors, ConnectorConfig
+    mesh = trimesh.creation.icosphere(subdivisions=3, radius=20.0)
+    n = np.array([0.3, 1.0, 0.2]); n = n / np.linalg.norm(n)
+    _, fid = snap_point_to_mesh_surface(mesh, n * 20.0)
+    r = clean_local_plane_split(mesh, np.array([0.0, 0.0, 0.0]), n, fid)
+    assert r.success
+    assert r.cap_faces_upper and r.cap_faces_lower, "cap faces should be recorded"
+
+    cr = add_cap_native_connectors(
+        r.upper, r.lower, np.array([0.0, 0.0, 0.0]), n,
+        r.cap_faces_upper, r.cap_faces_lower,
+        ConnectorConfig(enabled=True, diameter=4.0, height=3.0, clearance=0.2),
+    )
+    # Cap-native is engine-free, so this holds even with no boolean engine.
+    assert cr.connectors_added, cr.skipped_reason
+    assert len(cr.upper.faces) >= len(r.upper.faces)
+
+
 def test_degenerate_normal_does_not_crash():
     mesh, face_id = _fork_middle_tooth()
     # Zero normal must not raise; it returns a SplitResult (via fallback).
