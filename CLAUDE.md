@@ -30,14 +30,42 @@ docs/                  Architecture and algorithm documentation
 ## Running tests
 
 ```bash
-pytest                          # 222 tests, ~21s (with local captures present)
+pytest                          # ~286 tests, ~20s
 pytest tests/test_geometry.py   # single module
 pytest -v                       # verbose
 pytest -k smallest              # filter by keyword
 ```
 
-Config is in `pytest.ini`. Test deps are in `requirements-test.txt`.
-**Always run `pytest` before pushing.**
+Config is in `pytest.ini`. Test deps are in `requirements-test.txt` (note: it
+must include `rtree` for ray-cast projection tests, plus `triangle` and
+`mapbox-earcut` for trimesh mesh-builder triangulation). Fork tessellation
+tests skip when `triangle` has no wheel for the running Python.
+CI runs the suite on py3.10-3.12 (Linux) + py3.12 (Windows) via
+`.github/workflows/tests.yml`. **Always run `pytest` before pushing.**
+
+## Critical gotchas (hard-won)
+
+- **No triangulation engine in Cura.** Cura's bundled Python ships neither
+  `mapbox_earcut` nor `triangle`, so `trimesh`'s `cap=True` slice and
+  `triangulate_polygon` raise *"No available triangulation engine!"* at runtime.
+  Core code must never depend on one. `clean_local_plane_split` slices uncapped
+  and caps via the scipy-based `_attempt_watertight_repair`. (Tests pass because
+  test deps include the engines; a cut that works in tests can still fall back
+  in Cura -- check the host log.)
+- **Cut-mode reliability.** The default modes (Multi-point, Plane, Isolate) are
+  user-defined and predictable. The single-click *search* modes (Smallest,
+  Shortest, Radial, Valley, Valley-seam) pick grazing/unintended planes on real
+  meshes (the min-cross-section objective favors grazing slivers; no fixed bias
+  fully fixes it) -- they are kept behind the experimental toggle. Prefer
+  user-defined cuts; do not build new features on the search.
+- **Plane mode** is the axis/surface hub: orientation `surface` (deterministic
+  `find_plane_along_normal`, **not** camera-dependent), `horizontal`, `points`
+  (3-point). The standalone horizontal/vertical modes were folded into it.
+- **Diagnose cuts with capture + replay, not guesswork.** Enable Debug capture,
+  reproduce in Cura, then `replay_operation("captures/<name>")` offline and
+  compare to the host `cura.log` "Split result" line (it records the strategy
+  used and any `(failed: ...)` reason). Real-mesh behavior differs from
+  synthetic test meshes -- always reproduce on the actual capture.
 
 ## Key conventions
 
@@ -50,7 +78,8 @@ Config is in `pytest.ini`. Test deps are in `requirements-test.txt`.
   The only difference is the `UM` import version.
 - **Style**: PEP 8, Google-style docstrings, type hints throughout.
   Copyright header (LGPLv3) on every file.
-- **No CI** yet. Run `pytest` locally before pushing.
+- **CI**: GitHub Actions runs `pytest` on push/PR (py3.10-3.12 Linux, py3.12
+  Windows). Still run `pytest` locally before pushing.
 - **Fallback chains**: mesh_splitter and connectors use priority-ordered
   fallback strategies. Maintain this pattern when adding new strategies.
 - **Daemon threads with timeouts**: Expensive algorithms
@@ -175,18 +204,25 @@ Interactive workflow:
 Compare `qml/ObjectSplitter.qml` and `qt6/ObjectSplitter.qml`, report
 differences beyond the `import UM` line, and offer to synchronize them.
 
-### `/debug-cut` -- Debug a failing cut
+### `diagnose-cut` -- Debug a wrong/failing cut  *(implemented: `.claude/skills/diagnose-cut/`)*
 
-1. Check if debug captures exist in `captures/`.
-2. List available captures.
-3. Replay the selected capture and report the result.
-4. If split fails, analyze the SplitResult to identify which strategy failed
-   and why.
+Replay a debug capture offline and compare to the Cura log to find why a cut
+grazed, hit the wrong feature, or fell back. Reproduces the real runtime env
+(no triangulation engine). Use this whenever a cut "doesn't work".
 
 ### `/bundle-deps` -- Refresh bundled dependencies
 
 ```bash
-python scripts/bundle_deps.py
+python scripts/bundle_deps.py    # bundles only trimesh, networkx, rtree
 ```
 
 Verify the bundle by importing trimesh from `lib/`.
+
+### `/build-package` -- Build the installable .curapackage
+
+```bash
+python scripts/build_curapackage.py   # -> dist/ObjectSplitter-<version>.curapackage
+```
+
+Reads version/SDK from `plugin.json`; ships only runtime files (no tests/docs/
+scripts). The OPC layout and metadata are handled by the script.

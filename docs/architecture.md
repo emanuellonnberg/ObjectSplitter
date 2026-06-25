@@ -22,9 +22,15 @@ and iterated on without launching Cura.
 |    plane_calculator  ->  mesh_splitter  ->  connectors   |
 |    geometry           path_cutter        debug_capture   |
 +----------------------------------------------------------+
-|  trimesh, numpy, scipy  (bundled in lib/)                |
+|  trimesh, networkx, rtree (bundled in lib/);             |
+|  numpy, scipy, shapely provided by Cura at runtime       |
 +----------------------------------------------------------+
 ```
+
+Cura's bundled Python ships no mesh-builder triangulation engine
+(`mapbox_earcut` / `triangle`), so the core must never rely on one. The clean
+local split (`mesh_splitter.clean_local_plane_split`) slices uncapped and caps
+via scipy for exactly this reason.
 
 ## Data flow: click to split
 

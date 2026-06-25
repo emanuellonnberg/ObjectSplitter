@@ -1,19 +1,50 @@
 # Cut Techniques
 
-ObjectSplitter provides seven cut modes, ranging from simple planar cuts to
-geodesic surface-following algorithms. This document explains the algorithm
-behind each mode, when to use it, and its performance characteristics.
+This document explains the algorithm behind each cut mode.
 
 ## Overview
 
-The modes fall into three categories:
+The modes split into two groups by how the cut is *decided*:
 
-1. **Planar (simple)** -- Horizontal, Vertical. Instant. Good for basic splits.
-2. **Planar (search)** -- Smallest Section, Valley. Search many orientations to
-   find the optimal plane. Good for necks, joints, and narrow features.
-3. **Non-planar (geodesic)** -- Shortest Seam, Radial, Valley Seam, Path. Cut along the mesh
-   surface instead of through a flat plane. Good for organic shapes where no
-   single plane produces a clean seam.
+**User-defined (default, reliable)** -- the cut comes directly from where you
+click, so it is predictable on any mesh:
+
+- **Multi-point** (`path`) -- geodesic path through your points (`core/path_cutter.py`).
+- **Plane** (`plane`) -- a clean, watertight planar cut localized to the clicked
+  feature. Orientation is **Along surface** (rotate about the clicked surface
+  normal to the smallest local cross-section; see `find_plane_along_normal`),
+  **Horizontal** (bed-parallel), or **3-point** (plane through three clicked
+  points). Optional *whole-model* cut for stacking splits.
+- **Isolate region** (`path_isolate`) -- extract a region bounded by closed loops.
+
+**Automatic search (experimental, less reliable)** -- an algorithm guesses the
+plane/seam from a single click. These can pick grazing or unintended cuts on
+real models and are hidden behind a "show experimental" toggle:
+
+- **Planar search** -- Smallest Section, Valley. Search orientations for the
+  minimum local cross-section. The alignment bias penalizes grazing planes.
+- **Geodesic seam** -- Shortest Seam, Radial, Valley Seam. Dual-Dijkstra surface
+  partitions. (When anchor points are enabled, Valley / Valley-seam instead cut
+  a valley-weighted geodesic *through* the points -- deterministic.)
+
+## The clean local split
+
+Planar cuts (Plane, Smallest, Valley) go through `clean_local_plane_split`
+(`core/mesh_splitter.py`):
+
+1. Slice each side of the plane **uncapped** (no triangulation engine needed --
+   Cura's bundled environment has none, so `cap=True` would raise
+   "No available triangulation engine!").
+2. Take the connected component containing the click as the separated piece;
+   weld the other components back onto the body.
+3. Cap both cut faces with the scipy-based watertight repair.
+
+This gives a **flat, watertight** cut face localized to the clicked feature --
+no triangle-edge sawtooth -- and only separates the clicked feature, not every
+feature the infinite plane crosses. For interconnected features (e.g. ladder
+rungs) a single plane crosses them all, so use Multi-point there.
+
+The sections below document the individual planar/geodesic algorithms.
 
 ---
 
