@@ -24,6 +24,113 @@ Item {
         }
     }
 
+    // Mode help text shown by the (i) popup next to the mode description.
+    function getModeHelp(mode) {
+        if (mode === "horizontal") return {
+            "title": "Horizontal cut",
+            "body": "A flat cut parallel to the build plate at a chosen height. Use it to split tall prints into stackable parts or to fit the printer's Z height.",
+            "steps": ["Set the Height %", "Press Cut"]
+        }
+        if (mode === "vertical") return {
+            "title": "Vertical cut",
+            "body": "A flat cut perpendicular to the build plate through the point you click. Use it for left/right or front/back splits of wide models.",
+            "steps": ["Click where the cut should pass", "Press Cut"]
+        }
+        if (mode === "smallest") return {
+            "title": "Smallest Section",
+            "body": "Searches many plane angles at your click and keeps the one with the smallest cross-section, automatically finding necks, wrists and joints.",
+            "steps": ["Click on or near the narrow feature", "Press Cut (higher Search resolution is finer but slower)"]
+        }
+        if (mode === "shortest") return {
+            "title": "Shortest Seam",
+            "body": "A surface-following cut (not a flat plane) that finds the shortest seam separating the clicked region from the rest, then refines it for a clean boundary. Good for organic protrusions like tails and tentacles.",
+            "steps": ["Click the region to separate", "Press Cut (runs with a 10 s timeout)"]
+        }
+        if (mode === "radial") return {
+            "title": "Radial (geodesic)",
+            "body": "Like Shortest Seam but skips the refinement step, so it is faster with a slightly rougher boundary. Handy as a quick preview of where a geodesic cut would land.",
+            "steps": ["Click the region to separate", "Press Cut"]
+        }
+        if (mode === "valley") return {
+            "title": "Valley (groove)",
+            "body": "A smallest-section search plus a slide along the cut direction, so it finds the narrowest spot even when you click slightly off the groove.",
+            "steps": ["Click near the groove or neck", "Press Cut"]
+        }
+        if (mode === "valley_seam") return {
+            "title": "Valley Seam (concavity)",
+            "body": "A surface-following seam that prefers running through concave (groove) regions near your click. Good for rounded throat geometry where a flat valley plane would notch the part.",
+            "steps": ["Click the feature to cut around", "Press Cut"]
+        }
+        if (mode === "path") return {
+            "title": "Multi-point",
+            "body": "Draw the cut yourself by clicking a series of points across the surface; the cut follows the surface from point to point and can close into a loop. Best when you need precise control.",
+            "steps": ["Click points across the surface", "Optionally enable Close Loop", "Press Cut"]
+        }
+        if (mode === "path_isolate") return {
+            "title": "Isolate region",
+            "body": "Extract a region bounded by one or more closed loops, then choose which side is the piece to keep. The rest of the model is separated from it.",
+            "steps": ["Click at least 3 points to outline a loop", "Press Finish Loop", "Optionally draw and finish more loops", "Press Pick Target Region, then click the region", "Press Isolate Region"]
+        }
+        return { "title": "", "body": "", "steps": [] }
+    }
+
+    // Per-mode help popup, opened by the (i) icon next to the description.
+    Popup {
+        id: modeHelpPopup
+        modal: true
+        focus: true
+        closePolicy: Popup.CloseOnPressOutside | Popup.CloseOnEscape
+        width: mainColumn.width
+        x: Math.round((base.width - width) / 2)
+        y: UM.Theme.getSize("default_margin").height
+        padding: UM.Theme.getSize("default_margin").width
+
+        property var help: (UM.ActiveTool) ? base.getModeHelp(UM.ActiveTool.properties.getValue("CutMode")) : ({ "title": "", "body": "", "steps": [] })
+
+        background: Rectangle {
+            color: UM.Theme.getColor("main_background")
+            border.color: UM.Theme.getColor("lining")
+            border.width: UM.Theme.getSize("default_lining").width
+            radius: UM.Theme.getSize("default_radius").width
+        }
+
+        contentItem: Column {
+            spacing: UM.Theme.getSize("default_margin").height
+
+            Label {
+                width: modeHelpPopup.availableWidth
+                text: modeHelpPopup.help.title
+                font: UM.Theme.getFont("default_bold")
+                color: UM.Theme.getColor("text")
+                wrapMode: Text.WordWrap
+                renderType: Text.NativeRendering
+            }
+            Label {
+                width: modeHelpPopup.availableWidth
+                text: modeHelpPopup.help.body
+                font: UM.Theme.getFont("default")
+                color: UM.Theme.getColor("text")
+                wrapMode: Text.WordWrap
+                renderType: Text.NativeRendering
+            }
+            Column {
+                width: modeHelpPopup.availableWidth
+                spacing: Math.round(UM.Theme.getSize("default_margin").height / 2)
+                Repeater {
+                    model: modeHelpPopup.help.steps
+                    Label {
+                        width: modeHelpPopup.availableWidth
+                        text: (index + 1) + ".  " + modelData
+                        font: UM.Theme.getFont("default")
+                        color: UM.Theme.getColor("text")
+                        wrapMode: Text.WordWrap
+                        renderType: Text.NativeRendering
+                    }
+                }
+            }
+        }
+    }
+
     Column {
         id: mainColumn
         spacing: UM.Theme.getSize("default_margin").height
@@ -116,28 +223,50 @@ Item {
             }
         }
 
-        // Cut Mode Description
-        Label {
+        // Cut Mode Description (with info popup)
+        Row {
             width: parent.width
-            text: {
-                if (UM.ActiveTool) {
-                    var mode = UM.ActiveTool.properties.getValue("CutMode")
-                    if (mode === "horizontal") return "Cut parallel to the build plate"
-                    if (mode === "vertical") return "Cut perpendicular to the build plate"
-                    if (mode === "smallest") return "Find smallest cross-section at click point"
-                    if (mode === "shortest") return "Plane search + min-cut refinement"
-                    if (mode === "radial") return "Geodesic distance partition from click"
-                    if (mode === "path") return "Click to place points, then press Cut"
-                    if (mode === "path_isolate") return "Place one or more closed loops, pick a target region, then isolate it"
-                    if (mode === "valley") return "Find and follow a valley/groove near click"
-                    if (mode === "valley_seam") return "Concavity-biased seam around clicked feature"
+            spacing: Math.round(UM.Theme.getSize("default_margin").width / 2)
+
+            Label {
+                width: parent.width - modeInfoIcon.width - parent.spacing
+                text: {
+                    if (UM.ActiveTool) {
+                        var mode = UM.ActiveTool.properties.getValue("CutMode")
+                        if (mode === "horizontal") return "Cut parallel to the build plate"
+                        if (mode === "vertical") return "Cut perpendicular to the build plate"
+                        if (mode === "smallest") return "Find smallest cross-section at click point"
+                        if (mode === "shortest") return "Plane search + min-cut refinement"
+                        if (mode === "radial") return "Geodesic distance partition from click"
+                        if (mode === "path") return "Click to place points, then press Cut"
+                        if (mode === "path_isolate") return "Place one or more closed loops, pick a target region, then isolate it"
+                        if (mode === "valley") return "Find and follow a valley/groove near click"
+                        if (mode === "valley_seam") return "Concavity-biased seam around clicked feature"
+                    }
+                    return ""
                 }
-                return ""
+                font: UM.Theme.getFont("default_italic")
+                color: UM.Theme.getColor("text_inactive")
+                wrapMode: Text.WordWrap
+                renderType: Text.NativeRendering
             }
-            font: UM.Theme.getFont("default_italic")
-            color: UM.Theme.getColor("text_inactive")
-            wrapMode: Text.WordWrap
-            renderType: Text.NativeRendering
+
+            Label {
+                id: modeInfoIcon
+                text: "ⓘ"  // circled small letter i
+                visible: UM.ActiveTool
+                font: UM.Theme.getFont("default")
+                color: infoMouse.containsMouse ? UM.Theme.getColor("text") : UM.Theme.getColor("text_inactive")
+                renderType: Text.NativeRendering
+
+                MouseArea {
+                    id: infoMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: modeHelpPopup.open()
+                }
+            }
         }
 
         // Path mode controls
@@ -392,7 +521,7 @@ Item {
                     if (UM.ActiveTool.properties.getValue("PathIsolateTargetPickActive")) {
                         return "Click the region you want to isolate."
                     }
-                    return "Click to place points for the current closed loop, then press Start New Loop."
+                    return "Place at least 3 points, press Finish Loop, then Pick Target Region (or start another loop)."
                 }
                 font: UM.Theme.getFont("default_italic")
                 color: UM.Theme.getColor("text_inactive")
@@ -510,7 +639,7 @@ Item {
                 spacing: Math.round(UM.Theme.getSize("default_margin").width / 2)
 
                 Button {
-                    text: "Start New Loop"
+                    text: "Finish Loop"
                     width: 110
                     height: UM.Theme.getSize("setting_control").height
                     enabled: UM.ActiveTool && UM.ActiveTool.properties.getValue("CurrentLoopPointCount") >= 3
@@ -545,9 +674,14 @@ Item {
                     text: "Pick Target Region"
                     width: 125
                     height: UM.Theme.getSize("setting_control").height
+                    // Needs at least one finished loop. Stays enabled between
+                    // loops (current empty) and while a complete extra loop is
+                    // pending (>=3 pts, auto-finalized on click); only greys out
+                    // during a half-drawn new loop (1-2 pts).
                     enabled: UM.ActiveTool &&
                              UM.ActiveTool.properties.getValue("PathLoopCount") >= 1 &&
-                             UM.ActiveTool.properties.getValue("CurrentLoopPointCount") === 0
+                             (UM.ActiveTool.properties.getValue("CurrentLoopPointCount") === 0 ||
+                              UM.ActiveTool.properties.getValue("CurrentLoopPointCount") >= 3)
                     onClicked: {
                         if (UM.ActiveTool) {
                             UM.ActiveTool.setProperty("TriggerPickPathIsolateTarget", true)

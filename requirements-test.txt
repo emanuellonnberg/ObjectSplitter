@@ -9,5 +9,20 @@ pytest>=7.0.0
 shapely>=2.0.0
 networkx>=3.0.0
 
+# rtree: trimesh uses it to build the triangle bounds-tree behind
+# mesh.ray.* . The orthographic projection tests ray-cast meshes, so without
+# rtree those projections come back empty. It is also bundled with the plugin
+# at runtime (see requirements-bundle.txt).
+rtree>=1.0.0
+
+# triangle: triangulation engine for trimesh.creation.extrude_polygon. The fork
+# test mesh pins this engine for a deterministic tessellation (see
+# scripts/visual_verification.create_fork). Test-only; never shipped.
+triangle>=20220202
+
+# mapbox-earcut: fallback triangulation engine for extrude_polygon used by the
+# other test meshes (e.g. path-cutter bridge surfaces).
+mapbox-earcut>=1.0.0
+
 # Optional - for PNG image rendering in tests
 matplotlib>=3.5.0

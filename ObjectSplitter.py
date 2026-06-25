@@ -384,6 +384,25 @@ class ObjectSplitter(Tool):
 
         CuraApplication.getInstance().globalContainerStackChanged.connect(self._updateEnabled)
         Selection.selectionChanged.connect(self._onSelectionChanged)
+        # Clear path markers if the object they belong to is deleted from the
+        # scene (otherwise the waypoint dots are left floating).
+        try:
+            CuraApplication.getInstance().getController().getScene().sceneChanged.connect(self._onSceneChanged)
+        except Exception as e:
+            Logger.log("w", "Object Splitter: could not connect sceneChanged: %s", str(e))
+
+    def _onSceneChanged(self, *args):
+        """Drop path state when the tracked object is removed from the scene."""
+        node = self._path_node
+        if node is None:
+            return
+        try:
+            removed = node.getParent() is None
+        except Exception:
+            removed = True
+        if removed:
+            Logger.log("i", "Object Splitter: tracked object removed; clearing path markers")
+            self._clearPathWaypoints()
 
     def _updateEnabled(self):
         """Update whether the tool is enabled based on current state."""
@@ -1215,6 +1234,12 @@ class ObjectSplitter(Tool):
     def _armPathIsolateTargetPick(self):
         if self._cut_mode != self.CUT_MODE_PATH_ISOLATE:
             return
+        # If at least one loop is already finished and a complete extra loop is
+        # pending, finalize it automatically so the last loop needs no explicit
+        # Finish Loop. The first loop must still be finished by hand, so this
+        # never fires before/while the first loop is being drawn.
+        if self._path_isolate_loops and len(self._path_waypoints) >= 3:
+            self._startNewPathLoop()
         if not self._path_isolate_loops:
             Logger.log("w", "Path isolate: add at least one closed loop before picking a target")
             return
