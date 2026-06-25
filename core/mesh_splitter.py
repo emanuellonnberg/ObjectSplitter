@@ -927,8 +927,11 @@ def clean_local_plane_split(
         pos_comps = pos.split(only_watertight=False)
         neg_comps = neg.split(only_watertight=False)
 
-        def _build(feat_comps, body):
-            """Feature = clicked component of feat_comps; remainder = body + the rest."""
+        def _pick(feat_comps, body):
+            """Cheap: identify the clicked feature component (no capping yet).
+
+            Returns (clicked, others, body, feature_face_count) or None.
+            """
             if not feat_comps:
                 return None
             # Pick the nearest component that is a real feature, not a sliver.
@@ -937,22 +940,25 @@ def clean_local_plane_split(
             if len(clicked.faces) < min_feature_faces:
                 return None
             others = [c for c in feat_comps if c is not clicked]
-            separated, _ = _attempt_watertight_repair(clicked.copy())
-            remainder = trimesh.util.concatenate([body] + others)
-            remainder.merge_vertices()
-            remainder, _cap_faces = _attempt_watertight_repair(remainder)
-            if len(separated.vertices) == 0 or len(remainder.vertices) == 0:
-                return None
-            return separated, remainder, len(separated.faces)
+            return clicked, others, body, len(clicked.faces)
 
         # The clicked face lies on the plane, so its centroid side is unreliable.
-        # Try both orientations and keep the one whose separated piece is smaller
-        # -- the local feature (e.g. a tooth tip), not the whole body.
-        candidates = [r for r in (_build(pos_comps, neg),
-                                  _build(neg_comps, pos)) if r is not None]
-        if not candidates:
+        # Try both orientations and keep the one whose feature is smaller -- the
+        # local piece (e.g. a tooth tip), not the whole body. Pick by face count
+        # FIRST (cheap), then run the expensive watertight repair only on the
+        # winner instead of both candidates.
+        picks = [p for p in (_pick(pos_comps, neg),
+                             _pick(neg_comps, pos)) if p is not None]
+        if not picks:
             raise ValueError("no valid clean split on either side")
-        separated, remainder, _ = min(candidates, key=lambda r: r[2])
+        clicked, others, body, _ = min(picks, key=lambda p: p[3])
+
+        separated, _ = _attempt_watertight_repair(clicked.copy())
+        remainder = trimesh.util.concatenate([body] + others)
+        remainder.merge_vertices()
+        remainder, _cap_faces = _attempt_watertight_repair(remainder)
+        if len(separated.vertices) == 0 or len(remainder.vertices) == 0:
+            raise ValueError("empty separated or remainder piece")
 
         result.upper = separated
         result.lower = remainder
