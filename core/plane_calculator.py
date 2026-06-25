@@ -514,7 +514,7 @@ def find_plane_along_normal(
     mesh: "trimesh.Trimesh",
     click_position: numpy.ndarray,
     surface_normal: numpy.ndarray,
-    n_angles: int = 36,
+    n_angles: int = 18,
 ) -> CutPlane:
     """Find a cut plane that CONTAINS the surface normal (cuts *along* the arrow).
 
