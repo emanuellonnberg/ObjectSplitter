@@ -2158,7 +2158,7 @@ class ObjectSplitter(Tool):
                     arrow = numpy.array([0.0, 1.0, 0.0])
                     if click_face_id is not None and click_face_id < len(tm.face_normals):
                         arrow = numpy.array(tm.face_normals[click_face_id], dtype=numpy.float64)
-                    plane = find_plane_along_normal(tm, snap_point, arrow, click_face_id)
+                    plane = find_plane_along_normal(tm, snap_point, arrow)
             elif self._cut_mode == self.CUT_MODE_HORIZONTAL:
                 plane = horizontal_cut_plane(tm, self._cut_height_percent)
             elif self._cut_mode == self.CUT_MODE_VERTICAL:
