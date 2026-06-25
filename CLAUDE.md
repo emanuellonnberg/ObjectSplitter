@@ -199,10 +199,10 @@ Interactive workflow:
 4. Create getter and setter methods.
 5. Add UI control to both `qml/` and `qt6/` files.
 
-### `/sync-qml` -- Sync QML files
+### `sync-qml` -- Sync QML files  *(implemented: `.claude/skills/sync-qml/`)*
 
-Compare `qml/ObjectSplitter.qml` and `qt6/ObjectSplitter.qml`, report
-differences beyond the `import UM` line, and offer to synchronize them.
+Diff `qml/` and `qt6/` panels, flag drift beyond the `import UM` line, and check
+delimiter balance. Use after editing either QML file.
 
 ### `diagnose-cut` -- Debug a wrong/failing cut  *(implemented: `.claude/skills/diagnose-cut/`)*
 
