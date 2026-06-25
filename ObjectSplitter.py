@@ -86,8 +86,10 @@ from .core.geometry import (
     create_dot_mesh_data,
 )
 from .core.plane_calculator import (
+    CutPlane,
     horizontal_cut_plane,
     vertical_cut_plane,
+    find_plane_along_normal,
     find_smallest_cut_plane,
     find_valley_cut_plane,
     find_valley_seam_partition,
@@ -99,6 +101,7 @@ from .core.mesh_splitter import (
     slice_mesh_with_fallback,
     split_by_shortest_seam,
     split_by_local_plane,
+    clean_local_plane_split,
     local_plane_partition,
     split_by_face_sets,
     prune_small_components,
@@ -215,6 +218,7 @@ class ObjectSplitter(Tool):
     """Tool for splitting 3D objects into multiple parts by cutting along planes."""
 
     # Cut mode constants
+    CUT_MODE_PLANE = "plane"                # Predictable plane cut across the clicked surface
     CUT_MODE_HORIZONTAL = "horizontal"      # Cut parallel to build plate
     CUT_MODE_VERTICAL = "vertical"          # Cut perpendicular to build plate
     CUT_MODE_SMALLEST = "smallest"          # Find smallest cross-section
@@ -235,6 +239,8 @@ class ObjectSplitter(Tool):
         self._cut_mode = self.CUT_MODE_PATH
         self._cut_height = 0.0  # For horizontal cuts: Z position (relative to object)
         self._cut_height_percent = 50.0  # Percentage of object height
+        self._plane_orientation = "surface"  # surface | horizontal | vertical
+        self._cut_whole_model = False  # Plane mode: cut whole model vs clicked feature
         self._plane_normal = numpy.array([0.0, 1.0, 0.0])  # Y-up in Cura
         self._plane_origin = numpy.array([0.0, 0.0, 0.0])
 
@@ -332,6 +338,13 @@ class ObjectSplitter(Tool):
         self._last_picked_node = None
         self._last_picked_position = None
         self._hover_node = None  # Node currently being hovered over
+        # Cached world-space trimesh for the hovered node, so the surface-normal
+        # arrow can be computed cheaply per mouse-move (rebuilt only when the
+        # node or its transform changes).
+        self._hover_tm = None
+        self._hover_tm_node = None
+        self._hover_tm_xform = None
+        self._hover_kdtree = None  # KD-tree of hover trimesh vertices (fast normal lookup)
         self._picking_pass = None  # Cached picking pass
         self._progress_dialog = None  # Progress dialog for long operations
 
@@ -339,6 +352,8 @@ class ObjectSplitter(Tool):
             "CutMode",
             "CutModes",
             "CutHeightPercent",
+            "PlaneOrientation",
+            "CutWholeModel",
             "ShowPreview",
             "TrimeshAvailable",
             "SearchResolution",
@@ -508,6 +523,28 @@ class ObjectSplitter(Tool):
         if value != self._cut_height_percent:
             self._cut_height_percent = float(value)
             Logger.log("d", "Cut height percent changed to: %s", str(value))
+            self.propertyChanged.emit()
+
+    def getPlaneOrientation(self) -> str:
+        return self._plane_orientation
+
+    def setPlaneOrientation(self, value: str) -> None:
+        value = str(value)
+        if value != self._plane_orientation:
+            self._plane_orientation = value
+            self._clearPathWaypoints()  # clear any placed 3-point markers
+            self._removePreview()
+            Logger.log("d", "Plane orientation changed to: %s", value)
+            self.propertyChanged.emit()
+
+    def getCutWholeModel(self) -> bool:
+        return self._cut_whole_model
+
+    def setCutWholeModel(self, value: bool) -> None:
+        enabled = bool(value)
+        if enabled != self._cut_whole_model:
+            self._cut_whole_model = enabled
+            Logger.log("d", "Cut whole model: %s", enabled)
             self.propertyChanged.emit()
 
     def getShowPreview(self) -> bool:
@@ -1072,6 +1109,10 @@ class ObjectSplitter(Tool):
             self._cut_mode == self.CUT_MODE_PATH or
             self._cut_mode == self.CUT_MODE_PATH_ISOLATE or
             (
+                self._cut_mode == self.CUT_MODE_PLANE and
+                self._plane_orientation == "points"
+            ) or
+            (
                 self._multi_point_anchors_enabled and
                 self._cut_mode in (self.CUT_MODE_VALLEY, self.CUT_MODE_VALLEY_SEAM)
             )
@@ -1565,6 +1606,23 @@ class ObjectSplitter(Tool):
         self._clearPathWaypoints()
         self._performCut(node, Vector(*click_point.tolist()), anchor_points=anchor_points)
 
+    def _planeFromThreePoints(self, p1, p2, p3):
+        """Cut plane through three clicked points (any orientation).
+
+        Normal = (p2-p1) x (p3-p1); origin = the centroid of the three points.
+        Accepts Vectors or numpy arrays. Returns (origin, normal) numpy arrays.
+        """
+        def _arr(p):
+            if hasattr(p, "x"):
+                return numpy.array([p.x, p.y, p.z], dtype=numpy.float64)
+            return numpy.asarray(p, dtype=numpy.float64).reshape(3)
+        a, b, c = _arr(p1), _arr(p2), _arr(p3)
+        normal = numpy.cross(b - a, c - a)
+        n = numpy.linalg.norm(normal)
+        normal = (normal / n) if n > 1e-9 else numpy.array([0.0, 1.0, 0.0])
+        origin = (a + b + c) / 3.0
+        return origin, normal
+
     def event(self, event):
         super().event(event)
         modifiers = QApplication.keyboardModifiers()
@@ -1649,6 +1707,17 @@ class ObjectSplitter(Tool):
                     Logger.log("d", "Dragging point %d", hit_idx + 1)
                     return
                 self._addPathWaypoint(picked_position, picked_node)
+                # Plane + 3-point: once three points are placed, cut along the
+                # plane through them (any orientation).
+                if (self._cut_mode == self.CUT_MODE_PLANE
+                        and self._plane_orientation == "points"
+                        and len(self._path_waypoints) >= 3):
+                    pts = list(self._path_waypoints[:3])
+                    origin, normal = self._planeFromThreePoints(*pts)
+                    self._clearPathWaypoints()
+                    self._removePreview()
+                    self._performCut(picked_node, picked_position,
+                                     plane_override=(origin, normal))
                 return
 
             Logger.log("i", "Splitting object '%s' at position %s", picked_node.getName(), str(picked_position))
@@ -1712,6 +1781,11 @@ class ObjectSplitter(Tool):
             self._removePreview()
             self._hover_node = picked_node
             return
+        if (self._cut_mode == self.CUT_MODE_PLANE
+                and self._plane_orientation == "points"):
+            self._removePreview()
+            self._hover_node = picked_node
+            return
         if (
             self._multi_point_anchors_enabled and
             self._cut_mode in (self.CUT_MODE_VALLEY, self.CUT_MODE_VALLEY_SEAM)
@@ -1737,30 +1811,47 @@ class ObjectSplitter(Tool):
             self._removePreview()
             return
 
-        # Calculate plane parameters based on cut mode
-        transformed_mesh = mesh_data.getTransformed(picked_node.getWorldTransformation())
-        vertices = transformed_mesh.getVertices()
-
-        # Get bounding box for plane size
-        min_bounds = vertices.min(axis=0)
-        max_bounds = vertices.max(axis=0)
+        # Use the node's cached world-space bounding box instead of transforming
+        # every vertex on each hover. Transforming a dense mesh (tens of thousands
+        # of vertices) per mouse-move was the cause of laggy hover previews.
+        bbox = picked_node.getBoundingBox()
+        if bbox is None:
+            self._removePreview()
+            return
+        min_bounds = numpy.array([bbox.minimum.x, bbox.minimum.y, bbox.minimum.z])
+        max_bounds = numpy.array([bbox.maximum.x, bbox.maximum.y, bbox.maximum.z])
         mesh_size = max_bounds - min_bounds
         plane_size = max(mesh_size[0], mesh_size[2]) * 1.2  # 20% larger than mesh
 
-        # For smallest/shortest seam: show arrow at click point along surface normal
-        if self._cut_mode in (
+        # Surface-relative modes (and Plane "along surface"): show the normal arrow.
+        arrow_modes = (
             self.CUT_MODE_SMALLEST,
             self.CUT_MODE_SHORTEST,
             self.CUT_MODE_RADIAL,
             self.CUT_MODE_VALLEY,
             self.CUT_MODE_VALLEY_SEAM,
-        ):
+        )
+        plane_surface = (self._cut_mode == self.CUT_MODE_PLANE
+                         and self._plane_orientation == "surface")
+        if self._cut_mode in arrow_modes or plane_surface:
             center = numpy.array([picked_position.x, picked_position.y, picked_position.z])
             mesh_size_max = max(mesh_size[0], mesh_size[1], mesh_size[2])
             marker_size = max(0.5, mesh_size_max * 0.012)  # 1.2% of mesh or 0.5mm
-            # Marker orientation is intentionally fixed for preview performance.
-            # Surface-normal-based orientation is computed only when executing the cut.
-            self._createOrUpdateMarker(center, marker_size, None)
+            # Orient the marker along the surface normal at the hover point. The
+            # trimesh is cached per node, so the nearest-face lookup stays cheap.
+            normal_dir = None
+            try:
+                tm = self._getCachedHoverTrimesh(picked_node)
+                if tm is not None and self._hover_kdtree is not None:
+                    # Nearest-vertex normal: microsecond KD-tree query instead of
+                    # the slow nearest-face proximity. Good enough for the arrow.
+                    _, vidx = self._hover_kdtree.query(center)
+                    vnormals = tm.vertex_normals
+                    if vidx is not None and vidx < len(vnormals):
+                        normal_dir = numpy.asarray(vnormals[vidx], dtype=numpy.float64)
+            except Exception as e:
+                Logger.log("d", "Hover normal lookup failed: %s", e)
+            self._createOrUpdateMarker(center, marker_size, normal_dir)
             self._hover_node = picked_node
             return
 
@@ -1858,6 +1949,40 @@ class ObjectSplitter(Tool):
     # Cutting Logic (delegates to core modules)
     # ==========================================================================
 
+    def _getCachedHoverTrimesh(self, node: CuraSceneNode):
+        """Return a world-space trimesh for the hovered node, cached.
+
+        Extracting the trimesh transforms every vertex, so it is rebuilt only
+        when the hovered node or its world transform changes -- keeping the
+        per-hover surface-normal lookup cheap on dense meshes.
+        """
+        try:
+            xform = node.getWorldTransformation().getData().tobytes()
+        except Exception:
+            xform = None
+        if (self._hover_tm is not None and self._hover_tm_node is node
+                and self._hover_tm_xform == xform):
+            return self._hover_tm
+        extraction = self._extractTrimesh(node)
+        if extraction is None:
+            self._hover_tm = None
+            self._hover_tm_node = None
+            self._hover_tm_xform = None
+            self._hover_kdtree = None
+            return None
+        self._hover_tm = extraction[0]
+        self._hover_tm_node = node
+        self._hover_tm_xform = xform
+        # Cache a KD-tree of vertices so the hover arrow can find the nearest
+        # vertex normal in microseconds, instead of the ~4 ms nearest-FACE
+        # proximity query (which also builds a ~100 ms triangle tree).
+        try:
+            from scipy.spatial import cKDTree
+            self._hover_kdtree = cKDTree(self._hover_tm.vertices)
+        except Exception:
+            self._hover_kdtree = None
+        return self._hover_tm
+
     def _extractTrimesh(self, node: CuraSceneNode) -> Optional[Tuple["trimesh.Trimesh", numpy.ndarray, numpy.ndarray]]:
         """
         Extract a trimesh object from a Cura scene node.
@@ -1916,6 +2041,7 @@ class ObjectSplitter(Tool):
         node: CuraSceneNode,
         click_position: Vector,
         anchor_points: Optional[list] = None,
+        plane_override: Optional[tuple] = None,
     ):
         """Perform the cut operation on the given node using core algorithms."""
         self._showProgress("Object Splitter", "Preparing mesh...", 0, 100)
@@ -1976,7 +2102,63 @@ class ObjectSplitter(Tool):
             from .core.plane_calculator import snap_point_to_mesh_surface
             _, click_face_id = snap_point_to_mesh_surface(tm, click_pos_arr)
 
-            if self._cut_mode == self.CUT_MODE_HORIZONTAL:
+            # Point-based modes: when the user has placed anchor points, the cut
+            # follows those points deterministically (a geodesic path through
+            # them, like Multi-point) instead of seeding the unreliable search.
+            used_anchor_path = False
+            if (self._multi_point_anchors_enabled
+                    and self._cut_mode in (self.CUT_MODE_VALLEY, self.CUT_MODE_VALLEY_SEAM)
+                    and anchor_points_arr and len(anchor_points_arr) >= 2):
+                try:
+                    from .core.path_cutter import chain_paths, partition_faces_by_path
+                    self._updateProgress("Computing geodesic path through points...", 20)
+                    anchor_pts = numpy.asarray(anchor_points_arr, dtype=numpy.float64)
+                    # Valley modes hug concave grooves between the points; plain
+                    # Multi-point would use valley_bias=0.
+                    vertex_path = chain_paths(tm, anchor_pts, valley_bias=0.75)
+                    face_set_a, face_set_b = partition_faces_by_path(tm, vertex_path)
+                    used_anchor_path = True
+                    plane = None
+                    Logger.log("i", "Point mode: valley-weighted path cut through %d anchor points",
+                               len(anchor_pts))
+                except Exception as e:
+                    Logger.log("w", "Anchor path cut failed (%s); using search instead", e)
+
+            if used_anchor_path:
+                pass  # face sets already computed from the geodesic path
+            elif plane_override is not None:
+                # Caller supplied the plane directly (e.g. 2-click vertical cut).
+                snap_point, click_face_id = snap_point_to_mesh_surface(tm, click_pos_arr)
+                plane = CutPlane(
+                    origin=numpy.asarray(plane_override[0], dtype=numpy.float64),
+                    normal=numpy.asarray(plane_override[1], dtype=numpy.float64),
+                )
+            elif self._cut_mode == self.CUT_MODE_PLANE:
+                snap_point, click_face_id = snap_point_to_mesh_surface(tm, click_pos_arr)
+                if self._plane_orientation == "horizontal":
+                    # Bed-parallel (Y up). Whole-model uses the height slider;
+                    # local passes through the clicked feature's height.
+                    if self._cut_whole_model:
+                        plane = horizontal_cut_plane(tm, self._cut_height_percent)
+                    else:
+                        plane = CutPlane(origin=numpy.asarray(snap_point, dtype=numpy.float64),
+                                         normal=numpy.array([0.0, 1.0, 0.0]))
+                elif self._plane_orientation == "vertical":
+                    # Perpendicular to the bed, view-aligned through the click.
+                    if R is not None:
+                        plane = vertical_cut_plane(snap_point, R @ numpy.array([1.0, 0.0, 0.0]))
+                    else:
+                        plane = vertical_cut_plane(snap_point)
+                else:
+                    # "surface": cut ALONG the hover arrow (the clicked surface
+                    # normal). The plane CONTAINS the arrow (excludes the grazing
+                    # tangent plane); rotating about it to the smallest local
+                    # cross-section gives the feature's neck. Deterministic.
+                    arrow = numpy.array([0.0, 1.0, 0.0])
+                    if click_face_id is not None and click_face_id < len(tm.face_normals):
+                        arrow = numpy.array(tm.face_normals[click_face_id], dtype=numpy.float64)
+                    plane = find_plane_along_normal(tm, snap_point, arrow)
+            elif self._cut_mode == self.CUT_MODE_HORIZONTAL:
                 plane = horizontal_cut_plane(tm, self._cut_height_percent)
             elif self._cut_mode == self.CUT_MODE_VERTICAL:
                 if R is not None:
@@ -2175,7 +2357,23 @@ class ObjectSplitter(Tool):
 
             # Perform the split (delegates to core.mesh_splitter)
             self._updateProgress("Splitting mesh...", 40)
-            if self._cut_mode in (
+            if used_anchor_path:
+                # Geodesic path cut through the placed points (Multi-point style).
+                # Cap the cut like path mode so the faces seal and connectors work.
+                split_result = split_by_face_sets(
+                    tm, face_set_a, face_set_b,
+                    strategy_name="anchor_path",
+                    attempt_hole_fill=(self._connector_enabled or self._path_cap_ends),
+                )
+            elif self._cut_mode == self.CUT_MODE_PLANE:
+                # Clean local split: capped slice + clicked-component selection
+                # gives a flat watertight cut localized to the clicked feature
+                # (or the whole model when CutWholeModel is on).
+                split_result = clean_local_plane_split(
+                    tm, plane.origin, plane.normal, click_face_id,
+                    whole_model=self._cut_whole_model
+                )
+            elif self._cut_mode in (
                 self.CUT_MODE_SHORTEST,
                 self.CUT_MODE_RADIAL,
                 self.CUT_MODE_VALLEY_SEAM,
@@ -2192,17 +2390,11 @@ class ObjectSplitter(Tool):
                     attempt_hole_fill=False,
                 )
             elif self._cut_mode in (self.CUT_MODE_SMALLEST, self.CUT_MODE_VALLEY):
-                # Use graph-based local separation with candidate fallback.
-                # If the best plane only grazes the surface (single-triangle cut),
-                # try the next-best candidates until we get a meaningful partition.
-                candidate_normals = []
-                if search_result and search_result.top_candidates:
-                    candidate_normals = [n for _, n in search_result.top_candidates]
-                if not candidate_normals:
-                    candidate_normals = [plane.normal]
-
-                split_result = split_by_local_plane(
-                    tm, plane.origin, candidate_normals, click_face_id
+                # The search now penalizes grazing planes, so plane.normal cuts
+                # across the clicked feature. Use the clean split for a flat,
+                # watertight cut (no triangle-edge sawtooth, engine-free).
+                split_result = clean_local_plane_split(
+                    tm, plane.origin, plane.normal, click_face_id
                 )
             else:
                 split_result = slice_mesh_with_fallback(
@@ -2221,7 +2413,36 @@ class ObjectSplitter(Tool):
 
             # Add connectors if enabled (delegates to core.connectors)
             if self._connector_enabled:
-                if self._cut_mode in (
+                if used_anchor_path:
+                    # Non-planar geodesic path cut through the points: place
+                    # connectors along the path (same as Multi-point), not the
+                    # planar peg/hole which needs a single cut plane.
+                    try:
+                        self._updateProgress("Adding connectors...", 60)
+                        path_points = numpy.asarray(
+                            tm.vertices[vertex_path], dtype=numpy.float64)
+                        cr = add_path_connectors(
+                            mesh_upper, mesh_lower, path_points,
+                            split_result.cap_faces_upper,
+                            split_result.cap_faces_lower,
+                            config=ConnectorConfig(
+                                enabled=True,
+                                diameter=float(self._connector_diameter),
+                                height=float(self._connector_height),
+                                clearance=float(self._connector_clearance),
+                                sides=self._connector_sides,
+                            ),
+                            face_count=len(tm.faces),
+                        )
+                        if cr.connectors_added:
+                            mesh_upper = cr.upper
+                            mesh_lower = cr.lower
+                            Logger.log("i", "Path connectors added (anchor cut)")
+                        else:
+                            Logger.log("w", "Connectors skipped: %s", cr.skipped_reason)
+                    except Exception as e:
+                        Logger.log("w", "Anchor-path connectors failed: %s", e)
+                elif self._cut_mode in (
                     self.CUT_MODE_SHORTEST,
                     self.CUT_MODE_RADIAL,
                     self.CUT_MODE_VALLEY_SEAM,

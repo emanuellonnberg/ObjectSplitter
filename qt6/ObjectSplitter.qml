@@ -26,6 +26,11 @@ Item {
 
     // Mode help text shown by the (i) popup next to the mode description.
     function getModeHelp(mode) {
+        if (mode === "plane") return {
+            "title": "Plane cut",
+            "body": "A clean, flat cut. 'Along surface' cuts across the clicked feature (aim with the hover arrow); 'Horizontal' is bed-parallel; '3-point plane' lets you click three points to define a plane at any angle. Separates only the clicked feature, or the whole model with 'Cut whole model'. For interconnected parts like ladder rungs a single plane crosses them all -- use Multi-point there.",
+            "steps": ["Pick an orientation", "Along surface / Horizontal: click the feature. 3-point: click three points to set the plane", "Toggle 'Cut whole model' for a full split (e.g. stacking)"]
+        }
         if (mode === "horizontal") return {
             "title": "Horizontal cut",
             "body": "A flat cut parallel to the build plate at a chosen height. Use it to split tall prints into stackable parts or to fit the printer's Z height.",
@@ -195,7 +200,7 @@ Item {
                 // Experimental (secondary) modes only appear in this dropdown
                 // when the "Show experimental cut modes" toggle (near Debug) is
                 // on. Auto-on when an experimental mode is already active.
-                property var primaryValues: ["path", "path_isolate", "horizontal", "vertical"]
+                property var primaryValues: ["path", "path_isolate", "plane"]
                 property var experimentalValues: ["smallest", "shortest", "radial", "valley", "valley_seam"]
                 // manualShowExperimental is the user's toggle; showExperimental
                 // derives from it OR an experimental mode being active, so the
@@ -206,8 +211,8 @@ Item {
                     : false)
                 property var modeValues: showExperimental ? primaryValues.concat(experimentalValues) : primaryValues
                 model: showExperimental
-                    ? ["Multi-point", "Isolate region", "Horizontal", "Vertical", "Smallest Section", "Shortest Seam", "Radial (geodesic)", "Valley (groove)", "Valley Seam (concavity)"]
-                    : ["Multi-point", "Isolate region", "Horizontal", "Vertical"]
+                    ? ["Multi-point", "Isolate region", "Plane", "Smallest Section", "Shortest Seam", "Radial (geodesic)", "Valley (groove)", "Valley Seam (concavity)"]
+                    : ["Multi-point", "Isolate region", "Plane"]
                 currentIndex: {
                     if (UM.ActiveTool) {
                         var idx = modeValues.indexOf(UM.ActiveTool.properties.getValue("CutMode"))
@@ -233,6 +238,7 @@ Item {
                 text: {
                     if (UM.ActiveTool) {
                         var mode = UM.ActiveTool.properties.getValue("CutMode")
+                        if (mode === "plane") return "Clean plane cut: along the clicked surface, or Horizontal/Vertical"
                         if (mode === "horizontal") return "Cut parallel to the build plate"
                         if (mode === "vertical") return "Cut perpendicular to the build plate"
                         if (mode === "smallest") return "Find smallest cross-section at click point"
@@ -850,11 +856,71 @@ Item {
             visible: UM.ActiveTool && ["horizontal", "smallest", "valley", "valley_seam"].indexOf(UM.ActiveTool.properties.getValue("CutMode")) >= 0
         }
 
-        // Cut Height (for horizontal mode)
+        // Plane mode controls (orientation + whole-model)
         Column {
             width: parent.width
             spacing: Math.round(UM.Theme.getSize("default_margin").height / 2)
-            visible: UM.ActiveTool && UM.ActiveTool.properties.getValue("CutMode") === "horizontal"
+            visible: UM.ActiveTool && UM.ActiveTool.properties.getValue("CutMode") === "plane"
+
+            Row {
+                spacing: Math.round(UM.Theme.getSize("default_margin").width / 2)
+
+                Label {
+                    height: UM.Theme.getSize("setting_control").height
+                    text: catalog.i18nc("@label", "Orientation:")
+                    width: 70
+                    font: UM.Theme.getFont("default")
+                    color: UM.Theme.getColor("text")
+                    verticalAlignment: Text.AlignVCenter
+                    renderType: Text.NativeRendering
+                }
+
+                ComboBox {
+                    id: planeOrientationCombo
+                    width: 150
+                    height: UM.Theme.getSize("setting_control").height
+                    property var values: ["surface", "horizontal", "points"]
+                    model: ["Along surface", "Horizontal", "3-point plane"]
+                    currentIndex: {
+                        if (UM.ActiveTool) {
+                            var i = values.indexOf(UM.ActiveTool.properties.getValue("PlaneOrientation"))
+                            return i >= 0 ? i : 0
+                        }
+                        return 0
+                    }
+                    onActivated: {
+                        if (UM.ActiveTool) {
+                            UM.ActiveTool.setProperty("PlaneOrientation", values[currentIndex])
+                        }
+                    }
+                }
+            }
+
+            CheckBox {
+                id: cutWholeModelCheckbox
+                text: catalog.i18nc("@option", "Cut whole model")
+                checked: UM.ActiveTool ? UM.ActiveTool.properties.getValue("CutWholeModel") : false
+                hoverEnabled: true
+                ToolTip.visible: hovered
+                ToolTip.text: "Cut the entire model at the plane instead of just the clicked feature."
+                onClicked: {
+                    if (UM.ActiveTool) {
+                        UM.ActiveTool.setProperty("CutWholeModel", checked)
+                    }
+                }
+            }
+        }
+
+        // Cut Height (horizontal mode, or Plane + Horizontal + whole model)
+        Column {
+            width: parent.width
+            spacing: Math.round(UM.Theme.getSize("default_margin").height / 2)
+            visible: UM.ActiveTool && (
+                UM.ActiveTool.properties.getValue("CutMode") === "horizontal" ||
+                (UM.ActiveTool.properties.getValue("CutMode") === "plane" &&
+                 UM.ActiveTool.properties.getValue("PlaneOrientation") === "horizontal" &&
+                 UM.ActiveTool.properties.getValue("CutWholeModel"))
+            )
 
             Label {
                 text: catalog.i18nc("@label", "Cut Height:")

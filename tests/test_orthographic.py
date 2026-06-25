@@ -525,23 +525,28 @@ def test_fork_valley_cut_orthographic_signature():
     if img_a.sum() > img_b.sum():
         img_a, img_b = img_b, img_a
 
-    baseline_small = _rows_to_mask(_FORK_SMALLEST_BASELINE_SMALL_ROWS)
+    # Valley cuts ACROSS the clicked middle tooth. With grazing planes now
+    # penalized it may cut deeper than the smallest mode, so check structurally
+    # (the separated piece covers the middle tooth) rather than matching the
+    # smallest baseline mask.
     baseline_big = _rows_to_mask(_FORK_SMALLEST_BASELINE_BIG_ROWS)
-    iou_small = _mask_iou(img_a, baseline_small)
-    iou_big = _mask_iou(img_b, baseline_big)
-    assert iou_small >= 0.60, f"Valley small-piece IoU too low: {iou_small:.3f}"
-    assert iou_big >= 0.90, f"Valley remainder IoU too low: {iou_big:.3f}"
+    assert _mask_iou(img_b, baseline_big) >= 0.90, "Valley remainder changed shape unexpectedly."
 
     assert img_a.sum() >= 4, f"Valley separated piece is too sparse.\n{print_image(img_a)}"
     center_slice = slice(8, 12)
+    assert img_a[center_slice, :].any(), (
+        f"Valley piece should cover the clicked middle tooth.\n{print_image(img_a)}")
     assert not img_b[center_slice, -1].any(), f"Expected top-center gap in valley remainder.\n{print_image(img_b)}"
 
 
 @requires_triangle
 def test_fork_valley_seam_cut_orthographic_signature():
     """
-    Valley seam mode should improve over planar valley on fork geometry by
-    removing a larger clicked-feature partition and producing a deeper cutout.
+    Valley seam mode removes a meaningful clicked-feature partition on the fork.
+
+    (We no longer assert it beats planar valley by a margin: the grazing-bias
+    fix made planar valley cut across the feature too, so the two are now
+    comparable -- and that face-count margin was platform-fragile.)
     """
     mesh = create_fork()
     click_pt = np.array([0, 39, 0], dtype=float)
@@ -569,30 +574,6 @@ def test_fork_valley_seam_cut_orthographic_signature():
     assert ratio >= 0.015, (
         f"Valley seam fork cut did not remove enough of the clicked feature "
         f"({small_faces}/{len(mesh.faces)} faces, {ratio:.2%})."
-    )
-
-    valley_search = find_valley_cut_plane(
-        mesh,
-        snap_pt,
-        search_resolution=18,
-        surface_normal=click_surface_normal,
-    )
-    valley_candidate_normals = (
-        [n for _, n in valley_search.top_candidates]
-        if valley_search.top_candidates
-        else [valley_search.plane.normal]
-    )
-    valley_result = split_by_local_plane(
-        mesh,
-        valley_search.plane.origin,
-        valley_candidate_normals,
-        click_face_id,
-    )
-    assert valley_result.success
-    valley_ratio = min(len(valley_result.upper.faces), len(valley_result.lower.faces)) / len(mesh.faces)
-    assert ratio >= valley_ratio + 0.003, (
-        f"Valley seam should improve over planar valley. "
-        f"valley_seam={ratio:.2%}, valley={valley_ratio:.2%}"
     )
 
     img_a = generate_projection(result.upper, view_axis=2, resolution=20, custom_bounds=mesh.bounds)
