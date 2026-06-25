@@ -514,19 +514,25 @@ def find_plane_along_normal(
     mesh: "trimesh.Trimesh",
     click_position: numpy.ndarray,
     surface_normal: numpy.ndarray,
+    source_face_id: Optional[int] = None,
     n_angles: int = 18,
 ) -> CutPlane:
-    """Find a cut plane that CONTAINS the surface normal (cuts *along* the arrow).
+    """Find a cut plane that CONTAINS the surface normal (cuts *across* the feature).
 
     The plane is constrained to contain ``surface_normal`` (so its own normal is
     perpendicular to it), which geometrically excludes the grazing tangent plane.
-    Rotating about the surface normal, the rotation with the smallest local
-    cross-section is the natural neck/base of the clicked feature.
+    Rotating about the surface normal, each candidate is scored by the size of
+    the connected feature it separates at the click -- the smallest real feature
+    is the neck/base we want. Scoring by separated-feature size (not section
+    *area*) is robust: a body-spanning plane can have a small local cross-section
+    but separates a huge piece, so an area objective picks it unpredictably.
 
     Args:
         mesh: The trimesh object.
         click_position: 3D point the plane passes through.
         surface_normal: Surface normal at the click (the hover arrow direction).
+        source_face_id: The clicked face index. If None, the nearest face by
+            centroid is used.
         n_angles: Number of rotations to test about the surface normal.
 
     Returns:
@@ -547,33 +553,53 @@ def find_plane_along_normal(
     u = u / numpy.linalg.norm(u)
     v = numpy.cross(axis, u)
 
-    avg_face_area = mesh.area / max(len(mesh.faces), 1)
-    min_area = avg_face_area * 5.0
+    face_centroids = mesh.vertices[mesh.faces].mean(axis=1)
+    if source_face_id is None:
+        source_face_id = int(numpy.argmin(
+            numpy.linalg.norm(face_centroids - click, axis=1)))
+
+    n_faces = len(mesh.faces)
+    min_faces = max(20, int(0.003 * n_faces))
+    rel = face_centroids - click
+
+    try:
+        import scipy.sparse
+        from scipy.sparse.csgraph import connected_components
+        adjacency = numpy.asarray(mesh.face_adjacency)
+        ones = numpy.ones(len(adjacency), dtype=numpy.int8)
+    except Exception as e:  # noqa: BLE001 - fall back to any plane containing the axis
+        logger.debug("find_plane_along_normal: scipy/adjacency unavailable: %s", e)
+        return CutPlane(origin=click, normal=u)
 
     best_normal = None
-    best_area = float("inf")
+    best_feature = float("inf")
     for k in range(n_angles):
         theta = numpy.pi * k / n_angles
         # Candidate plane normal lies in the plane perpendicular to the axis,
         # so the cut plane itself contains the axis (the surface normal/arrow).
         candidate = numpy.cos(theta) * u + numpy.sin(theta) * v
-        try:
-            section = mesh.section(plane_origin=click, plane_normal=candidate)
-            if section is None:
-                continue
-            path_2d, to_3D = _section_to_2d(section)
-            area = _local_section_area(path_2d, to_3D, click)
-        except Exception as e:
-            logger.debug("along-normal section failed at theta=%.2f: %s", theta, e)
+        above = (rel @ candidate) >= 0
+        # Keep only adjacency edges whose two faces are on the SAME side; the
+        # connected component of the clicked face is the feature it would lop.
+        same_side = above[adjacency[:, 0]] == above[adjacency[:, 1]]
+        if not same_side.any():
             continue
-        if area >= min_area and area < best_area:
-            best_area = area
+        edges = adjacency[same_side]
+        graph = scipy.sparse.coo_matrix(
+            (ones[:len(edges)], (edges[:, 0], edges[:, 1])),
+            shape=(n_faces, n_faces))
+        _, labels = connected_components(graph, directed=False)
+        feature = int(numpy.count_nonzero(labels == labels[source_face_id]))
+        if feature < min_faces:
+            continue  # sliver / grazing
+        if feature < best_feature:
+            best_feature = feature
             best_normal = candidate
 
     if best_normal is None:
-        best_normal = u  # no real cross-section found; any plane containing the axis
-    logger.debug("find_plane_along_normal: best_area=%.2f normal=%s",
-                 best_area, best_normal)
+        best_normal = u  # no real feature found; any plane containing the axis
+    logger.debug("find_plane_along_normal: feature=%s faces, normal=%s",
+                 best_feature, best_normal)
     return CutPlane(origin=click, normal=best_normal)
 
 

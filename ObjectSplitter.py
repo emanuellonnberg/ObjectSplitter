@@ -2150,14 +2150,15 @@ class ObjectSplitter(Tool):
                     else:
                         plane = vertical_cut_plane(snap_point)
                 else:
-                    # "surface": cut ALONG the hover arrow (the clicked surface
-                    # normal). The plane CONTAINS the arrow (excludes the grazing
-                    # tangent plane); rotating about it to the smallest local
-                    # cross-section gives the feature's neck. Deterministic.
+                    # "surface": cut ACROSS the clicked feature. The plane
+                    # CONTAINS the hover arrow (the clicked surface normal, which
+                    # excludes the grazing tangent plane); rotating about it, the
+                    # rotation that separates the smallest connected feature is
+                    # the neck. Deterministic and view-independent.
                     arrow = numpy.array([0.0, 1.0, 0.0])
                     if click_face_id is not None and click_face_id < len(tm.face_normals):
                         arrow = numpy.array(tm.face_normals[click_face_id], dtype=numpy.float64)
-                    plane = find_plane_along_normal(tm, snap_point, arrow)
+                    plane = find_plane_along_normal(tm, snap_point, arrow, click_face_id)
             elif self._cut_mode == self.CUT_MODE_HORIZONTAL:
                 plane = horizontal_cut_plane(tm, self._cut_height_percent)
             elif self._cut_mode == self.CUT_MODE_VERTICAL:
